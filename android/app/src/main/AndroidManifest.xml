@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.questapp">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
+    <uses-feature android:name="android.hardware.vr.headtracking" android:required="true" />
+
+    <application
+        android:label="QuestApp"
+        android:hasCode="false">
+
+        <meta-data
+            android:name="com.oculus.supportedDevices"
+            android:value="quest|quest2|questpro|quest3" />
+
+        <activity
+            android:name="android.app.NativeActivity"
+            android:exported="true"
+            android:screenOrientation="landscape"
+            android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|uiMode">
+
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="quest_app" />
+
+            <meta-data
+                android:name="com.oculus.vr.focusaware"
+                android:value="true" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="com.oculus.intent.category.VR" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
