@@ -1,5 +1,5 @@
 [target.aarch64-linux-android]
-linker = "aarch64-linux-android35-clang"
+linker = "/Users/iz3xypug/Library/Android/sdk/ndk/30.0.14904198/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android30-clang"
 
 [target.x86_64-linux-android]
-linker = "x86_64-linux-android35-clang"
+linker = "/Users/iz3xypug/Library/Android/sdk/ndk/30.0.14904198/toolchains/llvm/prebuilt/darwin-x86_64/bin/x86_64-linux-android30-clang"
