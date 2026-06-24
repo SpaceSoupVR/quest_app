@@ -4,10 +4,12 @@
 
 set -e
 
-QUEST_APP_DIR="$HOME/Desktop/rampstack/vr/quest_app"
-DEBUG_VIEWER_DIR="$HOME/Desktop/rampstack/vr/space_soup_editor"
-SPACE_SOUP_DIR="$HOME/Desktop/rampstack/vr/space_soup"
-GAME_DIR="$HOME/Desktop/rampstack/vr/game"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+XR_DIR="$(dirname "$SCRIPT_DIR")"
+QUEST_APP_DIR="$SCRIPT_DIR"
+DEBUG_VIEWER_DIR="$XR_DIR/space_soup_editor"
+SPACE_SOUP_DIR="$XR_DIR/space_soup"
+GAME_DIR="$XR_DIR/game"
 PACKAGE="com.example.questapp"
 REMOTE_GAME_DIR="/sdcard/Android/data/$PACKAGE/files/game"
 HOST_TARGET=$(rustc -vV | awk '/host:/ {print $2}')
