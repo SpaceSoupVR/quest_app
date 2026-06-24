@@ -153,6 +153,20 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     'main: loop {
+        // [input-anr-fix] Drain the Android NativeActivity input queue every
+        // iteration. We don't act on these events, but we must finish each one
+        // so Android's input dispatcher doesn't time out (5s) and raise an ANR
+        // ("app isn't responding" popup). Remove this block to revert.
+        if let Some(input_queue) = ndk_glue::input_queue().as_ref() {
+            while let Ok(Some(event)) = input_queue.get_event() {
+                // pre_dispatch returns Some when the event still needs finishing
+                // (None means the IME consumed it and will finish it itself).
+                if let Some(event) = input_queue.pre_dispatch(event) {
+                    input_queue.finish_event(event, false);
+                }
+            }
+        }
+
         if debug_stream.is_none() {
             debug_reconnect_timer += 1;
             if debug_reconnect_timer >= 60 {
