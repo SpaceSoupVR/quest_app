@@ -431,9 +431,47 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         let offset = runtime.locomotion.player_offset;
         let yaw_inv = Quat::from_rotation_y(-runtime.locomotion.player_yaw);
 
-        let cuboids: Vec<Cuboid> = render_cuboids.iter()
+        let mut cuboids: Vec<Cuboid> = render_cuboids.iter()
             .map(|rc| to_space_soup_cuboid(rc, offset, yaw_inv))
             .collect();
+
+        // [controller-hands] Render a grip block per hand from the controller
+        // poses, mirroring the editor's fallback. Controller poses are already
+        // in stage space (same frame as the eye views), so they are pushed raw
+        // — no locomotion transform — to stay locked to the physical controller.
+        // Delete this block and revert `let mut cuboids` to remove.
+        for (grip, aim, color) in [
+            (cs.l_grip_pose, cs.l_aim_pose, Color3(180, 200, 255, 255)),
+            (cs.r_grip_pose, cs.r_aim_pose, Color3(255, 200, 180, 255)),
+        ] {
+            if let Some(p) = grip {
+                let mut c = Cuboid::solid_and_wire(
+                    xr_vec3(p.position),
+                    Vec3::new(0.035, 0.035, 0.06),
+                    color,
+                    Color3(255, 255, 255, 200),
+                );
+                c.rotation = xr_quat(p.orientation);
+                cuboids.push(c);
+            }
+            if let Some(p) = aim {
+                let aim_pos = xr_vec3(p.position);
+                let aim_rot = xr_quat(p.orientation);
+                let mut c = Cuboid::wireframe(aim_pos, Vec3::splat(0.02), color);
+                c.rotation = aim_rot;
+                cuboids.push(c);
+
+                let dir = aim_rot * Vec3::new(0.0, 0.0, -1.0);
+                for i in 1..6 {
+                    let t = i as f32 * 0.06;
+                    cuboids.push(Cuboid::solid(
+                        aim_pos + dir * t,
+                        Vec3::splat(0.008),
+                        Color3(color.0, color.1, color.2, 200),
+                    ));
+                }
+            }
+        }
 
         for rm in &render_meshes {
             if let Some((mesh, _)) = mesh_cache.get_mut(&rm.path) {
