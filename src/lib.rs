@@ -142,6 +142,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut prev_l_trigger = false;
     let mut prev_r_squeeze = false;
     let mut prev_l_squeeze = false;
+    let mut prev_a         = false;
 
     const JOINT_NAMES: [&str; 26] = [
         "palm", "wrist",
@@ -306,7 +307,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             teleport_pressed:  cs.r_trigger > 0.5 && !prev_r_trigger,
             teleport_released: !(cs.r_trigger > 0.5) && prev_r_trigger,
             teleport_hand:     Hand::Right,
+            jump_pressed:      cs.btn_a && !prev_a,
         };
+
+        prev_a = cs.btn_a;
 
         let teleport_target: Option<TeleportTarget> = None;
 
