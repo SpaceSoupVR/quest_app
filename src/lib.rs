@@ -12,10 +12,10 @@ use space_soup::renderer::{Cuboid, Color3, CuboidStyle as SsCuboidStyle, GltfMes
 use glam::{Vec3, Quat};
 #[cfg(target_os = "android")]
 use space_soup_engine::{
-    GameRuntime, InputFrame, PlayerRig, Hand,
+    GameRuntime, InputFrame, PlayerRig, Hand, Transform,
     LocomotionInput, LocomotionMode, TeleportTarget,
     RenderCuboid, RenderMesh, CuboidStyle as EngineCuboidStyle,
-    spawn_both_hand_rigs,
+    build_hand, FingerCurls,
     DebugPacket, Pose, HandSample, JointSample, LocomotionSample, SceneSample, TimingSample,
     debug_sender,
 };
@@ -96,10 +96,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Object count right after load: {}", runtime.scene().objects.len());
 
-    spawn_both_hand_rigs(&mut runtime);
     runtime.locomotion.set_mode(LocomotionMode::Smooth);
 
-    info!("Object count after spawning hand rigs: {}", runtime.scene().objects.len());
+    // Controller hands are drawn procedurally each frame (see the
+    // [controller-hands] block below), so we no longer spawn the tracked-joint
+    // rig here. Restore spawn_both_hand_rigs when wiring real hand tracking.
 
     let mut mesh_cache: HashMap<String, (GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform)> =
         HashMap::new();
@@ -332,8 +333,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(e) = runtime.load_scene(&next_scene) {
                 warn!("Failed to switch scene to '{next_scene}': {e}");
             } else {
-                spawn_both_hand_rigs(&mut runtime);
-                info!("After scene reload + hand respawn: {} objects", runtime.scene().objects.len());
+                info!("After scene reload: {} objects", runtime.scene().objects.len());
 
                 let new_paths: Vec<String> = runtime.scene().objects.iter()
                     .filter_map(|o| o.mesh.as_ref().map(|m| m.path.clone()))
@@ -439,39 +439,39 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .map(|rc| to_space_soup_cuboid(rc, offset, yaw_inv))
             .collect();
 
-        // [controller-hands] Render a grip block per hand from the controller
-        // poses, mirroring the editor's fallback. Controller poses are already
-        // in stage space (same frame as the eye views), so they are pushed raw
-        // — no locomotion transform — to stay locked to the physical controller.
-        // Delete this block and revert `let mut cuboids` to remove.
-        for (grip, aim, color) in [
-            (cs.l_grip_pose, cs.l_aim_pose, Color3(180, 200, 255, 255)),
-            (cs.r_grip_pose, cs.r_aim_pose, Color3(255, 200, 180, 255)),
+        // [controller-hands] Draw a posable cube hand per controller plus an
+        // aim ray. Controller poses are already in stage space (same frame as
+        // the eye views), so these are pushed raw — no locomotion transform —
+        // to stay locked to the physical controller. Fingers curl from trigger
+        // and grip pressure; see space_soup_engine::procedural_hand.
+        for (hand, grip, aim, trigger, squeeze) in [
+            (Hand::Left,  cs.l_grip_pose, cs.l_aim_pose, cs.l_trigger, cs.l_squeeze),
+            (Hand::Right, cs.r_grip_pose, cs.r_aim_pose, cs.r_trigger, cs.r_squeeze),
         ] {
             if let Some(p) = grip {
-                let mut c = Cuboid::solid_and_wire(
-                    xr_vec3(p.position),
-                    Vec3::new(0.035, 0.035, 0.06),
-                    color,
-                    Color3(255, 255, 255, 200),
-                );
-                c.rotation = xr_quat(p.orientation);
-                cuboids.push(c);
+                let anchor = Transform::new(xr_vec3(p.position), xr_quat(p.orientation));
+                let curls = FingerCurls {
+                    thumb:  0.0,        // thumb stays extended for now
+                    index:  trigger,    // trigger curls the pointer finger
+                    middle: squeeze,    // grip curls the remaining fingers
+                    ring:   squeeze,
+                    little: squeeze,
+                };
+                for hc in build_hand(anchor, hand, &curls) {
+                    let mut c = Cuboid::solid(hc.position, hc.half_size, ss_color(hc.color));
+                    c.rotation = hc.rotation;
+                    cuboids.push(c);
+                }
             }
             if let Some(p) = aim {
                 let aim_pos = xr_vec3(p.position);
-                let aim_rot = xr_quat(p.orientation);
-                let mut c = Cuboid::wireframe(aim_pos, Vec3::splat(0.02), color);
-                c.rotation = aim_rot;
-                cuboids.push(c);
-
-                let dir = aim_rot * Vec3::new(0.0, 0.0, -1.0);
+                let dir = xr_quat(p.orientation) * Vec3::new(0.0, 0.0, -1.0);
                 for i in 1..6 {
                     let t = i as f32 * 0.06;
                     cuboids.push(Cuboid::solid(
                         aim_pos + dir * t,
                         Vec3::splat(0.008),
-                        Color3(color.0, color.1, color.2, 200),
+                        Color3(255, 255, 255, 160),
                     ));
                 }
             }
