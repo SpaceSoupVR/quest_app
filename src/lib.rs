@@ -15,7 +15,6 @@ use space_soup_engine::{
     GameRuntime, InputFrame, PlayerRig, Hand,
     LocomotionInput, LocomotionMode, TeleportTarget,
     RenderCuboid, RenderMesh, CuboidStyle as EngineCuboidStyle,
-    spawn_both_hand_rigs,
     DebugPacket, Pose, HandSample, JointSample, LocomotionSample, SceneSample, TimingSample,
     debug_sender,
 };
@@ -78,6 +77,20 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut hands       = HandTrackers::new(&xr, &headset.session)?;
     let mut renderer    = XrRenderer::new(&vk, &xr, &headset.session)?;
 
+    // By default, wgpu's uncaptured-error handler panics the whole process
+    // with just the generic "Handling wgpu errors as fatal by default"
+    // line — the actual validation message (which resource, which limit
+    // was exceeded, etc.) gets swallowed into the panic payload, which is
+    // exactly why logcat only ever showed the header and nothing after it.
+    // Installing our own handler here logs the real message through
+    // `log::error!` (tagged "quest_app", same as everything else) instead
+    // of letting wgpu abort the process. Once this is in, the existing
+    // `adb logcat -s quest_app:V` filter will show the actual error text
+    // on the next crash/validation failure.
+    renderer.device().on_uncaptured_error(Box::new(|error| {
+        error!("=== WGPU UNCAPTURED ERROR ===\n{error}\n=============================");
+    }));
+
     let mut debug_stream: Option<std::net::TcpStream> = None;
 
     // ── Load the game ───────────────────────────────────────────────────────
@@ -96,7 +109,16 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Object count right after load: {}", runtime.scene().objects.len());
 
-    spawn_both_hand_rigs(&mut runtime);
+    // Removed: spawn_both_hand_rigs(&mut runtime);
+    // That spawned the old 26-cuboid-per-hand optical-tracking rig from
+    // hands.rs — 52 extra objects, ON TOP OF the righthand_*/lefthand_*
+    // objects already defined in the scene JSON. With both active you had
+    // two overlapping hand rigs, ~4x the collision-check cost (O(n^2) over
+    // object count), and visibly more render/script overhead every frame.
+    // The JSON-defined hands now cover this, driven by controller grip
+    // poses instead of optical tracking. Restore this call if you want
+    // optical hand tracking back as a fallback for when controllers
+    // aren't held.
     runtime.locomotion.set_mode(LocomotionMode::Smooth);
 
     info!("Object count after spawning hand rigs: {}", runtime.scene().objects.len());
@@ -109,9 +131,19 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         .filter_map(|o| o.mesh.as_ref().map(|m| m.path.clone()))
         .collect();
 
+    info!("Mesh paths to preload, in order: {:?}", mesh_paths);
+
     for path in mesh_paths {
         if mesh_cache.contains_key(&path) { continue; }
         let full_path = runtime.game_dir().join(&path);
+
+        // Announce the attempt BEFORE calling load — if the process dies
+        // inside GltfMesh::load (e.g. a wgpu fatal validation error during
+        // texture upload), this line tells us exactly which file it was on,
+        // since the existing "Preloaded mesh" success line never gets a
+        // chance to print.
+        info!("Attempting to load mesh: '{path}' -> {}", full_path.display());
+
         match GltfMesh::load(
             renderer.device(),
             renderer.queue(),
@@ -120,7 +152,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         ) {
             Ok(mesh) => {
                 let model_uniform = renderer.create_model_uniform();
-                info!("Preloaded mesh '{path}' ({} primitives)", mesh.primitives.len());
+                info!(
+                    "Preloaded mesh '{path}' ({} primitives, {} bytes on disk)",
+                    mesh.primitives.len(),
+                    std::fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0),
+                );
                 mesh_cache.insert(path, (mesh, model_uniform));
             }
             Err(e) => {
@@ -153,20 +189,6 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     'main: loop {
-        // [input-anr-fix] Drain the Android NativeActivity input queue every
-        // iteration. We don't act on these events, but we must finish each one
-        // so Android's input dispatcher doesn't time out (5s) and raise an ANR
-        // ("app isn't responding" popup). Remove this block to revert.
-        if let Some(input_queue) = ndk_glue::input_queue().as_ref() {
-            while let Ok(Some(event)) = input_queue.get_event() {
-                // pre_dispatch returns Some when the event still needs finishing
-                // (None means the IME consumed it and will finish it itself).
-                if let Some(event) = input_queue.pre_dispatch(event) {
-                    input_queue.finish_event(event, false);
-                }
-            }
-        }
-
         if debug_stream.is_none() {
             debug_reconnect_timer += 1;
             if debug_reconnect_timer >= 60 {
@@ -328,8 +350,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(e) = runtime.load_scene(&next_scene) {
                 warn!("Failed to switch scene to '{next_scene}': {e}");
             } else {
-                spawn_both_hand_rigs(&mut runtime);
-                info!("After scene reload + hand respawn: {} objects", runtime.scene().objects.len());
+                info!("After scene reload: {} objects", runtime.scene().objects.len());
 
                 let new_paths: Vec<String> = runtime.scene().objects.iter()
                     .filter_map(|o| o.mesh.as_ref().map(|m| m.path.clone()))
@@ -337,6 +358,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 for path in new_paths {
                     if mesh_cache.contains_key(&path) { continue; }
                     let full_path = runtime.game_dir().join(&path);
+                    info!("Attempting to load mesh (scene reload): '{path}' -> {}", full_path.display());
                     match GltfMesh::load(
                         renderer.device(),
                         renderer.queue(),
@@ -431,47 +453,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         let offset = runtime.locomotion.player_offset;
         let yaw_inv = Quat::from_rotation_y(-runtime.locomotion.player_yaw);
 
-        let mut cuboids: Vec<Cuboid> = render_cuboids.iter()
+        let cuboids: Vec<Cuboid> = render_cuboids.iter()
             .map(|rc| to_space_soup_cuboid(rc, offset, yaw_inv))
             .collect();
-
-        // [controller-hands] Render a grip block per hand from the controller
-        // poses, mirroring the editor's fallback. Controller poses are already
-        // in stage space (same frame as the eye views), so they are pushed raw
-        // — no locomotion transform — to stay locked to the physical controller.
-        // Delete this block and revert `let mut cuboids` to remove.
-        for (grip, aim, color) in [
-            (cs.l_grip_pose, cs.l_aim_pose, Color3(180, 200, 255, 255)),
-            (cs.r_grip_pose, cs.r_aim_pose, Color3(255, 200, 180, 255)),
-        ] {
-            if let Some(p) = grip {
-                let mut c = Cuboid::solid_and_wire(
-                    xr_vec3(p.position),
-                    Vec3::new(0.035, 0.035, 0.06),
-                    color,
-                    Color3(255, 255, 255, 200),
-                );
-                c.rotation = xr_quat(p.orientation);
-                cuboids.push(c);
-            }
-            if let Some(p) = aim {
-                let aim_pos = xr_vec3(p.position);
-                let aim_rot = xr_quat(p.orientation);
-                let mut c = Cuboid::wireframe(aim_pos, Vec3::splat(0.02), color);
-                c.rotation = aim_rot;
-                cuboids.push(c);
-
-                let dir = aim_rot * Vec3::new(0.0, 0.0, -1.0);
-                for i in 1..6 {
-                    let t = i as f32 * 0.06;
-                    cuboids.push(Cuboid::solid(
-                        aim_pos + dir * t,
-                        Vec3::splat(0.008),
-                        Color3(color.0, color.1, color.2, 200),
-                    ));
-                }
-            }
-        }
 
         for rm in &render_meshes {
             if let Some((mesh, _)) = mesh_cache.get_mut(&rm.path) {
