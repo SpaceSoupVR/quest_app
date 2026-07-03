@@ -72,12 +72,12 @@ fn hand_skin_matrices(
     root_pos: Vec3,
     root_rot: Quat,
     curl: f32,
-    grip: Option<&GripPoseDef>,
+    finger_curl: Option<&HashMap<String, f32>>,
 ) -> Vec<glam::Mat4> {
     let local_pose = skin.blended_local_pose(0, 1, |ji| {
-        grip.and_then(|g| {
+        finger_curl.and_then(|fc| {
             let name = space_soup::renderer::mesh::GltfSkin::generic_joint_name(&skin.joint_names[ji]);
-            g.finger_curl.get(name).copied()
+            fc.get(name).copied()
         }).unwrap_or(curl)
     });
     let global_in_mesh_space = skin.hierarchical_transforms(&local_pose);
@@ -92,7 +92,7 @@ fn hand_skin_matrices(
 fn held_grip_pose<'a>(runtime: &'a GameRuntime, hand: Hand) -> Option<(&'a space_soup_engine::GameObject, &'a GripPoseDef)> {
     let id = runtime.attachments.object_for_joint(JointId::HandGrip(hand))?;
     let obj = runtime.scene().find_object(id)?;
-    let grip = obj.grip_pose.as_ref()?;
+    let grip = obj.grip_pose(hand)?;
     Some((obj, grip))
 }
 
@@ -412,8 +412,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         let l_trigger_down = cs.l_trigger > 0.5 || cs.l_squeeze > 0.5;
 
         if r_trigger_down && !(prev_r_trigger || prev_r_squeeze) {
-            if let Some(id) = nearest_object_to(&runtime, rig.hand_grip(Hand::Right).position) {
-                input.grabbed.push((id, Hand::Right));
+            let p = rig.hand_grip(Hand::Right).position;
+            if let Some((id, point)) = nearest_grip_point_to(&runtime, p) {
+                input.grabbed.push((id, Hand::Right, point));
+            } else if let Some(id) = nearest_object_to(&runtime, p) {
+                input.grabbed.push((id, Hand::Right, String::new()));
             }
         }
         if !r_trigger_down && (prev_r_trigger || prev_r_squeeze) {
@@ -422,8 +425,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if l_trigger_down && !(prev_l_trigger || prev_l_squeeze) {
-            if let Some(id) = nearest_object_to(&runtime, rig.hand_grip(Hand::Left).position) {
-                input.grabbed.push((id, Hand::Left));
+            let p = rig.hand_grip(Hand::Left).position;
+            if let Some((id, point)) = nearest_grip_point_to(&runtime, p) {
+                input.grabbed.push((id, Hand::Left, point));
+            } else if let Some(id) = nearest_object_to(&runtime, p) {
+                input.grabbed.push((id, Hand::Left, String::new()));
             }
         }
         if !l_trigger_down && (prev_l_trigger || prev_l_squeeze) {
@@ -600,8 +606,23 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                         (tf.position, tf.rotation, 0.0)
                     };
 
-                    let held = held_grip_pose(&runtime, hand);
-                    if let Some((obj, grip)) = held {
+                    // Named grip-point holds (physics-joint grabs) take
+                    // priority; fall back to the legacy per-hand
+                    // `grip_pose_left`/`_right` cosmetic alignment for
+                    // objects that don't define `grip_points`.
+                    let held_point = runtime.held_grip_point(hand);
+                    let held_pose = if held_point.is_none() { held_grip_pose(&runtime, hand) } else { None };
+
+                    if let Some((obj, point)) = held_point {
+                        let obj_mat = glam::Mat4::from_rotation_translation(obj.cuboid.rotation, obj.cuboid.position);
+                        let offset_mat = glam::Mat4::from_rotation_translation(
+                            Quat::from_array(point.local_rot),
+                            Vec3::from(point.local_pos),
+                        );
+                        let (_, rot, pos) = (obj_mat * offset_mat).to_scale_rotation_translation();
+                        root_pos = pos;
+                        root_rot = rot;
+                    } else if let Some((obj, grip)) = held_pose {
                         let obj_mat = glam::Mat4::from_rotation_translation(obj.cuboid.rotation, obj.cuboid.position);
                         let offset_mat = glam::Mat4::from_rotation_translation(
                             Quat::from_array(grip.hand_offset_rot),
@@ -612,7 +633,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                         root_rot = rot;
                     }
 
-                    let skinned_mats = hand_skin_matrices(skin, root_pos, root_rot, curl, held.map(|(_, g)| g));
+                    let finger_curl = held_point.map(|(_, p)| &p.finger_curl)
+                        .or_else(|| held_pose.map(|(_, g)| &g.finger_curl));
+                    let skinned_mats = hand_skin_matrices(skin, root_pos, root_rot, curl, finger_curl);
                     skin.update_joint_matrices(renderer.queue(), &skinned_mats);
                 }
             }
@@ -668,6 +691,26 @@ fn nearest_object_to(runtime: &GameRuntime, point: Vec3) -> Option<String> {
         .filter(|(_, d)| *d <= GRAB_RANGE)
         .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
         .map(|(id, _)| id)
+}
+
+/// Nearest named grip point (across every object's `grip_points`) to
+/// `point`, within range — tried before `nearest_object_to` on grab so
+/// objects with authored grip points snap/free-grab correctly instead of
+/// falling back to the old whole-object grab.
+#[cfg(target_os = "android")]
+fn nearest_grip_point_to(runtime: &GameRuntime, point: Vec3) -> Option<(String, String)> {
+    const GRAB_RANGE: f32 = 0.15;
+    runtime.scene().objects.iter()
+        .flat_map(|o| {
+            let obj_mat = glam::Mat4::from_rotation_translation(o.cuboid.rotation, o.cuboid.position);
+            o.grip_points.iter().map(move |gp| {
+                let world_pos = obj_mat.transform_point3(Vec3::from(gp.local_pos));
+                (o.id.clone(), gp.name.clone(), point.distance(world_pos))
+            })
+        })
+        .filter(|(_, _, d)| *d <= GRAB_RANGE)
+        .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap())
+        .map(|(id, name, _)| (id, name))
 }
 
 #[cfg(target_os = "android")]
