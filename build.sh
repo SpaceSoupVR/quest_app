@@ -35,6 +35,18 @@ echo "==> Copying .so into jniLibs ..."
 mkdir -p android/jniLibs/arm64-v8a
 cp "$SO" android/jniLibs/arm64-v8a/libquest_app.so
 
+# space_soup_engine's PhysX integration pulls in C++ code linked against
+# libc++_shared — without bundling it, the app fails to load at the
+# dynamic-linker stage (before any Rust code, including the logger, runs),
+# which looks like an instant, silent crash on launch.
+CXX_SHARED="$NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+if [ -f "$CXX_SHARED" ]; then
+    echo "==> Copying libc++_shared.so into jniLibs ..."
+    cp "$CXX_SHARED" android/jniLibs/arm64-v8a/libc++_shared.so
+else
+    echo "==> WARNING: libc++_shared.so not found at $CXX_SHARED — app will fail to load on device"
+fi
+
 echo "==> Building APK with Gradle ..."
 cd android
 ./gradlew assembleDebug --quiet
