@@ -88,6 +88,33 @@ fn hand_skin_matrices(
         .collect()
 }
 
+/// Per-finger curl for a free (empty) hand, driven directly by the controller:
+/// the trigger curls the index finger, the grip (squeeze) curls the middle,
+/// ring and pinky, and the thumb stays extended. Keyed by generic joint name so
+/// it feeds straight into `hand_skin_matrices`' per-joint lookup.
+#[cfg(target_os = "android")]
+fn free_hand_finger_curl(
+    skin: &space_soup::renderer::mesh::GltfSkin,
+    trigger: f32,
+    squeeze: f32,
+) -> HashMap<String, f32> {
+    let trigger = trigger.clamp(0.0, 1.0);
+    let squeeze = squeeze.clamp(0.0, 1.0);
+    let mut map = HashMap::new();
+    for name in &skin.joint_names {
+        let generic = space_soup::renderer::mesh::GltfSkin::generic_joint_name(name);
+        let curl = if generic.starts_with("thumb") {
+            0.0                 // thumb stays extended
+        } else if generic.starts_with("index") {
+            trigger             // trigger curls the pointer finger
+        } else {
+            squeeze             // grip curls middle / ring / pinky
+        };
+        map.insert(generic.to_string(), curl);
+    }
+    map
+}
+
 #[cfg(target_os = "android")]
 fn held_grip_pose<'a>(runtime: &'a GameRuntime, hand: Hand) -> Option<(&'a space_soup_engine::GameObject, &'a GripPoseDef)> {
     let id = runtime.attachments.object_for_joint(JointId::HandGrip(hand))?;
@@ -594,9 +621,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             if let Some((mesh, _)) = mesh_cache.get(&rm.id) {
                 if let Some(skin) = &mesh.skin {
                     let Some(hand) = hand_for_mesh_id(&rm.id) else { continue };
-                    let (has_grip, squeeze) = match hand {
-                        Hand::Left  => (cs.l_grip_pose.is_some(), cs.l_squeeze),
-                        Hand::Right => (cs.r_grip_pose.is_some(), cs.r_squeeze),
+                    let (has_grip, squeeze, trigger) = match hand {
+                        Hand::Left  => (cs.l_grip_pose.is_some(), cs.l_squeeze, cs.l_trigger),
+                        Hand::Right => (cs.r_grip_pose.is_some(), cs.r_squeeze, cs.r_trigger),
                     };
                     let (mut root_pos, mut root_rot, curl) = if has_grip {
                         let tf = runtime.rig.hand_grip(hand);
@@ -633,8 +660,17 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                         root_rot = rot;
                     }
 
-                    let finger_curl = held_point.map(|(_, p)| &p.finger_curl)
+                    // Held objects define their own finger pose; a free hand is
+                    // driven live by the controller (trigger -> index, grip ->
+                    // middle/ring/pinky, thumb extended).
+                    let held_curl = held_point.map(|(_, p)| &p.finger_curl)
                         .or_else(|| held_pose.map(|(_, g)| &g.finger_curl));
+                    let free_curl = if held_curl.is_none() {
+                        Some(free_hand_finger_curl(skin, trigger, squeeze))
+                    } else {
+                        None
+                    };
+                    let finger_curl = held_curl.or(free_curl.as_ref());
                     let skinned_mats = hand_skin_matrices(skin, root_pos, root_rot, curl, finger_curl);
                     skin.update_joint_matrices(renderer.queue(), &skinned_mats);
                 }
