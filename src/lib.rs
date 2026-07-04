@@ -97,14 +97,19 @@ fn free_hand_finger_curl(
     skin: &space_soup::renderer::mesh::GltfSkin,
     trigger: f32,
     squeeze: f32,
+    thumb_touch: bool,
 ) -> HashMap<String, f32> {
     let trigger = trigger.clamp(0.0, 1.0);
     let squeeze = squeeze.clamp(0.0, 1.0);
+    // Resting the thumb on the joystick curls it partway inward — a relaxed
+    // bend, not a full fist — matching how a real hand rests its thumb on the
+    // stick. Fully extended (0.0) when the thumb is off the stick.
+    let thumb = if thumb_touch { 0.35 } else { 0.0 };
     let mut map = HashMap::new();
     for name in &skin.joint_names {
         let generic = space_soup::renderer::mesh::GltfSkin::generic_joint_name(name);
         let curl = if generic.starts_with("thumb") {
-            0.0                 // thumb stays extended
+            thumb               // thumb rests on the stick when touched
         } else if generic.starts_with("index") {
             trigger             // trigger curls the pointer finger
         } else {
@@ -621,9 +626,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             if let Some((mesh, _)) = mesh_cache.get(&rm.id) {
                 if let Some(skin) = &mesh.skin {
                     let Some(hand) = hand_for_mesh_id(&rm.id) else { continue };
-                    let (has_grip, squeeze, trigger) = match hand {
-                        Hand::Left  => (cs.l_grip_pose.is_some(), cs.l_squeeze, cs.l_trigger),
-                        Hand::Right => (cs.r_grip_pose.is_some(), cs.r_squeeze, cs.r_trigger),
+                    let (has_grip, squeeze, trigger, thumb_touch) = match hand {
+                        Hand::Left  => (cs.l_grip_pose.is_some(), cs.l_squeeze, cs.l_trigger, cs.l_stick_touch),
+                        Hand::Right => (cs.r_grip_pose.is_some(), cs.r_squeeze, cs.r_trigger, cs.r_stick_touch),
                     };
                     let (mut root_pos, mut root_rot, curl) = if has_grip {
                         let tf = runtime.rig.hand_grip(hand);
@@ -666,7 +671,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     let held_curl = held_point.map(|(_, p)| &p.finger_curl)
                         .or_else(|| held_pose.map(|(_, g)| &g.finger_curl));
                     let free_curl = if held_curl.is_none() {
-                        Some(free_hand_finger_curl(skin, trigger, squeeze))
+                        Some(free_hand_finger_curl(skin, trigger, squeeze, thumb_touch))
                     } else {
                         None
                     };
