@@ -272,14 +272,11 @@ EOF
 fi
 detail "Reattach any time with: tmux attach -t $DASHBOARD_SESSION"
 
-# ── 7. Wait for the listener to actually be ready ─────────────────────────────
 wait_for_tcp_listener 7778
 
-# ── 8. Launch Quest app ────────────────────────────────────────────────────────
 step "Launching quest_app on headset..."
 adb shell am start -n "$PACKAGE/android.app.NativeActivity"
 
-# Confirm the process actually started
 tries=0
 until adb shell pidof "$PACKAGE" >/dev/null 2>&1; do
     tries=$((tries + 1))
