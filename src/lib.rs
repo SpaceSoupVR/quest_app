@@ -13,7 +13,8 @@ use space_soup::{Controllers, HandTrackers, Headset, VkContext, XrContext};
 #[cfg(target_os = "android")]
 use space_soup_engine::{
     debug_sender, CuboidStyle as EngineCuboidStyle, DebugPacket, FingerJoint, GameRuntime,
-    GripKind, GripPoseDef, Hand, HandSample, InputFrame, JointId, JointSample, LocomotionInput,
+    ButtonPress, GripKind, GripPoseDef, Hand, HandSample, InputFrame, JointId, JointSample,
+    LocomotionInput,
     LocomotionMode, LocomotionSample, PlayerRig, Pose, RenderCuboid, RenderMesh, SceneSample,
     TeleportTarget, TimingSample,
 };
@@ -324,6 +325,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut prev_l_trigger = false;
     let mut prev_r_squeeze = false;
     let mut prev_l_squeeze = false;
+    let mut prev_btn_a = false;
+    let mut prev_btn_b = false;
+    let mut prev_btn_x = false;
+    let mut prev_btn_y = false;
 
     const JOINT_NAMES: [&str; 26] = [
         "palm",
@@ -572,10 +577,41 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Controller-button presses (rising edges) for animation bindings.
+        // A/B live on the right controller, X/Y on the left; trigger/grip are
+        // emitted per hand. `object_id` carries the held object (if any) so
+        // ContextualHold bindings can match.
+        {
+            let held_r = held_object_id(&runtime, &rig, Hand::Right);
+            let held_l = held_object_id(&runtime, &rig, Hand::Left);
+            let presses = [
+                ("btn_a", cs.btn_a && !prev_btn_a, held_r.clone()),
+                ("btn_b", cs.btn_b && !prev_btn_b, held_r.clone()),
+                ("btn_x", cs.btn_x && !prev_btn_x, held_l.clone()),
+                ("btn_y", cs.btn_y && !prev_btn_y, held_l.clone()),
+                ("trigger", cs.r_trigger > 0.5 && !prev_r_trigger, held_r.clone()),
+                ("trigger", cs.l_trigger > 0.5 && !prev_l_trigger, held_l.clone()),
+                ("grip", cs.r_squeeze > 0.5 && !prev_r_squeeze, held_r),
+                ("grip", cs.l_squeeze > 0.5 && !prev_l_squeeze, held_l),
+            ];
+            for (button, pressed, object_id) in presses {
+                if pressed {
+                    input.button_presses.push(ButtonPress {
+                        button: button.to_string(),
+                        object_id,
+                    });
+                }
+            }
+        }
+
         prev_r_trigger = cs.r_trigger > 0.5;
         prev_l_trigger = cs.l_trigger > 0.5;
         prev_r_squeeze = cs.r_squeeze > 0.5;
         prev_l_squeeze = cs.l_squeeze > 0.5;
+        prev_btn_a = cs.btn_a;
+        prev_btn_b = cs.btn_b;
+        prev_btn_x = cs.btn_x;
+        prev_btn_y = cs.btn_y;
 
         let locomotion_input = LocomotionInput {
             move_stick: (cs.l_stick.x, cs.l_stick.y),
@@ -870,6 +906,17 @@ fn xr_vec3(p: openxr::Vector3f) -> Vec3 {
 #[cfg(target_os = "android")]
 fn xr_quat(o: openxr::Quaternionf) -> Quat {
     Quat::from_xyzw(o.x, o.y, o.z, o.w)
+}
+
+/// The object this hand is currently holding: a physics grip if there is one,
+/// otherwise whatever object is within grab range of the hand (covers
+/// kinematic `grab_at_joint`-style holds).
+#[cfg(target_os = "android")]
+fn held_object_id(runtime: &GameRuntime, rig: &PlayerRig, hand: Hand) -> Option<String> {
+    if let Some((obj, _)) = runtime.held_grip_point(hand) {
+        return Some(obj.id.clone());
+    }
+    nearest_object_to(runtime, rig.hand_grip(hand).position)
 }
 
 #[cfg(target_os = "android")]
