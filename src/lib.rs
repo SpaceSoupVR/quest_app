@@ -7,16 +7,18 @@ use openxr;
 #[cfg(target_os = "android")]
 use space_soup::renderer::xr_renderer::XrRenderer;
 #[cfg(target_os = "android")]
-use space_soup::renderer::{Color3, Cuboid, CuboidStyle as SsCuboidStyle, GltfMesh, MeshInstance};
+use space_soup::renderer::{
+    Color3, Cuboid, CuboidStyle as SsCuboidStyle, GltfMesh, Light, LightKind as SsLightKind,
+    MeshInstance,
+};
 #[cfg(target_os = "android")]
 use space_soup::{Controllers, HandTrackers, Headset, VkContext, XrContext};
 #[cfg(target_os = "android")]
 use space_soup_engine::{
-    debug_sender, CuboidStyle as EngineCuboidStyle, DebugPacket, FingerJoint, GameRuntime,
-    ButtonPress, GripKind, GripPoseDef, Hand, HandSample, InputFrame, JointId, JointSample,
-    LocomotionInput,
-    LocomotionMode, LocomotionSample, PlayerRig, Pose, RenderCuboid, RenderMesh, SceneSample,
-    TeleportTarget, TimingSample,
+    debug_sender, ButtonPress, CuboidStyle as EngineCuboidStyle, DebugPacket, FingerJoint,
+    GameRuntime, GripKind, GripPoseDef, Hand, HandSample, InputFrame, JointId, JointSample,
+    LightKind as EngineLightKind, LocomotionInput, LocomotionMode, LocomotionSample, PlayerRig,
+    Pose, RenderCuboid, RenderLight, RenderMesh, SceneSample, TeleportTarget, TimingSample,
 };
 #[cfg(target_os = "android")]
 use log::warn;
@@ -155,6 +157,10 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
     );
     info!("ANativeActivity_onCreate started");
 
+    // Note: `ndk_glue::init` already registers the JVM/Activity with
+    // `ndk-context` internally (needed by cpal's AAudio backend for kira
+    // sound playback) — don't call `ndk_context::initialize_android_context`
+    // here too, it aborts the process on double-initialization.
     ndk_glue::init(activity as _, saved_state as _, saved_state_size, run);
 }
 
@@ -623,14 +629,15 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
         let teleport_target: Option<TeleportTarget> = None;
 
-        let (render_cuboids, render_meshes, scene_change) =
+        let (render_cuboids, render_meshes, render_lights, scene_change) =
             runtime.update(dt, &input, rig, &locomotion_input, teleport_target);
 
         if frame_count % 90 == 0 {
             info!(
-                "Frame {frame_count}: render_cuboids={} render_meshes={} scene.objects={} dt={:.4}",
+                "Frame {frame_count}: render_cuboids={} render_meshes={} render_lights={} scene.objects={} dt={:.4}",
                 render_cuboids.len(),
                 render_meshes.len(),
+                render_lights.len(),
                 runtime.scene().objects.len(),
                 dt,
             );
@@ -780,6 +787,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .map(|rc| to_space_soup_cuboid(rc, offset, yaw_inv))
             .collect();
 
+        let lights: Vec<Light> = render_lights
+            .iter()
+            .map(|rl| to_space_soup_light(rl, offset, yaw_inv))
+            .collect();
+
         for rm in &render_meshes {
             if let Some((mesh, _)) = mesh_cache.get_mut(&rm.id) {
                 mesh.position = yaw_inv * (rm.position - offset);
@@ -880,6 +892,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             time,
             &cuboids,
             &mesh_instances,
+            &lights,
         )?;
         let proj_layer = openxr::CompositionLayerProjection::new()
             .space(&headset.stage)
@@ -991,6 +1004,25 @@ fn to_space_soup_cuboid(rc: &RenderCuboid, offset: Vec3, yaw_inv: Quat) -> Cuboi
     };
     c.rotation = rotation;
     c
+}
+
+/// Same "world moves under a fixed camera" render-space transform applied to
+/// `render_cuboids`/`render_meshes` above — direction is a vector, so only
+/// the yaw rotation applies to it, not the positional offset.
+#[cfg(target_os = "android")]
+fn to_space_soup_light(rl: &RenderLight, offset: Vec3, yaw_inv: Quat) -> Light {
+    Light {
+        position: yaw_inv * (rl.position - offset),
+        direction: yaw_inv * rl.direction,
+        kind: match rl.kind {
+            EngineLightKind::Point => SsLightKind::Point,
+            EngineLightKind::Spot => SsLightKind::Spot,
+        },
+        color: ss_color(rl.color),
+        intensity: rl.intensity,
+        range: rl.range,
+        cone_angle_deg: rl.cone_angle_deg,
+    }
 }
 
 #[cfg(target_os = "android")]
