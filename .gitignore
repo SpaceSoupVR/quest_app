@@ -3,3 +3,5 @@
 target/
 .claude/
 .claude/
+android/.gradle/
+android/app/build/
