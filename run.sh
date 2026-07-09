@@ -27,51 +27,40 @@ SPACE_SOUP_DIR="$XR_DIR/space_soup"
 GAME_DIR="$XR_DIR/game"
 PACKAGE="com.example.questapp"
 REMOTE_GAME_DIR="/sdcard/Android/data/$PACKAGE/files/game"
+REMOTE_SERVER_URL_FILE="/sdcard/Android/data/$PACKAGE/files/server_url.txt"
+# The deployed multiplayer server (space_soup_server) on the DigitalOcean
+# droplet. Override with QUEST_SERVER_URL to point at a different server
+# (e.g. a local one on your LAN) without editing this script.
+SERVER_URL="${QUEST_SERVER_URL:-ws://137.184.21.78:9001}"
+# SSH access to that same droplet, used only to verify/restart the
+# space-soup-server systemd service before we tell the headset to connect
+# to it. Override with QUEST_SERVER_SSH_HOST/QUEST_SERVER_SSH_KEY if yours
+# differ.
+DROPLET_SSH_HOST="${QUEST_SERVER_SSH_HOST:-root@137.184.21.78}"
+DROPLET_SSH_KEY="${QUEST_SERVER_SSH_KEY:-$HOME/vr_digitalocean}"
+DROPLET_SERVICE="space-soup-server.service"
 HOST_TARGET=$(rustc -vV | awk '/host:/ {print $2}')
 SDK_HOME="${ANDROID_SDK_HOME:-$HOME/Library/Android/sdk}"
 NDK_HOME="${ANDROID_NDK_HOME:-$(ls -d "$SDK_HOME/ndk/"* 2>/dev/null | sort -V | tail -1)}"
 DASHBOARD_SESSION="quest_app"
 
+cleanup() {
+    tmux kill-session -t "$DASHBOARD_SESSION" 2>/dev/null || true
+    (cd "$QUEST_APP_DIR/android" && ./gradlew --stop >/dev/null 2>&1) || true
+}
+trap cleanup EXIT
 
 if ! command -v tmux >/dev/null 2>&1; then
     fail "tmux not found — install it with: brew install tmux"
     exit 1
 fi
-if ! command -v xterm >/dev/null 2>&1; then
-    warn "xterm not found (install XQuartz for it: brew install --cask xquartz)."
-    detail "Continuing — the dashboard will open in Terminal.app instead."
-fi
 
-resolve_display() {
-    if ! command -v xterm >/dev/null 2>&1; then
-        return 1
-    fi
-
-    local n="${DISPLAY#:}"
-    if [ -n "$DISPLAY" ] && [ -S "/tmp/.X11-unix/X${n:-0}" ]; then
-        printf '%s' "$DISPLAY"
-        return 0
-    fi
-    if [ -S "/tmp/.X11-unix/X0" ]; then
-        printf ':0'
-        return 0
-    fi
-
-    if [ -d "/Applications/Utilities/XQuartz.app" ] || [ -d "/Applications/XQuartz.app" ]; then
-        detail "Starting XQuartz (not running yet — first run after install needs this)..." >&2
-        open -a XQuartz 2>/dev/null || true
-        local tries=0
-        while [ "$tries" -lt 20 ]; do
-            if [ -S "/tmp/.X11-unix/X0" ]; then
-                printf ':0'
-                return 0
-            fi
-            tries=$((tries + 1))
-            sleep 1
-        done
-    fi
-    return 1
-}
+WANT_EDITOR=true
+read -r -p "Do you want the scene editor? [Y/n] " editor_reply
+case "$editor_reply" in
+    [nN]*) WANT_EDITOR=false ;;
+    *) WANT_EDITOR=true ;;
+esac
 
 wait_for_remote_path() {
     local path="$1"
@@ -140,18 +129,22 @@ step "Cleaning space_soup..."
 cd "$SPACE_SOUP_DIR"
 cargo clean
 
-step "Cleaning debug_viewer..."
-cd "$DEBUG_VIEWER_DIR"
-cargo clean
+if $WANT_EDITOR; then
+    step "Cleaning debug_viewer..."
+    cd "$DEBUG_VIEWER_DIR"
+    cargo clean
+fi
 
 step "Cleaning quest_app..."
 cd "$QUEST_APP_DIR"
 cargo clean
 cd android && ./gradlew clean && cd ..
 
-step "Pre-building debug_viewer..."
-cd "$DEBUG_VIEWER_DIR"
-cargo build --target "$HOST_TARGET"
+if $WANT_EDITOR; then
+    step "Pre-building debug_viewer..."
+    cd "$DEBUG_VIEWER_DIR"
+    cargo build --target "$HOST_TARGET"
+fi
 
 step "Building quest_app for Android..."
 cd "$QUEST_APP_DIR"
@@ -186,8 +179,10 @@ ok "Package installed and registered."
 
 cd "$QUEST_APP_DIR"
 
-step "Reversing TCP debug_viewer port 7778..."
-adb reverse tcp:7778 tcp:7778
+if $WANT_EDITOR; then
+    step "Reversing TCP debug_viewer port 7778..."
+    adb reverse tcp:7778 tcp:7778
+fi
 
 if [ ! -f "$GAME_DIR/manifest.json" ]; then
     fail "$GAME_DIR/manifest.json not found. Aborting."
@@ -236,7 +231,24 @@ fi
 
 ok "Game folder verified on device."
 
-step "Opening dev dashboard (tmux in xterm)..."
+step "Verifying multiplayer server is running on $DROPLET_SSH_HOST..."
+if [ -f "$DROPLET_SSH_KEY" ]; then
+    if ssh -i "$DROPLET_SSH_KEY" -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
+        "$DROPLET_SSH_HOST" "systemctl is-active --quiet $DROPLET_SERVICE || systemctl restart $DROPLET_SERVICE"; then
+        ok "space-soup-server is active."
+    else
+        warn "Could not confirm space-soup-server is running on $DROPLET_SSH_HOST — multiplayer may not work. Check manually with: ssh -i $DROPLET_SSH_KEY $DROPLET_SSH_HOST systemctl status $DROPLET_SERVICE"
+    fi
+else
+    warn "SSH key not found at $DROPLET_SSH_KEY — skipping multiplayer server check (set QUEST_SERVER_SSH_KEY to override)."
+fi
+
+step "Pushing multiplayer server URL ($SERVER_URL)..."
+adb shell mkdir -p "$(dirname "$REMOTE_SERVER_URL_FILE")"
+echo "$SERVER_URL" | adb shell "cat > '$REMOTE_SERVER_URL_FILE'"
+verify_remote_file "$REMOTE_SERVER_URL_FILE"
+
+step "Starting dev dashboard (tmux, running in background)..."
 
 tmux kill-session -t "$DASHBOARD_SESSION" 2>/dev/null || true
 tmux new-session -d -s "$DASHBOARD_SESSION" -n dev -x 220 -y 52
@@ -256,34 +268,26 @@ tmux send-keys -t "$PANE_LOGCAT" \
     "export DISABLE_AUTO_UPDATE=true; cd '$QUEST_APP_DIR' && adb logcat -s quest_app" C-m
 tmux select-pane -t "$PANE_LOGCAT" -T "logcat"
 
-PANE_VIEWER=$(tmux split-window -h -t "$PANE_LOGCAT" -l "60%" -P -F '#{pane_id}')
-tmux send-keys -t "$PANE_VIEWER" \
-    "export DISABLE_AUTO_UPDATE=true; cd '$DEBUG_VIEWER_DIR' && cargo run --target $HOST_TARGET" C-m
-tmux select-pane -t "$PANE_VIEWER" -T "debug_viewer"
+if $WANT_EDITOR; then
+    PANE_VIEWER=$(tmux split-window -h -t "$PANE_LOGCAT" -l "60%" -P -F '#{pane_id}')
+    tmux send-keys -t "$PANE_VIEWER" \
+        "export DISABLE_AUTO_UPDATE=true; cd '$DEBUG_VIEWER_DIR' && cargo run --target $HOST_TARGET" C-m
+    tmux select-pane -t "$PANE_VIEWER" -T "debug_viewer"
 
-PANE_KEEPALIVE=$(tmux split-window -v -t "$PANE_LOGCAT" -l "40%" -P -F '#{pane_id}')
-tmux send-keys -t "$PANE_KEEPALIVE" \
-    "export DISABLE_AUTO_UPDATE=true; while true; do adb reverse tcp:7778 tcp:7778 2>/dev/null; sleep 5; done" C-m
-tmux select-pane -t "$PANE_KEEPALIVE" -T "adb reverse keepalive"
+    PANE_KEEPALIVE=$(tmux split-window -v -t "$PANE_LOGCAT" -l "40%" -P -F '#{pane_id}')
+    tmux send-keys -t "$PANE_KEEPALIVE" \
+        "export DISABLE_AUTO_UPDATE=true; while true; do adb reverse tcp:7778 tcp:7778 2>/dev/null; sleep 5; done" C-m
+    tmux select-pane -t "$PANE_KEEPALIVE" -T "adb reverse keepalive"
 
-tmux select-pane -t "$PANE_VIEWER"
-
-if XTERM_DISPLAY=$(resolve_display); then
-    DISPLAY="$XTERM_DISPLAY" xterm -fa Monaco -fs 13 -bg '#101418' -fg '#d8f0ff' -geometry 220x52+40+40 \
-        -T "quest_app dev" -e "tmux attach -t $DASHBOARD_SESSION" &
-    ok "Dashboard opened in xterm."
-else
-    warn "No usable X11 display for xterm — opening the same dashboard in Terminal.app instead."
-    osascript <<EOF
-tell application "Terminal"
-    do script "tmux attach -t $DASHBOARD_SESSION"
-end tell
-EOF
-    ok "Dashboard opened in Terminal.app."
+    tmux select-pane -t "$PANE_VIEWER"
 fi
-detail "Reattach any time with: tmux attach -t $DASHBOARD_SESSION"
 
-wait_for_tcp_listener 7778
+ok "Dashboard running in background tmux session (no window opened)."
+detail "Attach any time with: tmux attach -t $DASHBOARD_SESSION"
+
+if $WANT_EDITOR; then
+    wait_for_tcp_listener 7778
+fi
 
 step "Launching quest_app on headset..."
 adb shell am start -n "$PACKAGE/android.app.NativeActivity"
@@ -300,5 +304,9 @@ done
 ok "quest_app process running."
 
 step "All set."
-detail "Put on your headset and move around — debug_viewer shows the live scene + player."
+if $WANT_EDITOR; then
+    detail "Put on your headset and move around — debug_viewer shows the live scene + player."
+fi
 detail "Dashboard: tmux attach -t $DASHBOARD_SESSION"
+
+read -r -p "Press Enter when you're done to stop the dashboard and free up GPU/CPU... "
