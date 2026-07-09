@@ -223,6 +223,17 @@ if [ -d "$GAME_DIR/models" ]; then
     shopt -u nullglob
 fi
 
+if [ -d "$GAME_DIR/sound" ]; then
+    adb shell mkdir -p "$REMOTE_GAME_DIR/sound"
+    shopt -s nullglob
+    for f in "$GAME_DIR"/sound/*; do
+        fname=$(basename "$f")
+        adb push "$f" "$REMOTE_GAME_DIR/sound/$fname"
+        verify_remote_file "$REMOTE_GAME_DIR/sound/$fname"
+    done
+    shopt -u nullglob
+fi
+
 ok "Game folder verified on device."
 
 step "Opening dev dashboard (tmux in xterm)..."
