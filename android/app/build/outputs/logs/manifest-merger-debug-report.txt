@@ -1,0 +1,117 @@
+-- Merging decision tree log ---
+manifest
+ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:2:1-39:12
+INJECTED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:2:1-39:12
+INJECTED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:2:1-39:12
+INJECTED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:2:1-39:12
+MERGED from [org.khronos.openxr:openxr_loader_for_android:1.1.60] /Users/frank/.gradle/caches/9.0.0/transforms/aa90582a0b57b5ae47be057f0a425d8c/transformed/openxr_loader_for_android-1.1.60/AndroidManifest.xml:1:1-29:12
+	package
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:3:5-35
+		INJECTED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml
+	android:versionName
+		INJECTED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml
+	android:versionCode
+		INJECTED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml
+	xmlns:android
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:2:11-69
+uses-permission#android.permission.INTERNET
+ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:5:5-67
+	android:name
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:5:22-64
+uses-permission#org.khronos.openxr.permission.OPENXR
+ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:6:5-76
+MERGED from [org.khronos.openxr:openxr_loader_for_android:1.1.60] /Users/frank/.gradle/caches/9.0.0/transforms/aa90582a0b57b5ae47be057f0a425d8c/transformed/openxr_loader_for_android-1.1.60/AndroidManifest.xml:13:3-74
+MERGED from [org.khronos.openxr:openxr_loader_for_android:1.1.60] /Users/frank/.gradle/caches/9.0.0/transforms/aa90582a0b57b5ae47be057f0a425d8c/transformed/openxr_loader_for_android-1.1.60/AndroidManifest.xml:13:3-74
+	android:name
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:6:22-73
+uses-permission#org.khronos.openxr.permission.OPENXR_SYSTEM
+ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:7:5-83
+MERGED from [org.khronos.openxr:openxr_loader_for_android:1.1.60] /Users/frank/.gradle/caches/9.0.0/transforms/aa90582a0b57b5ae47be057f0a425d8c/transformed/openxr_loader_for_android-1.1.60/AndroidManifest.xml:14:3-81
+MERGED from [org.khronos.openxr:openxr_loader_for_android:1.1.60] /Users/frank/.gradle/caches/9.0.0/transforms/aa90582a0b57b5ae47be057f0a425d8c/transformed/openxr_loader_for_android-1.1.60/AndroidManifest.xml:14:3-81
+	android:name
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:7:22-80
+uses-feature#android.hardware.vr.headtracking
+ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:8:5-93
+	android:required
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:8:67-90
+	android:name
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:8:19-66
+application
+ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:10:5-38:19
+INJECTED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:10:5-38:19
+	android:extractNativeLibs
+		INJECTED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml
+	android:label
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:11:9-33
+	android:hasCode
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:12:9-32
+meta-data#com.oculus.supportedDevices
+ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:14:9-16:60
+	android:value
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:16:13-57
+	android:name
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:15:13-55
+activity#android.app.NativeActivity
+ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:18:9-37:20
+	android:screenOrientation
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:21:13-50
+	android:exported
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:20:13-36
+	android:configChanges
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:22:13-122
+	android:name
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:19:13-54
+meta-data#android.app.lib_name
+ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:24:13-26:45
+	android:value
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:26:17-42
+	android:name
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:25:17-52
+meta-data#com.oculus.vr.focusaware
+ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:28:13-30:40
+	android:value
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:30:17-37
+	android:name
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:29:17-56
+intent-filter#action:name:android.intent.action.MAIN+category:name:android.intent.category.LAUNCHER+category:name:com.oculus.intent.category.VR
+ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:32:13-36:29
+action#android.intent.action.MAIN
+ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:33:17-69
+	android:name
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:33:25-66
+category#android.intent.category.LAUNCHER
+ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:34:17-77
+	android:name
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:34:27-74
+category#com.oculus.intent.category.VR
+ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:35:17-74
+	android:name
+		ADDED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml:35:27-71
+uses-sdk
+INJECTED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml reason: use-sdk injection requested
+INJECTED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml
+INJECTED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml
+MERGED from [org.khronos.openxr:openxr_loader_for_android:1.1.60] /Users/frank/.gradle/caches/9.0.0/transforms/aa90582a0b57b5ae47be057f0a425d8c/transformed/openxr_loader_for_android-1.1.60/AndroidManifest.xml:11:3-72
+MERGED from [org.khronos.openxr:openxr_loader_for_android:1.1.60] /Users/frank/.gradle/caches/9.0.0/transforms/aa90582a0b57b5ae47be057f0a425d8c/transformed/openxr_loader_for_android-1.1.60/AndroidManifest.xml:11:3-72
+	android:targetSdkVersion
+		INJECTED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml
+	android:minSdkVersion
+		INJECTED from /Users/frank/Desktop/rampstack/vr/quest_app/android/app/src/main/AndroidManifest.xml
+queries
+ADDED from [org.khronos.openxr:openxr_loader_for_android:1.1.60] /Users/frank/.gradle/caches/9.0.0/transforms/aa90582a0b57b5ae47be057f0a425d8c/transformed/openxr_loader_for_android-1.1.60/AndroidManifest.xml:16:3-27:13
+provider
+ADDED from [org.khronos.openxr:openxr_loader_for_android:1.1.60] /Users/frank/.gradle/caches/9.0.0/transforms/aa90582a0b57b5ae47be057f0a425d8c/transformed/openxr_loader_for_android-1.1.60/AndroidManifest.xml:18:5-114
+	android:authorities
+		ADDED from [org.khronos.openxr:openxr_loader_for_android:1.1.60] /Users/frank/.gradle/caches/9.0.0/transforms/aa90582a0b57b5ae47be057f0a425d8c/transformed/openxr_loader_for_android-1.1.60/AndroidManifest.xml:18:15-111
+intent#action:name:org.khronos.openxr.OpenXRRuntimeService
+ADDED from [org.khronos.openxr:openxr_loader_for_android:1.1.60] /Users/frank/.gradle/caches/9.0.0/transforms/aa90582a0b57b5ae47be057f0a425d8c/transformed/openxr_loader_for_android-1.1.60/AndroidManifest.xml:21:5-23:14
+action#org.khronos.openxr.OpenXRRuntimeService
+ADDED from [org.khronos.openxr:openxr_loader_for_android:1.1.60] /Users/frank/.gradle/caches/9.0.0/transforms/aa90582a0b57b5ae47be057f0a425d8c/transformed/openxr_loader_for_android-1.1.60/AndroidManifest.xml:22:7-72
+	android:name
+		ADDED from [org.khronos.openxr:openxr_loader_for_android:1.1.60] /Users/frank/.gradle/caches/9.0.0/transforms/aa90582a0b57b5ae47be057f0a425d8c/transformed/openxr_loader_for_android-1.1.60/AndroidManifest.xml:22:15-69
+intent#action:name:org.khronos.openxr.OpenXRApiLayerService
+ADDED from [org.khronos.openxr:openxr_loader_for_android:1.1.60] /Users/frank/.gradle/caches/9.0.0/transforms/aa90582a0b57b5ae47be057f0a425d8c/transformed/openxr_loader_for_android-1.1.60/AndroidManifest.xml:24:5-26:14
+action#org.khronos.openxr.OpenXRApiLayerService
+ADDED from [org.khronos.openxr:openxr_loader_for_android:1.1.60] /Users/frank/.gradle/caches/9.0.0/transforms/aa90582a0b57b5ae47be057f0a425d8c/transformed/openxr_loader_for_android-1.1.60/AndroidManifest.xml:25:7-73
+	android:name
+		ADDED from [org.khronos.openxr:openxr_loader_for_android:1.1.60] /Users/frank/.gradle/caches/9.0.0/transforms/aa90582a0b57b5ae47be057f0a425d8c/transformed/openxr_loader_for_android-1.1.60/AndroidManifest.xml:25:15-70
