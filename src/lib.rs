@@ -552,7 +552,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
         if r_trigger_down && !(prev_r_trigger || prev_r_squeeze) {
             let p = rig.hand_grip(Hand::Right).position;
-            if let Some((id, point)) = nearest_grip_point_to(&runtime, p, r_trigger_only) {
+            if let Some((id, point)) = nearest_grip_point_to(&runtime, p, r_trigger_only, Hand::Right) {
                 input.grabbed.push((id, Hand::Right, point));
             } else if let Some(id) = nearest_object_to(&runtime, p) {
                 input.grabbed.push((id, Hand::Right, String::new()));
@@ -565,7 +565,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
         if l_trigger_down && !(prev_l_trigger || prev_l_squeeze) {
             let p = rig.hand_grip(Hand::Left).position;
-            if let Some((id, point)) = nearest_grip_point_to(&runtime, p, l_trigger_only) {
+            if let Some((id, point)) = nearest_grip_point_to(&runtime, p, l_trigger_only, Hand::Left) {
                 input.grabbed.push((id, Hand::Left, point));
             } else if let Some(id) = nearest_object_to(&runtime, p) {
                 input.grabbed.push((id, Hand::Left, String::new()));
@@ -880,6 +880,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             time,
             &cuboids,
             &mesh_instances,
+            &[],
         )?;
         let proj_layer = openxr::CompositionLayerProjection::new()
             .space(&headset.stage)
@@ -942,6 +943,7 @@ fn nearest_grip_point_to(
     runtime: &GameRuntime,
     point: Vec3,
     trigger_only: bool,
+    hand: Hand,
 ) -> Option<(String, String)> {
     const GRAB_RANGE: f32 = 0.15;
     runtime
@@ -951,15 +953,20 @@ fn nearest_grip_point_to(
         .flat_map(|o| {
             let obj_mat =
                 glam::Mat4::from_rotation_translation(o.cuboid.rotation, o.cuboid.position);
-            o.grip_points.iter().map(move |gp| {
-                let world_pos = obj_mat.transform_point3(Vec3::from(gp.local_pos));
-                (
-                    o.id.clone(),
-                    gp.name.clone(),
-                    gp.kind,
-                    point.distance(world_pos),
-                )
-            })
+            // A hand only considers points tagged for it — so a left hand
+            // never snaps into a pose authored for the right hand.
+            o.grip_points
+                .iter()
+                .filter(move |gp| gp.hand == hand)
+                .map(move |gp| {
+                    let world_pos = obj_mat.transform_point3(Vec3::from(gp.local_pos));
+                    (
+                        o.id.clone(),
+                        gp.name.clone(),
+                        gp.kind,
+                        point.distance(world_pos),
+                    )
+                })
         })
         .filter(|(_, _, kind, d)| *d <= GRAB_RANGE && (*kind != GripKind::Pinch || trigger_only))
         .min_by(|a, b| a.3.partial_cmp(&b.3).unwrap())
