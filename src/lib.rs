@@ -1,5 +1,9 @@
 use log::{error, info};
 
+mod avatar;
+#[cfg(target_os = "android")]
+mod network;
+
 #[cfg(target_os = "android")]
 use glam::{Quat, Vec3};
 #[cfg(target_os = "android")]
@@ -7,17 +11,26 @@ use openxr;
 #[cfg(target_os = "android")]
 use space_soup::renderer::xr_renderer::XrRenderer;
 #[cfg(target_os = "android")]
-use space_soup::renderer::{Color3, Cuboid, CuboidStyle as SsCuboidStyle, GltfMesh, MeshInstance};
+use space_soup::renderer::{
+    Color3, Cuboid, CuboidStyle as SsCuboidStyle, GltfMesh, Light, LightKind as SsLightKind,
+    MeshInstance,
+};
 #[cfg(target_os = "android")]
 use space_soup::{Controllers, HandTrackers, Headset, VkContext, XrContext};
 #[cfg(target_os = "android")]
 use space_soup_engine::{
-    debug_sender, CuboidStyle as EngineCuboidStyle, DebugPacket, FingerJoint, GameRuntime,
-    ButtonPress, GripKind, GripPoseDef, Hand, HandSample, InputFrame, JointId, JointSample,
-    LocomotionInput,
-    LocomotionMode, LocomotionSample, PlayerRig, Pose, RenderCuboid, RenderMesh, SceneSample,
-    TeleportTarget, TimingSample,
+    debug_sender, ButtonPress, CuboidStyle as EngineCuboidStyle, DebugPacket, FingerJoint,
+    GameRuntime, Hand, HandSample, InputFrame, JointSample, LightKind as EngineLightKind,
+    Locomotion, LocomotionInput, LocomotionMode, LocomotionSample, PlayerFrameInput, Pose,
+    RenderCuboid, RenderLight, RenderMesh, SceneSample, TeleportTarget, TimingSample,
 };
+#[cfg(target_os = "android")]
+use space_soup_hands::{
+    build_player_rig, free_hand_finger_curl, hand_for_mesh_id, hand_skin_matrices,
+    held_grip_pose, held_object_id, nearest_grip_point_to, nearest_object_to,
+};
+#[cfg(target_os = "android")]
+use space_soup_protocol::PlayerId;
 #[cfg(target_os = "android")]
 use log::warn;
 #[cfg(target_os = "android")]
@@ -65,83 +78,6 @@ fn pump_android_events(exit: &mut bool) {
 }
 
 #[cfg(target_os = "android")]
-fn hand_for_mesh_id(id: &str) -> Option<Hand> {
-    if id.starts_with("lhand") {
-        Some(Hand::Left)
-    } else if id.starts_with("rhand") {
-        Some(Hand::Right)
-    } else {
-        None
-    }
-}
-
-#[cfg(target_os = "android")]
-fn hand_skin_matrices(
-    skin: &space_soup::renderer::mesh::GltfSkin,
-    root_pos: Vec3,
-    root_rot: Quat,
-    curl: f32,
-    finger_curl: Option<&HashMap<String, f32>>,
-) -> Vec<glam::Mat4> {
-    let local_pose = skin.blended_local_pose(0, 1, |ji| {
-        finger_curl
-            .and_then(|fc| {
-                let name =
-                    space_soup::renderer::mesh::GltfSkin::generic_joint_name(&skin.joint_names[ji]);
-                fc.get(name).copied()
-            })
-            .unwrap_or(curl)
-    });
-    let global_in_mesh_space = skin.hierarchical_transforms(&local_pose);
-    let root = glam::Mat4::from_rotation_translation(root_rot, root_pos);
-
-    skin.inv_bind_mats
-        .iter()
-        .enumerate()
-        .map(|(ji, inv_bind)| root * global_in_mesh_space[ji] * *inv_bind)
-        .collect()
-}
-
-#[cfg(target_os = "android")]
-fn free_hand_finger_curl(
-    skin: &space_soup::renderer::mesh::GltfSkin,
-    trigger: f32,
-    squeeze: f32,
-    thumb_touch: bool,
-) -> HashMap<String, f32> {
-    let trigger = trigger.clamp(0.0, 1.0);
-    let squeeze = squeeze.clamp(0.0, 1.0);
-
-    let thumb = if thumb_touch { 0.35 } else { 0.0 };
-    let mut map = HashMap::new();
-    for name in &skin.joint_names {
-        let generic = space_soup::renderer::mesh::GltfSkin::generic_joint_name(name);
-        let curl = if generic.starts_with("thumb") {
-            thumb
-        } else if generic.starts_with("index") {
-            trigger
-        } else {
-            squeeze
-        };
-        map.insert(generic.to_string(), curl);
-    }
-    map
-}
-
-#[cfg(target_os = "android")]
-fn held_grip_pose<'a>(
-    runtime: &'a GameRuntime,
-    hand: Hand,
-) -> Option<(&'a space_soup_engine::GameObject, &'a GripPoseDef)> {
-    let id = runtime
-        .attachments
-        .object_for_joint(JointId::HandGrip(hand))?;
-    let obj = runtime.scene().find_object(id)?;
-    let grip = obj.grip_pose(hand)?;
-    Some((obj, grip))
-}
-
-#[cfg(target_os = "android")]
 #[no_mangle]
 pub unsafe extern "C" fn ANativeActivity_onCreate(
     activity: *mut std::ffi::c_void,
@@ -155,6 +91,10 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
     );
     info!("ANativeActivity_onCreate started");
 
+    // Note: `ndk_glue::init` already registers the JVM/Activity with
+    // `ndk-context` internally (needed by cpal's AAudio backend for kira
+    // sound playback) — don't call `ndk_context::initialize_android_context`
+    // here too, it aborts the process on double-initialization.
     ndk_glue::init(activity as _, saved_state as _, saved_state_size, run);
 }
 
@@ -255,17 +195,36 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         runtime.scene().objects.len()
     );
 
-    runtime.locomotion.set_mode(LocomotionMode::Smooth);
+    // quest_app still simulates its own single local player (Phase 4 of the
+    // server-authoritative rework — actually sending this to a remote
+    // server and rendering *its* results instead — hasn't happened yet);
+    // GameRuntime itself is multi-player-capable now, so it needs a fixed
+    // id to address that one local player by.
+    let local_player = PlayerId::local();
+    runtime
+        .locomotions
+        .insert(local_player, Locomotion::new(LocomotionMode::Smooth));
 
     info!(
         "Object count after load (incl. hand bones from scene JSON): {}",
         runtime.scene().objects.len()
     );
 
+    let net = network::spawn(network::server_url());
+
     let mut mesh_cache: HashMap<
         String,
         (GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform),
     > = HashMap::new();
+
+    // Remote-player avatar bodies: one man.glb instance per connected
+    // player, keyed by PlayerId rather than scene-object id (see avatar.rs
+    // for why head/torso/arms are split between this mesh and cuboids).
+    let mut avatar_mesh_cache: HashMap<
+        PlayerId,
+        (GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform),
+    > = HashMap::new();
+    let man_glb_path = runtime.game_dir().join("models/man.glb");
 
     let (mesh_tx, mesh_rx) = std::sync::mpsc::channel::<(String, GltfMesh)>();
     {
@@ -459,89 +418,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
         let cs = &controllers.state;
 
-        let mut rig = PlayerRig::new();
-
-        if let Some(ev) = eye_views.first() {
-            let p = ev.pose.position;
-            let o = ev.pose.orientation;
-            let (wp, wr) = runtime.locomotion.apply_to_head(
-                Vec3::new(p.x, p.y, p.z),
-                Quat::from_xyzw(o.x, o.y, o.z, o.w),
-            );
-            rig.set_head(wp, wr);
-        }
-
-        if let Some(p) = cs.r_grip_pose {
-            let (wp, wr) = runtime
-                .locomotion
-                .apply_to_head(xr_vec3(p.position), xr_quat(p.orientation));
-            rig.set_hand_grip(Hand::Right, wp, wr);
-        }
-        if let Some(p) = cs.l_grip_pose {
-            let (wp, wr) = runtime
-                .locomotion
-                .apply_to_head(xr_vec3(p.position), xr_quat(p.orientation));
-            rig.set_hand_grip(Hand::Left, wp, wr);
-        }
-        if let Some(p) = cs.r_aim_pose {
-            let (wp, wr) = runtime
-                .locomotion
-                .apply_to_head(xr_vec3(p.position), xr_quat(p.orientation));
-            rig.set_hand_aim(Hand::Right, wp, wr);
-        }
-        if let Some(p) = cs.l_aim_pose {
-            let (wp, wr) = runtime
-                .locomotion
-                .apply_to_head(xr_vec3(p.position), xr_quat(p.orientation));
-            rig.set_hand_aim(Hand::Left, wp, wr);
-        }
-
-        if hands.right_joints.iter().any(|j| j.valid) {
-            let joints: Vec<(Vec3, Quat, bool)> = hands
-                .right_joints
-                .iter()
-                .map(|j| {
-                    let (wp, wr) = runtime
-                        .locomotion
-                        .apply_to_head(xr_vec3(j.pose.position), xr_quat(j.pose.orientation));
-                    (wp, wr, j.valid)
-                })
-                .collect();
-            rig.set_hand_joints(Hand::Right, &joints);
-        } else if let Some(grip) = cs.r_grip_pose {
-            let (gp, gr) = runtime
-                .locomotion
-                .apply_to_head(xr_vec3(grip.position), xr_quat(grip.orientation));
-            rig.set_hand_joints(
-                Hand::Right,
-                &controller_hand_joints(gp, gr, Hand::Right, cs.r_squeeze),
-            );
-        } else {
-            rig.clear_hand_tracking(Hand::Right);
-        }
-        if hands.left_joints.iter().any(|j| j.valid) {
-            let joints: Vec<(Vec3, Quat, bool)> = hands
-                .left_joints
-                .iter()
-                .map(|j| {
-                    let (wp, wr) = runtime
-                        .locomotion
-                        .apply_to_head(xr_vec3(j.pose.position), xr_quat(j.pose.orientation));
-                    (wp, wr, j.valid)
-                })
-                .collect();
-            rig.set_hand_joints(Hand::Left, &joints);
-        } else if let Some(grip) = cs.l_grip_pose {
-            let (gp, gr) = runtime
-                .locomotion
-                .apply_to_head(xr_vec3(grip.position), xr_quat(grip.orientation));
-            rig.set_hand_joints(
-                Hand::Left,
-                &controller_hand_joints(gp, gr, Hand::Left, cs.l_squeeze),
-            );
-        } else {
-            rig.clear_hand_tracking(Hand::Left);
-        }
+        let rig = build_player_rig(&eye_views, &runtime.locomotions[&local_player], cs, &hands);
 
         let mut input = InputFrame::default();
 
@@ -582,8 +459,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         // emitted per hand. `object_id` carries the held object (if any) so
         // ContextualHold bindings can match.
         {
-            let held_r = held_object_id(&runtime, &rig, Hand::Right);
-            let held_l = held_object_id(&runtime, &rig, Hand::Left);
+            let held_r = held_object_id(&runtime, local_player, &rig, Hand::Right);
+            let held_l = held_object_id(&runtime, local_player, &rig, Hand::Left);
             let presses = [
                 ("btn_a", cs.btn_a && !prev_btn_a, held_r.clone()),
                 ("btn_b", cs.btn_b && !prev_btn_b, held_r.clone()),
@@ -623,14 +500,42 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
         let teleport_target: Option<TeleportTarget> = None;
 
-        let (render_cuboids, render_meshes, scene_change) =
-            runtime.update(dt, &input, rig, &locomotion_input, teleport_target);
+        let mut frame_inputs = HashMap::new();
+        frame_inputs.insert(
+            local_player,
+            PlayerFrameInput {
+                rig,
+                input,
+                locomotion_input,
+                teleport_target,
+            },
+        );
+        let (render_cuboids, render_meshes, render_lights, scene_change) =
+            runtime.update(dt, &frame_inputs);
+
+        // Multiplayer: publish this frame's world-space head/hand transforms
+        // (rig.head()/hand_grip() are already locomotion-adjusted, unlike
+        // the raw eye_views/grip poses used for the debug packet below) for
+        // network.rs's background thread to forward to the server.
+        {
+            let to_transform = |tf: space_soup_engine::Transform| avatar::Transform {
+                position: tf.position,
+                rotation: tf.rotation,
+            };
+            let local_rig = &runtime.rigs[&local_player];
+            let _ = net.local_pose_tx.send(avatar::LocalPose {
+                head: to_transform(local_rig.head()),
+                left_hand: Some(to_transform(local_rig.hand_grip(Hand::Left))),
+                right_hand: Some(to_transform(local_rig.hand_grip(Hand::Right))),
+            });
+        }
 
         if frame_count % 90 == 0 {
             info!(
-                "Frame {frame_count}: render_cuboids={} render_meshes={} scene.objects={} dt={:.4}",
+                "Frame {frame_count}: render_cuboids={} render_meshes={} render_lights={} scene.objects={} dt={:.4}",
                 render_cuboids.len(),
                 render_meshes.len(),
+                render_lights.len(),
                 runtime.scene().objects.len(),
                 dt,
             );
@@ -738,10 +643,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 },
 
                 locomotion: LocomotionSample {
-                    mode: format!("{:?}", runtime.locomotion.mode),
-                    player_offset: runtime.locomotion.player_offset.into(),
-                    player_yaw_deg: runtime.locomotion.player_yaw.to_degrees(),
-                    teleport_aiming: runtime.locomotion.is_teleport_aiming(),
+                    mode: format!("{:?}", runtime.locomotions[&local_player].mode),
+                    player_offset: runtime.locomotions[&local_player].player_offset.into(),
+                    player_yaw_deg: runtime.locomotions[&local_player].player_yaw.to_degrees(),
+                    teleport_aiming: runtime.locomotions[&local_player].is_teleport_aiming(),
                 },
 
                 scene: SceneSample {
@@ -768,16 +673,70 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let offset = runtime.locomotion.player_offset;
-        let yaw_inv = Quat::from_rotation_y(-runtime.locomotion.player_yaw);
+        let offset = runtime.locomotions[&local_player].player_offset;
+        let yaw_inv = Quat::from_rotation_y(-runtime.locomotions[&local_player].player_yaw);
 
-        let (head_pos, _) = runtime.world_head_transform();
+        let (head_pos, _) = runtime.world_head_transform(local_player);
         const MAX_RENDER_DIST: f32 = 40.0;
+
+        let remotes = net.remote_players.lock().unwrap().clone();
+
+        let avatar_cuboids: Vec<RenderCuboid> = remotes
+            .iter()
+            .flat_map(|(id, state)| avatar::build_avatar_cuboids(&id.0.to_string(), state))
+            .collect();
+
+        // Bodies to render as a man.glb instance: every remote player, plus
+        // the local player themselves (so you can look down and see your
+        // own body, not just floating hands) — the local head pose comes
+        // straight from this frame's rig rather than a network round-trip.
+        let local_head_tf = runtime.rigs[&local_player].head();
+        let local_head = avatar::Transform {
+            position: local_head_tf.position,
+            rotation: local_head_tf.rotation,
+        };
+        let bodies: Vec<(PlayerId, avatar::Transform)> = std::iter::once((local_player, local_head))
+            .chain(remotes.iter().map(|(&id, state)| (id, state.head)))
+            .collect();
+
+        // Drop avatar mesh instances for players/bodies no longer present.
+        avatar_mesh_cache.retain(|id, _| bodies.iter().any(|(bid, _)| bid == id));
+
+        for (id, head) in bodies.iter().copied() {
+            if !avatar_mesh_cache.contains_key(&id) {
+                match GltfMesh::load(
+                    renderer.device(),
+                    renderer.queue(),
+                    renderer.mesh_texture_layout(),
+                    &man_glb_path,
+                ) {
+                    Ok(mesh) => {
+                        let model_uniform = renderer.create_model_uniform();
+                        avatar_mesh_cache.insert(id, (mesh, model_uniform));
+                    }
+                    Err(e) => {
+                        warn!("Failed to load avatar mesh 'models/man.glb' for player {id:?}: {e}");
+                        continue;
+                    }
+                }
+            }
+            let (mesh, _) = avatar_mesh_cache.get_mut(&id).expect("just inserted above");
+            let torso = avatar::torso_transform(head);
+            mesh.position = yaw_inv * (torso.position - offset);
+            mesh.rotation = yaw_inv * torso.rotation * avatar::man_glb_orientation_offset();
+            mesh.scale = Vec3::splat(avatar::MAN_GLB_SCALE);
+        }
 
         let cuboids: Vec<Cuboid> = render_cuboids
             .iter()
+            .chain(avatar_cuboids.iter())
             .filter(|rc| rc.position.distance(head_pos) < MAX_RENDER_DIST)
             .map(|rc| to_space_soup_cuboid(rc, offset, yaw_inv))
+            .collect();
+
+        let lights: Vec<Light> = render_lights
+            .iter()
+            .map(|rl| to_space_soup_light(rl, offset, yaw_inv))
             .collect();
 
         for rm in &render_meshes {
@@ -809,16 +768,16 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                         ),
                     };
                     let (mut root_pos, mut root_rot, curl) = if has_grip {
-                        let tf = runtime.rig.hand_grip(hand);
+                        let tf = runtime.rigs[&local_player].hand_grip(hand);
                         (tf.position, tf.rotation, squeeze)
                     } else {
-                        let tf = runtime.rig.finger(hand, FingerJoint::Wrist);
+                        let tf = runtime.rigs[&local_player].finger(hand, FingerJoint::Wrist);
                         (tf.position, tf.rotation, 0.0)
                     };
 
-                    let held_point = runtime.held_grip_point(hand);
+                    let held_point = runtime.held_grip_point(local_player, hand);
                     let held_pose = if held_point.is_none() {
-                        held_grip_pose(&runtime, hand)
+                        held_grip_pose(&runtime, local_player, hand)
                     } else {
                         None
                     };
@@ -872,6 +831,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 let (mesh, model) = mesh_cache.get(&rm.id)?;
                 Some(MeshInstance { mesh, model })
             })
+            .chain(
+                avatar_mesh_cache
+                    .values()
+                    .map(|(mesh, model)| MeshInstance { mesh, model }),
+            )
             .collect();
 
         let proj_views = renderer.render_frame_with_meshes(
@@ -880,7 +844,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             time,
             &cuboids,
             &mesh_instances,
-            &[],
+            &lights,
         )?;
         let proj_layer = openxr::CompositionLayerProjection::new()
             .space(&headset.stage)
@@ -907,70 +871,6 @@ fn xr_vec3(p: openxr::Vector3f) -> Vec3 {
 #[cfg(target_os = "android")]
 fn xr_quat(o: openxr::Quaternionf) -> Quat {
     Quat::from_xyzw(o.x, o.y, o.z, o.w)
-}
-
-/// The object this hand is currently holding: a physics grip if there is one,
-/// otherwise whatever object is within grab range of the hand (covers
-/// kinematic `grab_at_joint`-style holds).
-#[cfg(target_os = "android")]
-fn held_object_id(runtime: &GameRuntime, rig: &PlayerRig, hand: Hand) -> Option<String> {
-    if let Some((obj, _)) = runtime.held_grip_point(hand) {
-        return Some(obj.id.clone());
-    }
-    nearest_object_to(runtime, rig.hand_grip(hand).position)
-}
-
-#[cfg(target_os = "android")]
-fn nearest_object_to(runtime: &GameRuntime, point: Vec3) -> Option<String> {
-    const GRAB_RANGE: f32 = 0.15;
-    runtime
-        .scene()
-        .objects
-        .iter()
-        .map(|o| {
-            let half = o.cuboid.half_size;
-            let closest = point.clamp(o.cuboid.position - half, o.cuboid.position + half);
-            (o.id.clone(), point.distance(closest))
-        })
-        .filter(|(_, d)| *d <= GRAB_RANGE)
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-        .map(|(id, _)| id)
-}
-
-#[cfg(target_os = "android")]
-
-fn nearest_grip_point_to(
-    runtime: &GameRuntime,
-    point: Vec3,
-    trigger_only: bool,
-    hand: Hand,
-) -> Option<(String, String)> {
-    const GRAB_RANGE: f32 = 0.15;
-    runtime
-        .scene()
-        .objects
-        .iter()
-        .flat_map(|o| {
-            let obj_mat =
-                glam::Mat4::from_rotation_translation(o.cuboid.rotation, o.cuboid.position);
-            // A hand only considers points tagged for it — so a left hand
-            // never snaps into a pose authored for the right hand.
-            o.grip_points
-                .iter()
-                .filter(move |gp| gp.hand == hand)
-                .map(move |gp| {
-                    let world_pos = obj_mat.transform_point3(Vec3::from(gp.local_pos));
-                    (
-                        o.id.clone(),
-                        gp.name.clone(),
-                        gp.kind,
-                        point.distance(world_pos),
-                    )
-                })
-        })
-        .filter(|(_, _, kind, d)| *d <= GRAB_RANGE && (*kind != GripKind::Pinch || trigger_only))
-        .min_by(|a, b| a.3.partial_cmp(&b.3).unwrap())
-        .map(|(id, name, _, _)| (id, name))
 }
 
 #[cfg(target_os = "android")]
@@ -1000,160 +900,27 @@ fn to_space_soup_cuboid(rc: &RenderCuboid, offset: Vec3, yaw_inv: Quat) -> Cuboi
     c
 }
 
+/// Same "world moves under a fixed camera" render-space transform applied to
+/// `render_cuboids`/`render_meshes` above — direction is a vector, so only
+/// the yaw rotation applies to it, not the positional offset.
+#[cfg(target_os = "android")]
+fn to_space_soup_light(rl: &RenderLight, offset: Vec3, yaw_inv: Quat) -> Light {
+    Light {
+        position: yaw_inv * (rl.position - offset),
+        direction: yaw_inv * rl.direction,
+        kind: match rl.kind {
+            EngineLightKind::Point => SsLightKind::Point,
+            EngineLightKind::Spot => SsLightKind::Spot,
+        },
+        color: ss_color(rl.color),
+        intensity: rl.intensity,
+        range: rl.range,
+        cone_angle_deg: rl.cone_angle_deg,
+    }
+}
+
 #[cfg(target_os = "android")]
 fn ss_color(c: space_soup_engine::Color3) -> Color3 {
     Color3(c.0, c.1, c.2, c.3)
 }
 
-#[cfg(target_os = "android")]
-fn walk_finger_chain(
-    grip_pos: Vec3,
-    grip_rot: Quat,
-    base_local: Vec3,
-    start_rot: Quat,
-    lengths: &[f32],
-    curl_max_deg: &[f32],
-    squeeze: f32,
-) -> Vec<(Vec3, Quat)> {
-    let mut local_pos = base_local;
-    let mut chain_rot = start_rot;
-    let mut out = Vec::with_capacity(lengths.len());
-    for (&len, &curl_deg) in lengths.iter().zip(curl_max_deg.iter()) {
-        let dir = chain_rot * Vec3::new(0.0, 0.0, -1.0);
-        local_pos += dir * len;
-        out.push((grip_pos + grip_rot * local_pos, grip_rot * chain_rot));
-        chain_rot *= Quat::from_rotation_x((squeeze * curl_deg).to_radians());
-    }
-    out
-}
-
-#[cfg(target_os = "android")]
-fn controller_hand_joints(
-    grip_pos: Vec3,
-    grip_rot: Quat,
-    hand: Hand,
-    squeeze: f32,
-) -> Vec<(Vec3, Quat, bool)> {
-    let squeeze = squeeze.clamp(0.0, 1.0);
-    let side = if hand == Hand::Left { -1.0 } else { 1.0 };
-
-    let mut out = vec![(grip_pos, grip_rot, true); 26];
-    out[FingerJoint::Wrist as usize] = (
-        grip_pos + grip_rot * Vec3::new(0.0, 0.0, 0.04),
-        grip_rot,
-        true,
-    );
-    out[FingerJoint::Palm as usize] = (
-        grip_pos + grip_rot * Vec3::new(0.0, 0.0, -0.02),
-        grip_rot,
-        true,
-    );
-
-    struct Finger {
-        joints: &'static [FingerJoint],
-        base: Vec3,
-        start_rot: Quat,
-        lengths: &'static [f32],
-        curl_deg: &'static [f32],
-    }
-
-    let fingers = [
-        Finger {
-            joints: &[
-                FingerJoint::ThumbMeta,
-                FingerJoint::ThumbProx,
-                FingerJoint::ThumbDist,
-            ],
-            base: Vec3::new(side * 0.032, -0.010, 0.025),
-            start_rot: Quat::from_rotation_y(side * -50.0_f32.to_radians())
-                * Quat::from_rotation_z(side * 20.0_f32.to_radians()),
-            lengths: &[0.030, 0.032, 0.024],
-            curl_deg: &[20.0, 55.0, 60.0],
-        },
-        Finger {
-            joints: &[
-                FingerJoint::IndexMeta,
-                FingerJoint::IndexProx,
-                FingerJoint::IndexInter,
-                FingerJoint::IndexDist,
-            ],
-            base: Vec3::new(side * 0.018, -0.002, 0.0),
-            start_rot: Quat::IDENTITY,
-            lengths: &[0.022, 0.036, 0.024, 0.018],
-            curl_deg: &[15.0, 90.0, 100.0, 80.0],
-        },
-        Finger {
-            joints: &[
-                FingerJoint::MiddleMeta,
-                FingerJoint::MiddleProx,
-                FingerJoint::MiddleInter,
-                FingerJoint::MiddleDist,
-            ],
-            base: Vec3::new(side * -0.002, 0.0, 0.01),
-            start_rot: Quat::IDENTITY,
-            lengths: &[0.024, 0.040, 0.026, 0.020],
-            curl_deg: &[15.0, 95.0, 100.0, 80.0],
-        },
-        Finger {
-            joints: &[
-                FingerJoint::RingMeta,
-                FingerJoint::RingProx,
-                FingerJoint::RingInter,
-                FingerJoint::RingDist,
-            ],
-            base: Vec3::new(side * -0.020, -0.002, 0.0),
-            start_rot: Quat::IDENTITY,
-            lengths: &[0.022, 0.035, 0.022, 0.018],
-            curl_deg: &[15.0, 95.0, 100.0, 80.0],
-        },
-        Finger {
-            joints: &[
-                FingerJoint::LittleMeta,
-                FingerJoint::LittleProx,
-                FingerJoint::LittleInter,
-                FingerJoint::LittleDist,
-            ],
-            base: Vec3::new(side * -0.038, -0.005, -0.01),
-            start_rot: Quat::IDENTITY,
-            lengths: &[0.020, 0.028, 0.018, 0.016],
-            curl_deg: &[15.0, 90.0, 100.0, 80.0],
-        },
-    ];
-
-    for finger in &fingers {
-        let chain = walk_finger_chain(
-            grip_pos,
-            grip_rot,
-            finger.base,
-            finger.start_rot,
-            finger.lengths,
-            finger.curl_deg,
-            squeeze,
-        );
-        for (&joint, &(pos, rot)) in finger.joints.iter().zip(chain.iter()) {
-            out[joint as usize] = (pos, rot, true);
-        }
-        if let (Some(tip_joint), Some(&(pos, rot))) = (tip_of(finger.joints[0]), chain.last()) {
-            out[tip_joint as usize] = (pos, rot, true);
-        }
-    }
-
-    let axis_fix = Quat::from_rotation_x(-90.0_f32.to_radians());
-    for (_, rot, _) in out.iter_mut() {
-        *rot *= axis_fix;
-    }
-
-    out
-}
-
-#[cfg(target_os = "android")]
-fn tip_of(meta_joint: FingerJoint) -> Option<FingerJoint> {
-    match meta_joint {
-        FingerJoint::ThumbMeta => Some(FingerJoint::ThumbTip),
-        FingerJoint::IndexMeta => Some(FingerJoint::IndexTip),
-        FingerJoint::MiddleMeta => Some(FingerJoint::MiddleTip),
-        FingerJoint::RingMeta => Some(FingerJoint::RingTip),
-        FingerJoint::LittleMeta => Some(FingerJoint::LittleTip),
-        _ => None,
-    }
-}
