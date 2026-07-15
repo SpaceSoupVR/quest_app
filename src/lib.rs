@@ -824,6 +824,37 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Whatever this frame's hands are actually holding gets its mesh
+        // transform predicted from this frame's own instantly-tracked hand
+        // pose instead of the loop above's server-broadcast position — a
+        // held object is right in view and a full round trip behind is the
+        // most noticeable place latency could show up. `point_local_*` is
+        // the grip point's pose *in the object's local space*, i.e.
+        // hand_pose = object_pose * offset_pose; inverting that gives the
+        // object's pose directly from the hand's real tracked pose, with no
+        // server dependency in the loop at all (both in world space, same
+        // as `rig`/`live_objects` — converted to render space below like
+        // everything else).
+        for hand in [Hand::Left, Hand::Right] {
+            let held: Option<&WireHeldGrip> = world.as_ref().and_then(|w| match hand {
+                Hand::Left => w.left_hand_held.as_ref(),
+                Hand::Right => w.right_hand_held.as_ref(),
+            });
+            let Some(held) = held else { continue };
+            let Some((mesh, _)) = mesh_cache.get_mut(&held.object_id) else {
+                continue;
+            };
+            let hand_tf = rig.hand_grip(hand);
+            let hand_mat = glam::Mat4::from_rotation_translation(hand_tf.rotation, hand_tf.position);
+            let offset_mat = glam::Mat4::from_rotation_translation(
+                Quat::from_array(held.point_local_rot),
+                Vec3::from(held.point_local_pos),
+            );
+            let (_, rot, pos) = (hand_mat * offset_mat.inverse()).to_scale_rotation_translation();
+            mesh.position = yaw_inv * (pos - offset);
+            mesh.rotation = yaw_inv * rot;
+        }
+
         for rm in meshes_src {
             if let Some((mesh, _)) = mesh_cache.get(&rm.id) {
                 if let Some(skin) = &mesh.skin {
@@ -844,7 +875,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                             cs.r_stick_touch,
                         ),
                     };
-                    let (mut root_pos, mut root_rot, curl) = if has_grip {
+                    let (root_pos, root_rot, curl) = if has_grip {
                         let tf = rig.hand_grip(hand);
                         (tf.position, tf.rotation, squeeze)
                     } else {
@@ -852,27 +883,22 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                         (tf.position, tf.rotation, 0.0)
                     };
 
+                    // Deliberately *not* re-deriving root_pos/root_rot from the
+                    // server's broadcast object position here (as this used to):
+                    // that made the hand mesh's rendered pose track the
+                    // server's round-trip-delayed report of the held object
+                    // instead of this frame's own instantly-tracked hand pose —
+                    // exactly backwards, and the most noticeable possible place
+                    // for latency (an object right in view lagging your real
+                    // hand). root_pos/root_rot above already come straight from
+                    // local tracking; the held object's own mesh transform is
+                    // instead predicted *from* that same local pose below,
+                    // keeping hand and object perfectly in sync with zero added
+                    // latency for both.
                     let held: Option<&WireHeldGrip> = world.as_ref().and_then(|w| match hand {
                         Hand::Left => w.left_hand_held.as_ref(),
                         Hand::Right => w.right_hand_held.as_ref(),
                     });
-
-                    if let Some(held) = held {
-                        if let Some(live) = live_objects.by_id.get(&held.object_id) {
-                            let obj_mat = glam::Mat4::from_rotation_translation(
-                                live.rotation,
-                                live.position,
-                            );
-                            let offset_mat = glam::Mat4::from_rotation_translation(
-                                Quat::from_array(held.point_local_rot),
-                                Vec3::from(held.point_local_pos),
-                            );
-                            let (_, rot, pos) =
-                                (obj_mat * offset_mat).to_scale_rotation_translation();
-                            root_pos = pos;
-                            root_rot = rot;
-                        }
-                    }
 
                     let held_curl = held.map(|h| &h.finger_curl);
                     let free_curl = if held_curl.is_none() {
