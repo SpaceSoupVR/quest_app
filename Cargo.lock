@@ -2580,7 +2580,9 @@ dependencies = [
  "env_logger",
  "futures-util",
  "glam 0.29.3",
+ "kira",
  "log",
+ "mint",
  "ndk 0.7.0",
  "ndk-glue",
  "openxr",
@@ -3149,7 +3151,6 @@ dependencies = [
  "rhai",
  "serde",
  "serde_json",
- "space_soup",
  "space_soup_protocol",
 ]
 

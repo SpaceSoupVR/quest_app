@@ -1,5 +1,6 @@
-use glam::{Quat, Vec3};
-use space_soup_engine::{Color3, CuboidStyle, RenderCuboid};
+use glam::{Mat4, Quat, Vec3};
+
+use space_soup::renderer::mesh::GltfSkin;
 
 /// Plain position/rotation pair — deliberately not tied to `network.rs`'s
 /// android-only wire conversion, so this module (and its tests) compile and
@@ -30,29 +31,13 @@ pub struct ArmLengths {
     pub forearm: f32,
 }
 
-impl Default for ArmLengths {
-    fn default() -> Self {
-        Self {
-            upper: 0.28,
-            forearm: 0.26,
-        }
-    }
-}
-
-const TORSO_DROP: f32 = 0.35;
-const SHOULDER_OFFSET: Vec3 = Vec3::new(0.20, 0.05, 0.0);
-const AVATAR_COLOR: Color3 = Color3(200, 200, 210, 255);
-const AVATAR_WIRE: Color3 = Color3(0, 0, 0, 0);
-
-/// Correction applied to `models/man.glb` so it sits upright at a realistic
-/// scale: the source asset (Sketchfab/FBX, per its embedded node names) is
-/// Z-up with a ~4.2-unit "height", so it needs a -90°-about-X rotation and a
-/// ~0.43 scale-down to look right under this engine's Y-up, meters convention.
-/// Estimated from the raw mesh bounding box, not visually verified — expect
-/// to retune both once this can actually be seen on-headset.
-pub fn man_glb_orientation_offset() -> Quat {
-    Quat::from_rotation_x(-90_f32.to_radians())
-}
+/// `models/man.glb`'s bind-pose vertex data is already Y-up (head sits
+/// above torso above feet along +Y — verified directly against the file,
+/// not assumed), but at roughly 4.2x real-world scale — the same size
+/// issue the original unrigged version had, just no longer also needing a
+/// Z-up rotation fix now that it's rigged. Estimated from bind-pose
+/// head/foot heights (~3.58 units apart), not visually verified — expect
+/// to retune once this can actually be seen on-headset.
 pub const MAN_GLB_SCALE: f32 = 0.43;
 
 /// Elbow position for a 2-bone (shoulder-elbow-hand) IK chain, via the
@@ -89,12 +74,11 @@ fn perpendicular_component(hint: Vec3, axis: Vec3) -> Option<Vec3> {
     (component.length_squared() > 1e-6).then(|| component.normalize())
 }
 
-/// Torso position/orientation derived from the head alone: dropped straight
-/// down by a fixed height, with **yaw-only** rotation — pitch/roll are
-/// discarded so looking up/down doesn't tilt the torso (same trick already
-/// used in this codebase's frustum-culling fix, for the same reason: pitch
-/// shouldn't leak into a computation that's conceptually about heading).
-pub fn torso_transform(head: Transform) -> Transform {
+/// Root placement for the whole skeleton, derived from the head alone:
+/// dropped straight down by `floor_drop` (already scaled to match
+/// `root_scale`, see call site), with **yaw-only** rotation — pitch/roll
+/// are discarded so looking up/down doesn't tilt the body.
+pub fn body_root_transform(head: Transform, floor_drop: f32) -> Transform {
     let forward = head.rotation * Vec3::NEG_Z;
     let forward_h = Vec3::new(forward.x, 0.0, forward.z);
     let rotation = if forward_h.length_squared() < 1e-6 {
@@ -103,83 +87,158 @@ pub fn torso_transform(head: Transform) -> Transform {
         Quat::from_rotation_arc(Vec3::NEG_Z, forward_h.normalize())
     };
     Transform {
-        position: head.position - Vec3::Y * TORSO_DROP,
+        position: head.position - Vec3::Y * floor_drop,
         rotation,
     }
 }
 
-fn bone_cuboid(id: String, from: Vec3, to: Vec3, thickness: f32) -> RenderCuboid {
-    let delta = to - from;
-    let length = delta.length();
-    let dir = if length > 1e-5 { delta / length } else { Vec3::NEG_Y };
-    RenderCuboid {
-        id,
-        position: from + dir * (length / 2.0),
-        half_size: Vec3::new(thickness, thickness, (length / 2.0).max(0.001)),
-        rotation: Quat::from_rotation_arc(Vec3::Z, dir),
-        color: AVATAR_COLOR,
-        wire_color: AVATAR_WIRE,
-        style: CuboidStyle::Solid,
-    }
+fn joint_index(skin: &GltfSkin, name: &str) -> Option<usize> {
+    skin.joint_names.iter().position(|n| n == name)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn push_arm(
-    out: &mut Vec<RenderCuboid>,
-    id_str: &str,
-    label: &str,
-    torso: Transform,
-    local_shoulder: Vec3,
-    hand: Transform,
-    lengths: ArmLengths,
-) {
-    let shoulder = torso.position + torso.rotation * local_shoulder;
-    let elbow = solve_arm(shoulder, hand.position, lengths);
+fn joint_index_any(skin: &GltfSkin, names: &[&str]) -> Option<usize> {
+    names.iter().find_map(|n| joint_index(skin, n))
+}
 
-    out.push(bone_cuboid(
-        format!("avatar_{id_str}_{label}_upper"),
+/// "Head" (Mixamo-style rigs) or "head" (this asset's own rig) — tried in
+/// that order so this works for either naming convention without needing
+/// to know in advance which one a given asset uses.
+fn find_head_joint(skin: &GltfSkin) -> Option<usize> {
+    joint_index_any(skin, &["Head", "head"])
+}
+
+/// The rigged skeleton's own bind-pose head height (mesh-local, *before*
+/// `root_scale` is applied — multiply by it at the call site), used so
+/// `body_root_transform` can put the feet at floor level under the tracked
+/// head regardless of this particular rig's proportions. Falls back to a
+/// generic human height if this skeleton has no head joint under either
+/// naming convention.
+pub fn bind_head_height(skin: &GltfSkin) -> f32 {
+    let Some(head_ji) = find_head_joint(skin) else {
+        return 1.6;
+    };
+    let bind_transforms = skin.hierarchical_transforms(&skin.joint_local_bind);
+    bind_transforms[head_ji].transform_point3(Vec3::ZERO).y
+}
+
+struct ArmChain {
+    shoulder: usize,
+    upper: usize,
+    forearm: usize,
+    hand: usize,
+}
+
+/// Looks up an arm chain by trying two observed naming conventions:
+/// Mixamo/Blender-style (`{Side}Shoulder` -> `{Side}Arm` -> `{Side}ForeArm`
+/// -> `{Side}Hand`, e.g. "LeftShoulder") and this asset's own shorter style
+/// (`{s}shoulder` -> `{s}arm1` -> `{s}arm2` -> `{s}hand`, e.g. "lshoulder").
+/// Returns `None` if a skeleton uses neither, so callers can fall back to
+/// leaving that arm in its bind pose instead of panicking.
+fn find_arm_chain(skin: &GltfSkin, side: &str) -> Option<ArmChain> {
+    let short = side.chars().next()?.to_ascii_lowercase();
+    let shoulder = joint_index_any(
+        skin,
+        &[&format!("{side}Shoulder"), &format!("{short}shoulder")],
+    )?;
+    let upper = joint_index_any(skin, &[&format!("{side}Arm"), &format!("{short}arm1")])?;
+    let forearm = joint_index_any(skin, &[&format!("{side}ForeArm"), &format!("{short}arm2")])?;
+    let hand = joint_index_any(skin, &[&format!("{side}Hand"), &format!("{short}hand")])?;
+    Some(ArmChain {
         shoulder,
-        elbow,
-        0.045,
-    ));
-    out.push(bone_cuboid(
-        format!("avatar_{id_str}_{label}_forearm"),
-        elbow,
-        hand.position,
-        0.04,
-    ));
-    out.push(RenderCuboid {
-        id: format!("avatar_{id_str}_{label}_hand"),
-        position: hand.position,
-        half_size: Vec3::splat(0.045),
-        rotation: hand.rotation,
-        color: AVATAR_COLOR,
-        wire_color: AVATAR_WIRE,
-        style: CuboidStyle::Solid,
-    });
+        upper,
+        forearm,
+        hand,
+    })
 }
 
-/// Builds a small cuboid arm rig (arms only — no legs, standard for VR
-/// avatars with no leg tracking) for one remote player. The head/torso are
-/// no longer plain cuboids here; they're rendered as a `models/man.glb` mesh
-/// instance positioned via `torso_transform` (see `lib.rs`'s avatar mesh
-/// cache). `id_str` should be unique per player (e.g. their `PlayerId`'s
-/// string form) since it's used to make each cuboid's id unique across
-/// players.
-pub fn build_avatar_cuboids(id_str: &str, remote: &RemotePlayerState) -> Vec<RenderCuboid> {
-    let mut out = Vec::with_capacity(6);
-
-    let torso = torso_transform(remote.head);
-    let lengths = ArmLengths::default();
-    if let Some(hand) = remote.left_hand {
-        let local_shoulder = Vec3::new(-SHOULDER_OFFSET.x, SHOULDER_OFFSET.y, SHOULDER_OFFSET.z);
-        push_arm(&mut out, id_str, "left", torso, local_shoulder, hand, lengths);
+/// Aims the upper-arm and forearm bones at `target` (mesh-local space,
+/// already divided by `root_scale` — see call site) via a 2-bone IK solve,
+/// writing the result into `local`'s rotations for those two joints. Uses
+/// each bone's own bind-pose child offset as the "aim from" direction, so
+/// this works for any rig's bind orientation without hardcoding which axis
+/// points "along the bone" — a hardcoded axis would silently produce
+/// twisted limbs on a rig authored with different conventions.
+fn apply_arm_ik(
+    local: &mut [(Vec3, Quat, Vec3)],
+    skin: &GltfSkin,
+    bind_transforms: &[Mat4],
+    chain: &ArmChain,
+    target: Vec3,
+) {
+    let upper_len = skin.joint_local_bind[chain.forearm].0.length();
+    let forearm_len = skin.joint_local_bind[chain.hand].0.length();
+    if upper_len < 1e-5 || forearm_len < 1e-5 {
+        return;
     }
-    if let Some(hand) = remote.right_hand {
-        push_arm(&mut out, id_str, "right", torso, SHOULDER_OFFSET, hand, lengths);
+
+    let (_, shoulder_rot, _) = bind_transforms[chain.shoulder].to_scale_rotation_translation();
+    let shoulder_pos = bind_transforms[chain.upper].transform_point3(Vec3::ZERO);
+
+    let elbow_pos = solve_arm(
+        shoulder_pos,
+        target,
+        ArmLengths {
+            upper: upper_len,
+            forearm: forearm_len,
+        },
+    );
+
+    let bind_dir_upper = skin.joint_local_bind[chain.forearm].0.normalize();
+    let desired_dir_upper = (shoulder_rot.inverse() * (elbow_pos - shoulder_pos)).normalize_or_zero();
+    if desired_dir_upper.length_squared() > 1e-8 {
+        local[chain.upper].1 = Quat::from_rotation_arc(bind_dir_upper, desired_dir_upper);
     }
 
-    out
+    let upper_world_rot = shoulder_rot * local[chain.upper].1;
+    let bind_dir_forearm = skin.joint_local_bind[chain.hand].0.normalize();
+    let desired_dir_forearm = (upper_world_rot.inverse() * (target - elbow_pos)).normalize_or_zero();
+    if desired_dir_forearm.length_squared() > 1e-8 {
+        local[chain.forearm].1 = Quat::from_rotation_arc(bind_dir_forearm, desired_dir_forearm);
+    }
+}
+
+/// Full skinning-matrix set for one avatar body: legs/spine/head stay in
+/// bind pose (no tracking data for them — the whole body's heading instead
+/// comes from `root_rot`), arms are 2-bone-IK'd toward the tracked hand
+/// positions when tracked, left in bind pose when not. `root_scale`
+/// uniformly scales the whole skeleton (see `MAN_GLB_SCALE`) — hand IK
+/// targets get divided by it internally so bone-length math stays in the
+/// same (unscaled) units as the bind pose data.
+///
+/// Always builds the *full* body, head included — the local player's own
+/// body is never actually drawn in their own direct view at all (see
+/// `lib.rs`, which keeps it out of the main render list entirely and only
+/// includes it for the mirror pass and other players' clients), so there's
+/// no local near-clipping concern left to hide the head for.
+pub fn body_skin_matrices(
+    skin: &GltfSkin,
+    root_pos: Vec3,
+    root_rot: Quat,
+    root_scale: f32,
+    left_hand: Option<Transform>,
+    right_hand: Option<Transform>,
+) -> Vec<Mat4> {
+    let mut local = skin.joint_local_bind.clone();
+    let bind_transforms = skin.hierarchical_transforms(&skin.joint_local_bind);
+    let root_rot_inv = root_rot.inverse();
+    let scale = root_scale.max(1e-5);
+
+    if let (Some(hand), Some(chain)) = (left_hand, find_arm_chain(skin, "Left")) {
+        let target = (root_rot_inv * (hand.position - root_pos)) / scale;
+        apply_arm_ik(&mut local, skin, &bind_transforms, &chain, target);
+    }
+    if let (Some(hand), Some(chain)) = (right_hand, find_arm_chain(skin, "Right")) {
+        let target = (root_rot_inv * (hand.position - root_pos)) / scale;
+        apply_arm_ik(&mut local, skin, &bind_transforms, &chain, target);
+    }
+
+    let final_transforms = skin.hierarchical_transforms(&local);
+    let root = Mat4::from_scale_rotation_translation(Vec3::splat(root_scale), root_rot, root_pos);
+    skin.inv_bind_mats
+        .iter()
+        .enumerate()
+        .map(|(ji, inv_bind)| root * final_transforms[ji] * *inv_bind)
+        .collect()
 }
 
 #[cfg(test)]
@@ -229,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn torso_transform_ignores_pitch_and_roll() {
+    fn body_root_transform_ignores_pitch_and_roll() {
         let base_yaw = 30.0_f32.to_radians();
         let head_level = Transform {
             position: Vec3::new(1.0, 1.7, 2.0),
@@ -240,38 +299,34 @@ mod tests {
             rotation: Quat::from_rotation_y(base_yaw) * Quat::from_rotation_x(60.0_f32.to_radians()),
         };
 
-        let torso_level = torso_transform(head_level);
-        let torso_pitched = torso_transform(head_pitched);
+        let root_level = body_root_transform(head_level, 1.6);
+        let root_pitched = body_root_transform(head_pitched, 1.6);
 
-        let fwd_level = torso_level.rotation * Vec3::NEG_Z;
-        let fwd_pitched = torso_pitched.rotation * Vec3::NEG_Z;
+        let fwd_level = root_level.rotation * Vec3::NEG_Z;
+        let fwd_pitched = root_pitched.rotation * Vec3::NEG_Z;
 
         assert!(
             fwd_level.distance(fwd_pitched) < 1e-4,
-            "pitching the head should not change torso orientation: {fwd_level:?} vs {fwd_pitched:?}"
+            "pitching the head should not change root orientation: {fwd_level:?} vs {fwd_pitched:?}"
         );
         assert!(
             fwd_level.y.abs() < 1e-5,
-            "torso forward should be perfectly horizontal, got y={}",
+            "root forward should be perfectly horizontal, got y={}",
             fwd_level.y
         );
     }
 
     #[test]
-    fn build_avatar_cuboids_head_only_has_no_arms() {
-        let remote = RemotePlayerState {
-            head: Transform {
-                position: Vec3::new(0.0, 1.7, 0.0),
-                rotation: Quat::IDENTITY,
-            },
-            left_hand: None,
-            right_hand: None,
+    fn body_root_transform_drops_to_floor() {
+        let head = Transform {
+            position: Vec3::new(0.0, 1.7, 0.0),
+            rotation: Quat::IDENTITY,
         };
-
-        let cuboids = build_avatar_cuboids("test-player", &remote);
-
-        // Head/torso are the man.glb mesh now (see lib.rs), not cuboids —
-        // with no hands tracked there should be no arm cuboids either.
-        assert!(cuboids.is_empty());
+        let root = body_root_transform(head, 1.6);
+        assert!(
+            (root.position.y - 0.1).abs() < 1e-4,
+            "root should sit floor_drop below the head, got y={}",
+            root.position.y
+        );
     }
 }
