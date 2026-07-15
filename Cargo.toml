@@ -32,6 +32,13 @@ tokio-tungstenite   = "0.29"
 futures-util        = { version = "0.3", default-features = false, features = ["sink", "std"] }
 serde_json          = "1.0"
 
+# client_audio.rs plays WireWorld.sounds locally against this client's own
+# head (see space_soup_engine::audio's doc comment on why the server can't
+# be everyone's listener) — Android-only for the same reason as the rest of
+# this section.
+kira = "0.12.1"
+mint = "0.5"
+
 [profile.release]
 opt-level = 3
 lto       = true
