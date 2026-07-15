@@ -12,7 +12,7 @@ use std::path::Path;
 
 use glam::{Quat, Vec3};
 
-use space_soup_engine::{GripKind, GripPointDef, Manifest, Scene};
+use space_soup_engine::{GripKind, GripPointDef, Hand, Manifest, Scene};
 use space_soup_protocol::{WireHeldGrip, WireObjectBounds};
 
 const GRAB_RANGE: f32 = 0.15;
@@ -100,13 +100,16 @@ pub fn nearest_grip_point_to(
     static_scene: &StaticScene,
     point: Vec3,
     trigger_only: bool,
+    hand: Hand,
 ) -> Option<(String, String)> {
     static_scene
         .grip_points
         .iter()
         .flat_map(|(id, points)| {
             let live_c = live.by_id.get(id);
-            points.iter().filter_map(move |gp| {
+            // A hand only considers points tagged for it — so a left hand
+            // never snaps into a pose authored for the right hand.
+            points.iter().filter(move |gp| gp.hand == hand).filter_map(move |gp| {
                 let live_c = live_c?;
                 let obj_mat =
                     glam::Mat4::from_rotation_translation(live_c.rotation, live_c.position);
