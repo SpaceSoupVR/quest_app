@@ -2,7 +2,13 @@ use log::{error, info};
 
 mod avatar;
 #[cfg(target_os = "android")]
+mod client_audio;
+#[cfg(target_os = "android")]
+mod grab_detect;
+#[cfg(target_os = "android")]
 mod network;
+#[cfg(target_os = "android")]
+mod to_wire;
 
 #[cfg(target_os = "android")]
 use glam::{Quat, Vec3};
@@ -13,28 +19,27 @@ use space_soup::renderer::xr_renderer::XrRenderer;
 #[cfg(target_os = "android")]
 use space_soup::renderer::{
     Color3, Cuboid, CuboidStyle as SsCuboidStyle, GltfMesh, Light, LightKind as SsLightKind,
-    MeshInstance,
+    MeshInstance, MirrorSurface,
 };
 #[cfg(target_os = "android")]
 use space_soup::{Controllers, HandTrackers, Headset, VkContext, XrContext};
 #[cfg(target_os = "android")]
 use space_soup_engine::{
-    debug_sender, ButtonPress, CuboidStyle as EngineCuboidStyle, DebugPacket, FingerJoint,
-    GameRuntime, Hand, HandSample, InputFrame, JointSample, LightKind as EngineLightKind,
-    Locomotion, LocomotionInput, LocomotionMode, LocomotionSample, PlayerFrameInput, Pose,
-    RenderCuboid, RenderLight, RenderMesh, SceneSample, TeleportTarget, TimingSample,
+    debug_sender, ButtonPress, DebugPacket, FingerJoint, Hand, HandSample, InputFrame,
+    JointSample, Locomotion, LocomotionInput, LocomotionMode, LocomotionSample, Manifest, Pose,
+    SceneSample, TeleportTarget, TimingSample,
 };
 #[cfg(target_os = "android")]
-use space_soup_hands::{
-    build_player_rig, free_hand_finger_curl, hand_for_mesh_id, hand_skin_matrices,
-    held_grip_pose, held_object_id, nearest_grip_point_to, nearest_object_to,
-};
+use space_soup_hands::{build_player_rig, free_hand_finger_curl, hand_for_mesh_id, hand_skin_matrices};
 #[cfg(target_os = "android")]
-use space_soup_protocol::PlayerId;
+use space_soup_protocol::{
+    PlayerId, WireColor3, WireCuboidStyle, WireHeldGrip, WireLightKind, WireRenderCuboid,
+    WireRenderLight, WireRenderMesh,
+};
 #[cfg(target_os = "android")]
 use log::warn;
 #[cfg(target_os = "android")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(target_os = "android")]
 use std::path::PathBuf;
 
@@ -115,6 +120,30 @@ fn game_dir() -> PathBuf {
     PathBuf::from("/sdcard/Android/data/com.example.questapp/files/game")
 }
 
+/// Queues background loads for any mesh referenced by `world_meshes` that
+/// isn't cached yet and hasn't already been requested — grouped by path so
+/// a path shared by several object ids (e.g. two objects using the same
+/// `.glb`) only gets loaded once.
+#[cfg(target_os = "android")]
+fn queue_new_meshes(
+    world_meshes: &[WireRenderMesh],
+    mesh_cache: &HashMap<String, (GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform)>,
+    requested: &mut HashSet<String>,
+    req_tx: &std::sync::mpsc::Sender<(String, Vec<String>)>,
+) {
+    let mut by_path: HashMap<String, Vec<String>> = HashMap::new();
+    for rm in world_meshes {
+        if mesh_cache.contains_key(&rm.id) || requested.contains(&rm.id) {
+            continue;
+        }
+        requested.insert(rm.id.clone());
+        by_path.entry(rm.path.clone()).or_default().push(rm.id.clone());
+    }
+    for (path, ids) in by_path {
+        let _ = req_tx.send((path, ids));
+    }
+}
+
 #[cfg(target_os = "android")]
 fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     std::panic::set_hook(Box::new(|info| {
@@ -173,42 +202,45 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut debug_stream: Option<std::net::TcpStream> = None;
 
+    // Physics/attachments/scripts all run on the server now (see
+    // space_soup_server::spawn_simulation) — this client no longer owns a
+    // GameRuntime at all. What's left locally: reading raw controller/hand
+    // tracking input, a *static* mirror of the current scene's grip points
+    // (authored content, not simulation — see grab_detect.rs) for its own
+    // grab-detection heuristic, and rendering whatever the server's latest
+    // `WireWorld` broadcast says exists.
     let dir = game_dir();
-    let mut runtime = match GameRuntime::load(&dir) {
-        Ok(rt) => {
-            info!(
-                "Loaded game from {} — scene '{}'",
-                dir.display(),
-                rt.scene_name()
-            );
-            rt
-        }
+    let local_player = PlayerId::local();
+
+    let entry_scene = match Manifest::load(&dir) {
+        Ok(m) => m.entry_scene,
         Err(e) => {
-            error!("Failed to load game from {}: {e}", dir.display());
+            error!("Failed to load manifest from {}: {e}", dir.display());
             error!("adb push your game folder to that path and relaunch.");
             return Err(e.into());
         }
     };
+    let mut static_scene = grab_detect::StaticScene::load(&dir, &entry_scene);
+    let mut live_objects = grab_detect::LiveObjects::default();
+    let mut client_audio = client_audio::ClientAudio::new();
 
-    info!(
-        "Object count right after load: {}",
-        runtime.scene().objects.len()
-    );
+    // The server's last-broadcast authoritative locomotion state — ground
+    // truth, used only to reconcile `predicted` below, never read directly
+    // for rendering or input (a real network round-trip to the droplet is
+    // ~90ms+, so waiting for this before showing any movement feels awful).
+    let mut player_offset = Vec3::ZERO;
+    let mut player_yaw = 0.0_f32;
 
-    // quest_app still simulates its own single local player (Phase 4 of the
-    // server-authoritative rework — actually sending this to a remote
-    // server and rendering *its* results instead — hasn't happened yet);
-    // GameRuntime itself is multi-player-capable now, so it needs a fixed
-    // id to address that one local player by.
-    let local_player = PlayerId::local();
-    runtime
-        .locomotions
-        .insert(local_player, Locomotion::new(LocomotionMode::Smooth));
-
-    info!(
-        "Object count after load (incl. hand bones from scene JSON): {}",
-        runtime.scene().objects.len()
-    );
+    // Client-side prediction: runs the exact same deterministic movement
+    // math the server runs (`Locomotion::update`, the actual engine type —
+    // not a reimplementation that could drift from it) locally, every
+    // frame, from this frame's own input, so the player sees themselves
+    // move instantly instead of waiting for a server round trip. Nudged
+    // gently toward `player_offset`/`player_yaw` (not snapped) whenever a
+    // fresh authoritative value arrives, so small prediction error against
+    // things the client can't simulate (wall/ground collision needs PhysX,
+    // server-only) gets corrected without a visible pop.
+    let mut predicted = Locomotion::new(LocomotionMode::Smooth);
 
     let net = network::spawn(network::server_url());
 
@@ -216,61 +248,51 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         String,
         (GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform),
     > = HashMap::new();
+    let mut requested_mesh_ids: HashSet<String> = HashSet::new();
 
-    // Remote-player avatar bodies: one man.glb instance per connected
-    // player, keyed by PlayerId rather than scene-object id (see avatar.rs
-    // for why head/torso/arms are split between this mesh and cuboids).
+    // Avatar bodies (local player + every remote player): one man.glb
+    // instance per player, keyed by PlayerId rather than scene-object id —
+    // man.glb is a real rigged/skinned mesh, so bones are IK-driven toward
+    // tracked head/hand positions each frame (see avatar::body_skin_matrices).
     let mut avatar_mesh_cache: HashMap<
         PlayerId,
         (GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform),
     > = HashMap::new();
-    let man_glb_path = runtime.game_dir().join("models/man.glb");
+    let man_glb_path = dir.join("models/man.glb");
 
-    let (mesh_tx, mesh_rx) = std::sync::mpsc::channel::<(String, GltfMesh)>();
-    {
+    // Persistent request/response mesh loader — replaces the old one-shot
+    // startup scan of `runtime.scene().objects`, since there's no local
+    // scene to scan anymore. New mesh ids are discovered reactively from
+    // each `WireWorld`'s mesh list (see `queue_new_meshes`).
+    let (mesh_req_tx, mesh_rx) = {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<(String, Vec<String>)>();
+        let (mesh_tx, mesh_rx) = std::sync::mpsc::channel::<(String, GltfMesh)>();
         let device = renderer.device().clone();
         let queue = renderer.queue().clone();
         let layout = renderer.mesh_texture_layout().clone();
-        let gdir = runtime.game_dir().to_path_buf();
-
-        let mut path_to_ids: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
-        for obj in runtime.scene().objects.iter() {
-            if let Some(mesh_ref) = obj.mesh.as_ref() {
-                path_to_ids
-                    .entry(mesh_ref.path.clone())
-                    .or_default()
-                    .push(obj.id.clone());
-            }
-        }
-
-        info!(
-            "Background mesh load starting: {} unique meshes",
-            path_to_ids.len()
-        );
+        let gdir = dir.clone();
         std::thread::Builder::new()
             .name("mesh_loader".into())
             .spawn(move || {
-                for (path, obj_ids) in path_to_ids {
+                for (path, ids) in req_rx {
                     let full_path = gdir.join(&path);
                     match GltfMesh::load(&device, &queue, &layout, &full_path) {
                         Ok(mesh) => {
-                            let prim_count = mesh.primitives.len()
-                                + mesh.skin.as_ref().map(|s| s.primitives.len()).unwrap_or(0);
-                            info!("Mesh loaded: '{path}' ({prim_count} primitives, {} object(s), skinned={})",
-                                obj_ids.len(), mesh.is_skinned());
-                            for obj_id in &obj_ids {
+                            info!("Mesh loaded: '{path}' ({} object(s))", ids.len());
+                            for id in &ids {
                                 let instance = mesh.clone_with_independent_skin(&device);
-                                if mesh_tx.send((obj_id.clone(), instance)).is_err() { return; }
+                                if mesh_tx.send((id.clone(), instance)).is_err() {
+                                    return;
+                                }
                             }
                         }
                         Err(e) => warn!("Failed to load mesh '{path}': {e}"),
                     }
                 }
-                info!("Background mesh loading complete");
             })
             .expect("failed to spawn mesh_loader");
-    }
+        (req_tx, mesh_rx)
+    };
 
     info!("All resources ready — entering event loop");
 
@@ -418,7 +440,37 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
         let cs = &controllers.state;
 
-        let rig = build_player_rig(&eye_views, &runtime.locomotions[&local_player], cs, &hands);
+        let rig = build_player_rig(&eye_views, &predicted, cs, &hands);
+
+        // Pull whatever the server most recently broadcast. `None` until the
+        // first tick after connecting — everything below degrades to "render
+        // nothing yet" rather than crashing when that's the case.
+        let world = net.latest_world.lock().unwrap().clone();
+
+        let empty_cuboids: Vec<WireRenderCuboid> = Vec::new();
+        let empty_meshes: Vec<WireRenderMesh> = Vec::new();
+        let empty_lights: Vec<WireRenderLight> = Vec::new();
+        let empty_bounds: Vec<space_soup_protocol::WireObjectBounds> = Vec::new();
+        let cuboids_src = world.as_ref().map(|w| &w.cuboids).unwrap_or(&empty_cuboids);
+        let meshes_src = world.as_ref().map(|w| &w.meshes).unwrap_or(&empty_meshes);
+        let lights_src = world.as_ref().map(|w| &w.lights).unwrap_or(&empty_lights);
+        let object_bounds_src = world.as_ref().map(|w| &w.object_bounds).unwrap_or(&empty_bounds);
+
+        if let Some(w) = &world {
+            player_offset = Vec3::from(w.player_offset);
+            player_yaw = w.player_yaw;
+
+            if w.scene_name != static_scene.scene_name {
+                info!(
+                    "Scene changed: '{}' -> '{}' — reloading local grip-point data",
+                    static_scene.scene_name, w.scene_name
+                );
+                static_scene = grab_detect::StaticScene::load(&dir, &w.scene_name);
+            }
+        }
+
+        live_objects.update(object_bounds_src);
+        queue_new_meshes(meshes_src, &mesh_cache, &mut requested_mesh_ids, &mesh_req_tx);
 
         let mut input = InputFrame::default();
 
@@ -429,27 +481,35 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
         if r_trigger_down && !(prev_r_trigger || prev_r_squeeze) {
             let p = rig.hand_grip(Hand::Right).position;
-            if let Some((id, point)) = nearest_grip_point_to(&runtime, p, r_trigger_only, Hand::Right) {
+            if let Some((id, point)) =
+                grab_detect::nearest_grip_point_to(&live_objects, &static_scene, p, r_trigger_only)
+            {
                 input.grabbed.push((id, Hand::Right, point));
-            } else if let Some(id) = nearest_object_to(&runtime, p) {
+            } else if let Some(id) = grab_detect::nearest_object_to(&live_objects, p) {
                 input.grabbed.push((id, Hand::Right, String::new()));
             }
         }
         if !r_trigger_down && (prev_r_trigger || prev_r_squeeze) {
-            if let Some(id) = nearest_object_to(&runtime, rig.hand_grip(Hand::Right).position) {
+            if let Some(id) =
+                grab_detect::nearest_object_to(&live_objects, rig.hand_grip(Hand::Right).position)
+            {
                 input.released.push((id, Hand::Right));
             }
         }
         if l_trigger_down && !(prev_l_trigger || prev_l_squeeze) {
             let p = rig.hand_grip(Hand::Left).position;
-            if let Some((id, point)) = nearest_grip_point_to(&runtime, p, l_trigger_only, Hand::Left) {
+            if let Some((id, point)) =
+                grab_detect::nearest_grip_point_to(&live_objects, &static_scene, p, l_trigger_only)
+            {
                 input.grabbed.push((id, Hand::Left, point));
-            } else if let Some(id) = nearest_object_to(&runtime, p) {
+            } else if let Some(id) = grab_detect::nearest_object_to(&live_objects, p) {
                 input.grabbed.push((id, Hand::Left, String::new()));
             }
         }
         if !l_trigger_down && (prev_l_trigger || prev_l_squeeze) {
-            if let Some(id) = nearest_object_to(&runtime, rig.hand_grip(Hand::Left).position) {
+            if let Some(id) =
+                grab_detect::nearest_object_to(&live_objects, rig.hand_grip(Hand::Left).position)
+            {
                 input.released.push((id, Hand::Left));
             }
         }
@@ -459,8 +519,16 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         // emitted per hand. `object_id` carries the held object (if any) so
         // ContextualHold bindings can match.
         {
-            let held_r = held_object_id(&runtime, local_player, &rig, Hand::Right);
-            let held_l = held_object_id(&runtime, local_player, &rig, Hand::Left);
+            let held_r = grab_detect::held_object_id(
+                world.as_ref().and_then(|w| w.right_hand_held.as_ref()),
+                &live_objects,
+                rig.hand_grip(Hand::Right).position,
+            );
+            let held_l = grab_detect::held_object_id(
+                world.as_ref().and_then(|w| w.left_hand_held.as_ref()),
+                &live_objects,
+                rig.hand_grip(Hand::Left).position,
+            );
             let presses = [
                 ("btn_a", cs.btn_a && !prev_btn_a, held_r.clone()),
                 ("btn_b", cs.btn_b && !prev_btn_b, held_r.clone()),
@@ -500,86 +568,53 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
         let teleport_target: Option<TeleportTarget> = None;
 
-        let mut frame_inputs = HashMap::new();
-        frame_inputs.insert(
-            local_player,
-            PlayerFrameInput {
-                rig,
-                input,
-                locomotion_input,
-                teleport_target,
-            },
-        );
-        let (render_cuboids, render_meshes, render_lights, scene_change) =
-            runtime.update(dt, &frame_inputs);
+        // Advance the local prediction using the same input this frame is
+        // about to send the server — this is what makes movement feel
+        // instant instead of waiting for a round trip. It can't know about
+        // wall/ground collision (that needs PhysX, server-only), so it may
+        // briefly overshoot near geometry; the gentle reconciliation below
+        // corrects that without a visible snap once the server catches up.
+        predicted.update(dt, &locomotion_input, &rig, teleport_target);
+        const RECONCILE_RATE: f32 = 6.0;
+        let reconcile_t = 1.0 - (-RECONCILE_RATE * dt).exp();
+        predicted.player_offset = predicted.player_offset.lerp(player_offset, reconcile_t);
+        let yaw_delta = (player_yaw - predicted.player_yaw + std::f32::consts::PI)
+            .rem_euclid(std::f32::consts::TAU)
+            - std::f32::consts::PI;
+        predicted.player_yaw += yaw_delta * reconcile_t;
 
-        // Multiplayer: publish this frame's world-space head/hand transforms
-        // (rig.head()/hand_grip() are already locomotion-adjusted, unlike
-        // the raw eye_views/grip poses used for the debug packet below) for
-        // network.rs's background thread to forward to the server.
+        // Ship this frame's input to the server's authoritative simulation —
+        // all physics/attachments/scripts run there now, not locally.
+        let _ = net.input_tx.send(network::PendingInput {
+            input: to_wire::input_frame_to_wire(&input),
+            locomotion_input: to_wire::locomotion_input_to_wire(&locomotion_input),
+            rig: to_wire::player_rig_to_wire(&rig),
+            teleport_target: teleport_target.map(to_wire::teleport_target_to_wire),
+        });
+
+        // Multiplayer avatar relay (unrelated to physics): publish this
+        // frame's world-space head/hand transforms for network.rs's
+        // background thread to forward to other players.
         {
-            let to_transform = |tf: space_soup_engine::Transform| avatar::Transform {
+            let to_avatar_transform = |tf: space_soup_engine::Transform| avatar::Transform {
                 position: tf.position,
                 rotation: tf.rotation,
             };
-            let local_rig = &runtime.rigs[&local_player];
             let _ = net.local_pose_tx.send(avatar::LocalPose {
-                head: to_transform(local_rig.head()),
-                left_hand: Some(to_transform(local_rig.hand_grip(Hand::Left))),
-                right_hand: Some(to_transform(local_rig.hand_grip(Hand::Right))),
+                head: to_avatar_transform(rig.head()),
+                left_hand: Some(to_avatar_transform(rig.hand_grip(Hand::Left))),
+                right_hand: Some(to_avatar_transform(rig.hand_grip(Hand::Right))),
             });
         }
 
         if frame_count % 90 == 0 {
             info!(
-                "Frame {frame_count}: render_cuboids={} render_meshes={} render_lights={} scene.objects={} dt={:.4}",
-                render_cuboids.len(),
-                render_meshes.len(),
-                render_lights.len(),
-                runtime.scene().objects.len(),
-                dt,
+                "Frame {frame_count}: cuboids={} meshes={} lights={} connected={}",
+                cuboids_src.len(),
+                meshes_src.len(),
+                lights_src.len(),
+                world.is_some(),
             );
-        }
-
-        if let Some(next_scene) = scene_change {
-            if let Err(e) = runtime.load_scene(&next_scene) {
-                warn!("Failed to switch scene to '{next_scene}': {e}");
-            } else {
-                info!(
-                    "After scene reload: {} objects",
-                    runtime.scene().objects.len()
-                );
-
-                let new_objs: Vec<(String, String)> = runtime
-                    .scene()
-                    .objects
-                    .iter()
-                    .filter_map(|o| o.mesh.as_ref().map(|m| (o.id.clone(), m.path.clone())))
-                    .collect();
-                for (obj_id, path) in new_objs {
-                    if mesh_cache.contains_key(&obj_id) {
-                        continue;
-                    }
-                    let full_path = runtime.game_dir().join(&path);
-                    info!(
-                        "Attempting to load mesh (scene reload): '{path}' -> {}",
-                        full_path.display()
-                    );
-                    match GltfMesh::load(
-                        renderer.device(),
-                        renderer.queue(),
-                        renderer.mesh_texture_layout(),
-                        &full_path,
-                    ) {
-                        Ok(mesh) => {
-                            let model_uniform = renderer.create_model_uniform();
-                            info!("Preloaded mesh '{obj_id}' ('{path}') for new scene");
-                            mesh_cache.insert(obj_id, (mesh, model_uniform));
-                        }
-                        Err(e) => warn!("Failed to preload mesh '{path}': {e}"),
-                    }
-                }
-            }
         }
 
         if let Some(ref mut stream) = debug_stream {
@@ -643,17 +678,17 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 },
 
                 locomotion: LocomotionSample {
-                    mode: format!("{:?}", runtime.locomotions[&local_player].mode),
-                    player_offset: runtime.locomotions[&local_player].player_offset.into(),
-                    player_yaw_deg: runtime.locomotions[&local_player].player_yaw.to_degrees(),
-                    teleport_aiming: runtime.locomotions[&local_player].is_teleport_aiming(),
+                    mode: "predicted (client-side)".to_string(),
+                    player_offset: predicted.player_offset.into(),
+                    player_yaw_deg: predicted.player_yaw.to_degrees(),
+                    teleport_aiming: predicted.is_teleport_aiming(),
                 },
 
                 scene: SceneSample {
-                    scene_name: runtime.scene_name().to_string(),
-                    object_count: runtime.scene().objects.len(),
-                    render_cuboids: render_cuboids.len(),
-                    render_meshes: render_meshes.len(),
+                    scene_name: static_scene.scene_name.clone(),
+                    object_count: cuboids_src.len() + meshes_src.len(),
+                    render_cuboids: cuboids_src.len(),
+                    render_meshes: meshes_src.len(),
                     active_animations: vec![],
                 },
 
@@ -673,36 +708,45 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let offset = runtime.locomotions[&local_player].player_offset;
-        let yaw_inv = Quat::from_rotation_y(-runtime.locomotions[&local_player].player_yaw);
+        // Render against the predicted (instant, locally-advanced) basis,
+        // not the raw last-known-authoritative one — this is what actually
+        // makes movement feel immediate instead of network-round-trip-gated.
+        let offset = predicted.player_offset;
+        let yaw_inv = Quat::from_rotation_y(-predicted.player_yaw);
 
-        let (head_pos, _) = runtime.world_head_transform(local_player);
+        let head_pos = rig.head().position;
         const MAX_RENDER_DIST: f32 = 40.0;
 
         let remotes = net.remote_players.lock().unwrap().clone();
 
-        let avatar_cuboids: Vec<RenderCuboid> = remotes
-            .iter()
-            .flat_map(|(id, state)| avatar::build_avatar_cuboids(&id.0.to_string(), state))
-            .collect();
-
-        // Bodies to render as a man.glb instance: every remote player, plus
-        // the local player themselves (so you can look down and see your
-        // own body, not just floating hands) — the local head pose comes
-        // straight from this frame's rig rather than a network round-trip.
-        let local_head_tf = runtime.rigs[&local_player].head();
-        let local_head = avatar::Transform {
-            position: local_head_tf.position,
-            rotation: local_head_tf.rotation,
+        // Bodies to render as a rigged, skinned instance: every remote
+        // player, plus the local player themselves (so you can look down
+        // and see your own body, not just floating hands) — the local
+        // head/hand poses come straight from this frame's rig, built from
+        // local tracking.
+        let local_state = avatar::RemotePlayerState {
+            head: avatar::Transform {
+                position: rig.head().position,
+                rotation: rig.head().rotation,
+            },
+            left_hand: Some(avatar::Transform {
+                position: rig.hand_grip(Hand::Left).position,
+                rotation: rig.hand_grip(Hand::Left).rotation,
+            }),
+            right_hand: Some(avatar::Transform {
+                position: rig.hand_grip(Hand::Right).position,
+                rotation: rig.hand_grip(Hand::Right).rotation,
+            }),
         };
-        let bodies: Vec<(PlayerId, avatar::Transform)> = std::iter::once((local_player, local_head))
-            .chain(remotes.iter().map(|(&id, state)| (id, state.head)))
-            .collect();
+        let bodies: Vec<(PlayerId, avatar::RemotePlayerState)> =
+            std::iter::once((local_player, local_state))
+                .chain(remotes.iter().map(|(&id, &state)| (id, state)))
+                .collect();
 
         // Drop avatar mesh instances for players/bodies no longer present.
-        avatar_mesh_cache.retain(|id, _| bodies.iter().any(|(bid, _)| bid == id));
+        avatar_mesh_cache.retain(|id, _| bodies.iter().any(|(bid, _)| *bid == *id));
 
-        for (id, head) in bodies.iter().copied() {
+        for (id, state) in bodies.iter().copied() {
             if !avatar_mesh_cache.contains_key(&id) {
                 match GltfMesh::load(
                     renderer.device(),
@@ -710,9 +754,16 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     renderer.mesh_texture_layout(),
                     &man_glb_path,
                 ) {
-                    Ok(mesh) => {
-                        let model_uniform = renderer.create_model_uniform();
-                        avatar_mesh_cache.insert(id, (mesh, model_uniform));
+                    Ok(mut mesh) => {
+                        if mesh.is_skinned() {
+                            mesh.create_skin_bind_group(renderer.device(), renderer.skin_joint_layout());
+                            let model_uniform = renderer.create_skinned_model_uniform();
+                            avatar_mesh_cache.insert(id, (mesh, model_uniform));
+                        } else {
+                            warn!("'models/man.glb' has no skin — avatar bodies need a rigged mesh");
+                            let model_uniform = renderer.create_model_uniform();
+                            avatar_mesh_cache.insert(id, (mesh, model_uniform));
+                        }
                     }
                     Err(e) => {
                         warn!("Failed to load avatar mesh 'models/man.glb' for player {id:?}: {e}");
@@ -721,33 +772,59 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let (mesh, _) = avatar_mesh_cache.get_mut(&id).expect("just inserted above");
-            let torso = avatar::torso_transform(head);
-            mesh.position = yaw_inv * (torso.position - offset);
-            mesh.rotation = yaw_inv * torso.rotation * avatar::man_glb_orientation_offset();
-            mesh.scale = Vec3::splat(avatar::MAN_GLB_SCALE);
+            mesh.position = Vec3::ZERO;
+            mesh.rotation = Quat::IDENTITY;
+            mesh.scale = Vec3::ONE;
+            let Some(skin) = &mesh.skin else { continue };
+
+            let to_render = |p: Vec3| yaw_inv * (p - offset);
+            let floor_drop = avatar::bind_head_height(skin) * avatar::MAN_GLB_SCALE;
+            let root = avatar::body_root_transform(
+                avatar::Transform {
+                    position: to_render(state.head.position),
+                    rotation: yaw_inv * state.head.rotation,
+                },
+                floor_drop,
+            );
+            let left_hand = state.left_hand.map(|h| avatar::Transform {
+                position: to_render(h.position),
+                rotation: yaw_inv * h.rotation,
+            });
+            let right_hand = state.right_hand.map(|h| avatar::Transform {
+                position: to_render(h.position),
+                rotation: yaw_inv * h.rotation,
+            });
+            let skinned_mats = avatar::body_skin_matrices(
+                skin,
+                root.position,
+                root.rotation,
+                avatar::MAN_GLB_SCALE,
+                left_hand,
+                right_hand,
+            );
+            skin.update_joint_matrices(renderer.queue(), &skinned_mats);
         }
 
-        let cuboids: Vec<Cuboid> = render_cuboids
+        let cuboids: Vec<Cuboid> = cuboids_src
             .iter()
-            .chain(avatar_cuboids.iter())
-            .filter(|rc| rc.position.distance(head_pos) < MAX_RENDER_DIST)
+            .filter(|rc| Vec3::from(rc.position).distance(head_pos) < MAX_RENDER_DIST)
             .map(|rc| to_space_soup_cuboid(rc, offset, yaw_inv))
             .collect();
 
-        let lights: Vec<Light> = render_lights
+        let lights: Vec<Light> = lights_src
             .iter()
             .map(|rl| to_space_soup_light(rl, offset, yaw_inv))
             .collect();
 
-        for rm in &render_meshes {
+        for rm in meshes_src {
             if let Some((mesh, _)) = mesh_cache.get_mut(&rm.id) {
-                mesh.position = yaw_inv * (rm.position - offset);
-                mesh.rotation = yaw_inv * rm.rotation;
-                mesh.scale = rm.scale;
+                mesh.position = yaw_inv * (Vec3::from(rm.position) - offset);
+                mesh.rotation = yaw_inv * Quat::from_array(rm.rotation);
+                mesh.scale = Vec3::from(rm.scale);
             }
         }
 
-        for rm in &render_meshes {
+        for rm in meshes_src {
             if let Some((mesh, _)) = mesh_cache.get(&rm.id) {
                 if let Some(skin) = &mesh.skin {
                     let Some(hand) = hand_for_mesh_id(&rm.id) else {
@@ -768,49 +845,36 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                         ),
                     };
                     let (mut root_pos, mut root_rot, curl) = if has_grip {
-                        let tf = runtime.rigs[&local_player].hand_grip(hand);
+                        let tf = rig.hand_grip(hand);
                         (tf.position, tf.rotation, squeeze)
                     } else {
-                        let tf = runtime.rigs[&local_player].finger(hand, FingerJoint::Wrist);
+                        let tf = rig.finger(hand, FingerJoint::Wrist);
                         (tf.position, tf.rotation, 0.0)
                     };
 
-                    let held_point = runtime.held_grip_point(local_player, hand);
-                    let held_pose = if held_point.is_none() {
-                        held_grip_pose(&runtime, local_player, hand)
-                    } else {
-                        None
-                    };
+                    let held: Option<&WireHeldGrip> = world.as_ref().and_then(|w| match hand {
+                        Hand::Left => w.left_hand_held.as_ref(),
+                        Hand::Right => w.right_hand_held.as_ref(),
+                    });
 
-                    if let Some((obj, point)) = held_point {
-                        let obj_mat = glam::Mat4::from_rotation_translation(
-                            obj.cuboid.rotation,
-                            obj.cuboid.position,
-                        );
-                        let offset_mat = glam::Mat4::from_rotation_translation(
-                            Quat::from_array(point.local_rot),
-                            Vec3::from(point.local_pos),
-                        );
-                        let (_, rot, pos) = (obj_mat * offset_mat).to_scale_rotation_translation();
-                        root_pos = pos;
-                        root_rot = rot;
-                    } else if let Some((obj, grip)) = held_pose {
-                        let obj_mat = glam::Mat4::from_rotation_translation(
-                            obj.cuboid.rotation,
-                            obj.cuboid.position,
-                        );
-                        let offset_mat = glam::Mat4::from_rotation_translation(
-                            Quat::from_array(grip.hand_offset_rot),
-                            Vec3::from(grip.hand_offset_pos),
-                        );
-                        let (_, rot, pos) = (obj_mat * offset_mat).to_scale_rotation_translation();
-                        root_pos = pos;
-                        root_rot = rot;
+                    if let Some(held) = held {
+                        if let Some(live) = live_objects.by_id.get(&held.object_id) {
+                            let obj_mat = glam::Mat4::from_rotation_translation(
+                                live.rotation,
+                                live.position,
+                            );
+                            let offset_mat = glam::Mat4::from_rotation_translation(
+                                Quat::from_array(held.point_local_rot),
+                                Vec3::from(held.point_local_pos),
+                            );
+                            let (_, rot, pos) =
+                                (obj_mat * offset_mat).to_scale_rotation_translation();
+                            root_pos = pos;
+                            root_rot = rot;
+                        }
                     }
 
-                    let held_curl = held_point
-                        .map(|(_, p)| &p.finger_curl)
-                        .or_else(|| held_pose.map(|(_, g)| &g.finger_curl));
+                    let held_curl = held.map(|h| &h.finger_curl);
                     let free_curl = if held_curl.is_none() {
                         Some(free_hand_finger_curl(skin, trigger, squeeze, thumb_touch))
                     } else {
@@ -824,19 +888,61 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let mesh_instances: Vec<MeshInstance> = render_meshes
+        // The local player's own avatar body is deliberately left out of
+        // the direct view entirely (not just the head) — you'd otherwise
+        // see your own untracked torso/legs hanging in your face. It's
+        // still handed to the renderer separately, for the mirror pass and
+        // (via the network) other players' clients to actually see.
+        let mesh_instances: Vec<MeshInstance> = meshes_src
             .iter()
-            .filter(|rm| rm.position.distance(head_pos) < MAX_RENDER_DIST)
+            .filter(|rm| Vec3::from(rm.position).distance(head_pos) < MAX_RENDER_DIST)
             .filter_map(|rm| {
                 let (mesh, model) = mesh_cache.get(&rm.id)?;
                 Some(MeshInstance { mesh, model })
             })
             .chain(
                 avatar_mesh_cache
-                    .values()
-                    .map(|(mesh, model)| MeshInstance { mesh, model }),
+                    .iter()
+                    .filter(|(&id, _)| id != local_player)
+                    .map(|(_, (mesh, model))| MeshInstance { mesh, model }),
             )
             .collect();
+
+        let mirror_only_mesh_instances: Vec<MeshInstance> = avatar_mesh_cache
+            .get(&local_player)
+            .map(|(mesh, model)| MeshInstance { mesh, model })
+            .into_iter()
+            .collect();
+
+        client_audio.update(
+            &dir,
+            world.as_ref().map(|w| w.sounds.as_slice()).unwrap_or(&[]),
+            (rig.head().position, rig.head().rotation),
+        );
+
+        // A scene object named "mirror" (authored like any other static
+        // cuboid, e.g. as a dark frame) additionally gets a real-time
+        // reflection rendered onto its face — same render-space transform
+        // as everything else, just also handed to the renderer's dedicated
+        // mirror pass.
+        let mirror_surface = cuboids_src.iter().find(|rc| rc.id == "mirror").map(|rc| {
+            let rotation = yaw_inv * Quat::from_array(rc.rotation);
+            let half_size = Vec3::from(rc.half_size);
+            // The quad sits at local Z=0 (the frame cuboid's center), but the
+            // frame itself has thickness — its own front face is half_size.z
+            // closer to the camera than that. Without pushing the quad
+            // forward past it, the opaque frame draws first, writes depth,
+            // and the quad fails the depth test every time: exactly why it
+            // was rendering as flat black (just the frame's own dark color).
+            let normal = rotation * Vec3::NEG_Z;
+            let position =
+                yaw_inv * (Vec3::from(rc.position) - offset) + normal * (half_size.z + 0.005);
+            MirrorSurface {
+                position,
+                rotation,
+                half_size,
+            }
+        });
 
         let proj_views = renderer.render_frame_with_meshes(
             &headset.session,
@@ -844,7 +950,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             time,
             &cuboids,
             &mesh_instances,
+            &mirror_only_mesh_instances,
             &lights,
+            mirror_surface,
         )?;
         let proj_layer = openxr::CompositionLayerProjection::new()
             .space(&headset.stage)
@@ -874,43 +982,42 @@ fn xr_quat(o: openxr::Quaternionf) -> Quat {
 }
 
 #[cfg(target_os = "android")]
-fn to_space_soup_cuboid(rc: &RenderCuboid, offset: Vec3, yaw_inv: Quat) -> Cuboid {
-    let position = yaw_inv * (rc.position - offset);
-    let rotation = yaw_inv * rc.rotation;
-
+fn to_space_soup_cuboid(rc: &WireRenderCuboid, offset: Vec3, yaw_inv: Quat) -> Cuboid {
     let style = match rc.style {
-        EngineCuboidStyle::Solid => SsCuboidStyle::Solid,
-        EngineCuboidStyle::Wireframe => SsCuboidStyle::Wireframe,
-        EngineCuboidStyle::SolidAndWire => SsCuboidStyle::SolidAndWire,
+        WireCuboidStyle::Solid => SsCuboidStyle::Solid,
+        WireCuboidStyle::Wireframe => SsCuboidStyle::Wireframe,
+        WireCuboidStyle::SolidAndWire => SsCuboidStyle::SolidAndWire,
     };
 
+    let position = yaw_inv * (Vec3::from(rc.position) - offset);
+    let half_size = Vec3::from(rc.half_size);
     let mut c = match style {
-        SsCuboidStyle::Solid => Cuboid::solid(position, rc.half_size, ss_color(rc.color)),
+        SsCuboidStyle::Solid => Cuboid::solid(position, half_size, ss_color(rc.color)),
         SsCuboidStyle::Wireframe => {
-            Cuboid::wireframe(position, rc.half_size, ss_color(rc.wire_color))
+            Cuboid::wireframe(position, half_size, ss_color(rc.wire_color))
         }
         SsCuboidStyle::SolidAndWire => Cuboid::solid_and_wire(
             position,
-            rc.half_size,
+            half_size,
             ss_color(rc.color),
             ss_color(rc.wire_color),
         ),
     };
-    c.rotation = rotation;
+    c.rotation = yaw_inv * Quat::from_array(rc.rotation);
     c
 }
 
 /// Same "world moves under a fixed camera" render-space transform applied to
-/// `render_cuboids`/`render_meshes` above — direction is a vector, so only
-/// the yaw rotation applies to it, not the positional offset.
+/// cuboids/meshes above — direction is a vector, so only the yaw rotation
+/// applies to it, not the positional offset.
 #[cfg(target_os = "android")]
-fn to_space_soup_light(rl: &RenderLight, offset: Vec3, yaw_inv: Quat) -> Light {
+fn to_space_soup_light(rl: &WireRenderLight, offset: Vec3, yaw_inv: Quat) -> Light {
     Light {
-        position: yaw_inv * (rl.position - offset),
-        direction: yaw_inv * rl.direction,
+        position: yaw_inv * (Vec3::from(rl.position) - offset),
+        direction: yaw_inv * Vec3::from(rl.direction),
         kind: match rl.kind {
-            EngineLightKind::Point => SsLightKind::Point,
-            EngineLightKind::Spot => SsLightKind::Spot,
+            WireLightKind::Point => SsLightKind::Point,
+            WireLightKind::Spot => SsLightKind::Spot,
         },
         color: ss_color(rl.color),
         intensity: rl.intensity,
@@ -920,7 +1027,6 @@ fn to_space_soup_light(rl: &RenderLight, offset: Vec3, yaw_inv: Quat) -> Light {
 }
 
 #[cfg(target_os = "android")]
-fn ss_color(c: space_soup_engine::Color3) -> Color3 {
+fn ss_color(c: WireColor3) -> Color3 {
     Color3(c.0, c.1, c.2, c.3)
 }
-

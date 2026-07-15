@@ -11,15 +11,49 @@ use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use space_soup_protocol::{ClientMessage, PlayerId, Pose, ServerMessage};
+use space_soup_protocol::{
+    ClientMessage, PlayerId, Pose, ServerMessage, WireHand, WireInputFrame, WireLocomotionInput,
+    WirePlayerRig, WireTeleportTarget, WireWorld,
+};
 
 use crate::avatar::{LocalPose, RemotePlayerState, Transform};
 
 pub type RemotePlayers = Arc<Mutex<HashMap<PlayerId, RemotePlayerState>>>;
+pub type LatestWorld = Arc<Mutex<Option<WireWorld>>>;
+
+/// One frame's worth of input for the server's authoritative simulation —
+/// everything `ClientMessage::Input` needs, already converted to wire types
+/// by `to_wire.rs` before it crosses into this module.
+#[derive(Debug, Clone)]
+pub struct PendingInput {
+    pub input: WireInputFrame,
+    pub locomotion_input: WireLocomotionInput,
+    pub rig: WirePlayerRig,
+    pub teleport_target: Option<WireTeleportTarget>,
+}
+
+impl Default for PendingInput {
+    fn default() -> Self {
+        Self {
+            input: WireInputFrame::default(),
+            locomotion_input: WireLocomotionInput {
+                move_stick: (0.0, 0.0),
+                turn_stick_x: 0.0,
+                teleport_pressed: false,
+                teleport_released: false,
+                teleport_hand: WireHand::Right,
+            },
+            rig: WirePlayerRig::default(),
+            teleport_target: None,
+        }
+    }
+}
 
 pub struct NetworkHandle {
     pub local_pose_tx: watch::Sender<LocalPose>,
+    pub input_tx: watch::Sender<PendingInput>,
     pub remote_players: RemotePlayers,
+    pub latest_world: LatestWorld,
 }
 
 fn to_wire(t: Transform) -> Pose {
@@ -61,33 +95,61 @@ pub fn spawn(server_url: String) -> NetworkHandle {
         left_hand: None,
         right_hand: None,
     });
+    let (input_tx, input_rx) = watch::channel(PendingInput::default());
     let remote_players: RemotePlayers = Arc::new(Mutex::new(HashMap::new()));
+    let latest_world: LatestWorld = Arc::new(Mutex::new(None));
 
     let thread_remote_players = remote_players.clone();
+    let thread_latest_world = latest_world.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("failed to build network runtime");
-        rt.block_on(run_client(server_url, local_pose_rx, thread_remote_players));
+        rt.block_on(run_client(
+            server_url,
+            local_pose_rx,
+            input_rx,
+            thread_remote_players,
+            thread_latest_world,
+        ));
     });
 
     NetworkHandle {
         local_pose_tx,
+        input_tx,
         remote_players,
+        latest_world,
     }
 }
 
 async fn run_client(
     server_url: String,
     mut local_pose_rx: watch::Receiver<LocalPose>,
+    mut input_rx: watch::Receiver<PendingInput>,
     remote_players: RemotePlayers,
+    latest_world: LatestWorld,
 ) {
     loop {
         match tokio_tungstenite::connect_async(&server_url).await {
             Ok((ws, _)) => {
+                // See the server-side handle_connection for why: without
+                // this, Nagle's algorithm batches our small, frequent
+                // pose/input frames, adding self-inflicted latency on top of
+                // the real droplet round-trip.
+                if let MaybeTlsStream::Plain(tcp) = ws.get_ref() {
+                    let _ = tcp.set_nodelay(true);
+                }
                 log::info!("multiplayer: connected to {server_url}");
-                if let Err(e) = run_session(ws, &mut local_pose_rx, &remote_players).await {
+                if let Err(e) = run_session(
+                    ws,
+                    &mut local_pose_rx,
+                    &mut input_rx,
+                    &remote_players,
+                    &latest_world,
+                )
+                .await
+                {
                     log::warn!("multiplayer: session ended: {e}");
                 }
             }
@@ -96,6 +158,7 @@ async fn run_client(
             }
         }
         remote_players.lock().unwrap().clear();
+        *latest_world.lock().unwrap() = None;
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
@@ -103,7 +166,9 @@ async fn run_client(
 async fn run_session(
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     local_pose_rx: &mut watch::Receiver<LocalPose>,
+    input_rx: &mut watch::Receiver<PendingInput>,
     remote_players: &RemotePlayers,
+    latest_world: &LatestWorld,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut sink, mut stream) = ws.split();
 
@@ -122,9 +187,22 @@ async fn run_session(
                 };
                 sink.send(Message::text(serde_json::to_string(&msg)?)).await?;
             }
+            changed = input_rx.changed() => {
+                changed?;
+                let pending = input_rx.borrow_and_update().clone();
+                let msg = ClientMessage::Input {
+                    input: pending.input,
+                    locomotion_input: pending.locomotion_input,
+                    rig: pending.rig,
+                    teleport_target: pending.teleport_target,
+                };
+                sink.send(Message::text(serde_json::to_string(&msg)?)).await?;
+            }
             incoming = stream.next() => {
                 match incoming {
-                    Some(Ok(Message::Text(text))) => handle_server_message(&text, remote_players),
+                    Some(Ok(Message::Text(text))) => {
+                        handle_server_message(&text, remote_players, latest_world)
+                    }
                     Some(Ok(Message::Close(_))) | None => return Ok(()),
                     Some(Err(e)) => return Err(Box::new(e)),
                     _ => {}
@@ -134,7 +212,7 @@ async fn run_session(
     }
 }
 
-fn handle_server_message(text: &str, remote_players: &RemotePlayers) {
+fn handle_server_message(text: &str, remote_players: &RemotePlayers, latest_world: &LatestWorld) {
     let Ok(msg) = serde_json::from_str::<ServerMessage>(text) else {
         return;
     };
@@ -158,12 +236,11 @@ fn handle_server_message(text: &str, remote_players: &RemotePlayers) {
         ServerMessage::PlayerLeft { id } => {
             remote_players.lock().unwrap().remove(&id);
         }
-        // Authoritative-simulation broadcast — quest_app doesn't send
-        // ClientMessage::Input yet (it still runs its own local GameRuntime;
-        // becoming a thin terminal that renders this instead is a bigger,
-        // separate cutover), so it never receives one of these in practice.
-        // Ignored rather than left unhandled so a real server response
-        // doesn't crash a match instead of just being a no-op.
-        ServerMessage::World(_) => {}
+        // Authoritative-simulation broadcast: the server already filters
+        // this to only the copy tagged for this connection (`for_player`),
+        // so whatever arrives here is unconditionally ours.
+        ServerMessage::World(world) => {
+            *latest_world.lock().unwrap() = Some(world);
+        }
     }
 }
