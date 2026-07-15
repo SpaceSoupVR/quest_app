@@ -482,7 +482,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         if r_trigger_down && !(prev_r_trigger || prev_r_squeeze) {
             let p = rig.hand_grip(Hand::Right).position;
             if let Some((id, point)) =
-                grab_detect::nearest_grip_point_to(&live_objects, &static_scene, p, r_trigger_only)
+                grab_detect::nearest_grip_point_to(&live_objects, &static_scene, p, r_trigger_only, Hand::Right)
             {
                 input.grabbed.push((id, Hand::Right, point));
             } else if let Some(id) = grab_detect::nearest_object_to(&live_objects, p) {
@@ -499,7 +499,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         if l_trigger_down && !(prev_l_trigger || prev_l_squeeze) {
             let p = rig.hand_grip(Hand::Left).position;
             if let Some((id, point)) =
-                grab_detect::nearest_grip_point_to(&live_objects, &static_scene, p, l_trigger_only)
+                grab_detect::nearest_grip_point_to(&live_objects, &static_scene, p, l_trigger_only, Hand::Left)
             {
                 input.grabbed.push((id, Hand::Left, point));
             } else if let Some(id) = grab_detect::nearest_object_to(&live_objects, p) {
