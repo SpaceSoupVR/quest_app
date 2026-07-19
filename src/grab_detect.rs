@@ -114,12 +114,13 @@ pub fn nearest_grip_point_to(
                 let obj_mat =
                     glam::Mat4::from_rotation_translation(live_c.rotation, live_c.position);
                 let world_pos = obj_mat.transform_point3(Vec3::from(gp.local_pos));
-                Some((id.clone(), gp.name.clone(), gp.kind, point.distance(world_pos)))
+                let range = gp.grab_range.unwrap_or(GRAB_RANGE);
+                Some((id.clone(), gp.name.clone(), gp.kind, point.distance(world_pos), range))
             })
         })
-        .filter(|(_, _, kind, d)| *d <= GRAB_RANGE && (*kind != GripKind::Pinch || trigger_only))
+        .filter(|(_, _, kind, d, range)| *d <= *range && (*kind != GripKind::Pinch || trigger_only))
         .min_by(|a, b| a.3.partial_cmp(&b.3).unwrap())
-        .map(|(id, name, _, _)| (id, name))
+        .map(|(id, name, _, _, _)| (id, name))
 }
 
 /// What a hand is holding, for stamping `ButtonPress::object_id` — the

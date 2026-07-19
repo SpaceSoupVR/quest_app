@@ -55,12 +55,29 @@ if ! command -v tmux >/dev/null 2>&1; then
     exit 1
 fi
 
-WANT_EDITOR=true
-read -r -p "Do you want the scene editor? [Y/n] " editor_reply
-case "$editor_reply" in
-    [nN]*) WANT_EDITOR=false ;;
-    *) WANT_EDITOR=true ;;
+WANT_CLEAN=false
+read -r -p "Clean all builds first? [y/N] " clean_reply
+case "$clean_reply" in
+    [yY]*) WANT_CLEAN=true ;;
+    *) WANT_CLEAN=false ;;
 esac
+
+WANT_DEPLOY=true
+read -r -p "Upload to headset and run? [Y/n] " deploy_reply
+case "$deploy_reply" in
+    [nN]*) WANT_DEPLOY=false ;;
+    *) WANT_DEPLOY=true ;;
+esac
+
+WANT_EDITOR=false
+if $WANT_DEPLOY; then
+    WANT_EDITOR=true
+    read -r -p "Do you want the scene editor? [Y/n] " editor_reply
+    case "$editor_reply" in
+        [nN]*) WANT_EDITOR=false ;;
+        *) WANT_EDITOR=true ;;
+    esac
+fi
 
 wait_for_remote_path() {
     local path="$1"
@@ -125,20 +142,22 @@ wait_for_tcp_listener() {
     ok "Listener on :$port is ready."
 }
 
-step "Cleaning space_soup..."
-cd "$SPACE_SOUP_DIR"
-cargo clean
-
-if $WANT_EDITOR; then
-    step "Cleaning debug_viewer..."
-    cd "$DEBUG_VIEWER_DIR"
+if $WANT_CLEAN; then
+    step "Cleaning space_soup..."
+    cd "$SPACE_SOUP_DIR"
     cargo clean
-fi
 
-step "Cleaning quest_app..."
-cd "$QUEST_APP_DIR"
-cargo clean
-cd android && ./gradlew clean && cd ..
+    if $WANT_EDITOR; then
+        step "Cleaning debug_viewer..."
+        cd "$DEBUG_VIEWER_DIR"
+        cargo clean
+    fi
+
+    step "Cleaning quest_app..."
+    cd "$QUEST_APP_DIR"
+    cargo clean
+    cd android && ./gradlew clean && cd ..
+fi
 
 if $WANT_EDITOR; then
     step "Pre-building debug_viewer..."
@@ -163,150 +182,166 @@ fi
 cd android
 ./gradlew assembleDebug
 
-step "Installing APK..."
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+if $WANT_DEPLOY; then
+    step "Installing APK..."
+    adb install -r app/build/outputs/apk/debug/app-debug.apk
 
-tries=0
-until adb shell pm list packages | grep -q "$PACKAGE"; do
-    tries=$((tries + 1))
-    if [ "$tries" -ge 15 ]; then
-        fail "$PACKAGE not found in package list after install."
+    tries=0
+    until adb shell pm list packages | grep -q "$PACKAGE"; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 15 ]; then
+            fail "$PACKAGE not found in package list after install."
+            exit 1
+        fi
+        sleep 1
+    done
+    ok "Package installed and registered."
+
+    cd "$QUEST_APP_DIR"
+
+    if $WANT_EDITOR; then
+        step "Reversing TCP debug_viewer port 7778..."
+        adb reverse tcp:7778 tcp:7778
+    fi
+
+    if [ ! -f "$GAME_DIR/manifest.json" ]; then
+        fail "$GAME_DIR/manifest.json not found. Aborting."
         exit 1
     fi
-    sleep 1
-done
-ok "Package installed and registered."
 
-cd "$QUEST_APP_DIR"
+    wait_for_app_data_dir
 
-if $WANT_EDITOR; then
-    step "Reversing TCP debug_viewer port 7778..."
-    adb reverse tcp:7778 tcp:7778
-fi
+    step "Pushing game folder to Quest..."
+    adb shell mkdir -p "$REMOTE_GAME_DIR"
+    adb push "$GAME_DIR/manifest.json" "$REMOTE_GAME_DIR/manifest.json"
+    verify_remote_file "$REMOTE_GAME_DIR/manifest.json"
 
-if [ ! -f "$GAME_DIR/manifest.json" ]; then
-    fail "$GAME_DIR/manifest.json not found. Aborting."
-    exit 1
-fi
+    if [ -f "$GAME_DIR/avatar_rig.json" ]; then
+        adb push "$GAME_DIR/avatar_rig.json" "$REMOTE_GAME_DIR/avatar_rig.json"
+        verify_remote_file "$REMOTE_GAME_DIR/avatar_rig.json"
+    fi
 
-wait_for_app_data_dir
+    if [ -d "$GAME_DIR/scenes" ]; then
+        adb shell mkdir -p "$REMOTE_GAME_DIR/scenes"
+        shopt -s nullglob
+        for f in "$GAME_DIR"/scenes/*.json; do
+            fname=$(basename "$f")
+            adb push "$f" "$REMOTE_GAME_DIR/scenes/$fname"
+            verify_remote_file "$REMOTE_GAME_DIR/scenes/$fname"
+        done
+        shopt -u nullglob
+    fi
 
-step "Pushing game folder to Quest..."
-adb shell mkdir -p "$REMOTE_GAME_DIR"
-adb push "$GAME_DIR/manifest.json" "$REMOTE_GAME_DIR/manifest.json"
-verify_remote_file "$REMOTE_GAME_DIR/manifest.json"
+    if [ -d "$GAME_DIR/models" ]; then
+        # Push files one at a time (not whole directories) — adb push of a
+        # directory that doesn't yet exist on-device tries to recursively
+        # create it via a sync-protocol mkdir that scoped storage rejects for
+        # app-private dirs ("remote secure_mkdirs failed: Operation not
+        # permitted"), even though a plain `adb shell mkdir -p` for the same
+        # path works fine. So we mkdir every subdirectory ourselves first,
+        # then push each file into its already-existing remote parent.
+        while IFS= read -r -d '' d; do
+            rel="${d#"$GAME_DIR"/models}"
+            adb shell mkdir -p "$REMOTE_GAME_DIR/models$rel"
+        done < <(find "$GAME_DIR/models" -type d -print0)
 
-if [ -d "$GAME_DIR/scenes" ]; then
-    adb shell mkdir -p "$REMOTE_GAME_DIR/scenes"
-    shopt -s nullglob
-    for f in "$GAME_DIR"/scenes/*.json; do
-        fname=$(basename "$f")
-        adb push "$f" "$REMOTE_GAME_DIR/scenes/$fname"
-        verify_remote_file "$REMOTE_GAME_DIR/scenes/$fname"
-    done
-    shopt -u nullglob
-fi
+        while IFS= read -r -d '' f; do
+            rel="${f#"$GAME_DIR"/models/}"
+            adb push "$f" "$REMOTE_GAME_DIR/models/$rel"
+            verify_remote_file "$REMOTE_GAME_DIR/models/$rel"
+        done < <(find "$GAME_DIR/models" -type f -print0)
+    fi
 
-if [ -d "$GAME_DIR/models" ]; then
-    adb shell mkdir -p "$REMOTE_GAME_DIR/models"
-    shopt -s nullglob
-    for f in "$GAME_DIR"/models/*; do
-        fname=$(basename "$f")
-        adb push "$f" "$REMOTE_GAME_DIR/models/$fname"
-        verify_remote_file "$REMOTE_GAME_DIR/models/$fname"
-    done
-    shopt -u nullglob
-fi
+    if [ -d "$GAME_DIR/sound" ]; then
+        adb shell mkdir -p "$REMOTE_GAME_DIR/sound"
+        shopt -s nullglob
+        for f in "$GAME_DIR"/sound/*; do
+            fname=$(basename "$f")
+            adb push "$f" "$REMOTE_GAME_DIR/sound/$fname"
+            verify_remote_file "$REMOTE_GAME_DIR/sound/$fname"
+        done
+        shopt -u nullglob
+    fi
 
-if [ -d "$GAME_DIR/sound" ]; then
-    adb shell mkdir -p "$REMOTE_GAME_DIR/sound"
-    shopt -s nullglob
-    for f in "$GAME_DIR"/sound/*; do
-        fname=$(basename "$f")
-        adb push "$f" "$REMOTE_GAME_DIR/sound/$fname"
-        verify_remote_file "$REMOTE_GAME_DIR/sound/$fname"
-    done
-    shopt -u nullglob
-fi
+    ok "Game folder verified on device."
 
-ok "Game folder verified on device."
-
-step "Verifying multiplayer server is running on $DROPLET_SSH_HOST..."
-if [ -f "$DROPLET_SSH_KEY" ]; then
-    if ssh -i "$DROPLET_SSH_KEY" -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
-        "$DROPLET_SSH_HOST" "systemctl is-active --quiet $DROPLET_SERVICE || systemctl restart $DROPLET_SERVICE"; then
-        ok "space-soup-server is active."
+    step "Verifying multiplayer server is running on $DROPLET_SSH_HOST..."
+    if [ -f "$DROPLET_SSH_KEY" ]; then
+        if ssh -i "$DROPLET_SSH_KEY" -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
+            "$DROPLET_SSH_HOST" "systemctl is-active --quiet $DROPLET_SERVICE || systemctl restart $DROPLET_SERVICE"; then
+            ok "space-soup-server is active."
+        else
+            warn "Could not confirm space-soup-server is running on $DROPLET_SSH_HOST — multiplayer may not work. Check manually with: ssh -i $DROPLET_SSH_KEY $DROPLET_SSH_HOST systemctl status $DROPLET_SERVICE"
+        fi
     else
-        warn "Could not confirm space-soup-server is running on $DROPLET_SSH_HOST — multiplayer may not work. Check manually with: ssh -i $DROPLET_SSH_KEY $DROPLET_SSH_HOST systemctl status $DROPLET_SERVICE"
+        warn "SSH key not found at $DROPLET_SSH_KEY — skipping multiplayer server check (set QUEST_SERVER_SSH_KEY to override)."
     fi
-else
-    warn "SSH key not found at $DROPLET_SSH_KEY — skipping multiplayer server check (set QUEST_SERVER_SSH_KEY to override)."
-fi
 
-step "Pushing multiplayer server URL ($SERVER_URL)..."
-adb shell mkdir -p "$(dirname "$REMOTE_SERVER_URL_FILE")"
-echo "$SERVER_URL" | adb shell "cat > '$REMOTE_SERVER_URL_FILE'"
-verify_remote_file "$REMOTE_SERVER_URL_FILE"
+    step "Pushing multiplayer server URL ($SERVER_URL)..."
+    adb shell mkdir -p "$(dirname "$REMOTE_SERVER_URL_FILE")"
+    echo "$SERVER_URL" | adb shell "cat > '$REMOTE_SERVER_URL_FILE'"
+    verify_remote_file "$REMOTE_SERVER_URL_FILE"
 
-step "Starting dev dashboard (tmux, running in background)..."
+    step "Starting dev dashboard (tmux, running in background)..."
 
-tmux kill-session -t "$DASHBOARD_SESSION" 2>/dev/null || true
-tmux new-session -d -s "$DASHBOARD_SESSION" -n dev -x 220 -y 52
+    tmux kill-session -t "$DASHBOARD_SESSION" 2>/dev/null || true
+    tmux new-session -d -s "$DASHBOARD_SESSION" -n dev -x 220 -y 52
 
-tmux set-option -t "$DASHBOARD_SESSION" -g mouse on
-tmux set-option -t "$DASHBOARD_SESSION" -g status-style "bg=colour234,fg=colour51"
-tmux set-option -t "$DASHBOARD_SESSION" -g status-left "#[bold]  Quest App Dev  #[default]"
-tmux set-option -t "$DASHBOARD_SESSION" -g status-left-length 20
-tmux set-option -t "$DASHBOARD_SESSION" -g status-right "#[fg=colour244]%H:%M:%S "
-tmux set-option -t "$DASHBOARD_SESSION" -g pane-border-status top
-tmux set-option -t "$DASHBOARD_SESSION" -g pane-border-format " #{pane_title} "
-tmux set-option -t "$DASHBOARD_SESSION" -g pane-active-border-style "fg=colour51"
-tmux set-option -t "$DASHBOARD_SESSION" -g pane-border-style "fg=colour238"
+    tmux set-option -t "$DASHBOARD_SESSION" -g mouse on
+    tmux set-option -t "$DASHBOARD_SESSION" -g status-style "bg=colour234,fg=colour51"
+    tmux set-option -t "$DASHBOARD_SESSION" -g status-left "#[bold]  Quest App Dev  #[default]"
+    tmux set-option -t "$DASHBOARD_SESSION" -g status-left-length 20
+    tmux set-option -t "$DASHBOARD_SESSION" -g status-right "#[fg=colour244]%H:%M:%S "
+    tmux set-option -t "$DASHBOARD_SESSION" -g pane-border-status top
+    tmux set-option -t "$DASHBOARD_SESSION" -g pane-border-format " #{pane_title} "
+    tmux set-option -t "$DASHBOARD_SESSION" -g pane-active-border-style "fg=colour51"
+    tmux set-option -t "$DASHBOARD_SESSION" -g pane-border-style "fg=colour238"
 
-PANE_LOGCAT=$(tmux display-message -t "$DASHBOARD_SESSION:dev" -p '#{pane_id}')
-tmux send-keys -t "$PANE_LOGCAT" \
-    "export DISABLE_AUTO_UPDATE=true; cd '$QUEST_APP_DIR' && adb logcat -s quest_app" C-m
-tmux select-pane -t "$PANE_LOGCAT" -T "logcat"
+    PANE_LOGCAT=$(tmux display-message -t "$DASHBOARD_SESSION:dev" -p '#{pane_id}')
+    tmux send-keys -t "$PANE_LOGCAT" \
+        "export DISABLE_AUTO_UPDATE=true; cd '$QUEST_APP_DIR' && adb logcat -s quest_app" C-m
+    tmux select-pane -t "$PANE_LOGCAT" -T "logcat"
 
-if $WANT_EDITOR; then
-    PANE_VIEWER=$(tmux split-window -h -t "$PANE_LOGCAT" -l "60%" -P -F '#{pane_id}')
-    tmux send-keys -t "$PANE_VIEWER" \
-        "export DISABLE_AUTO_UPDATE=true; cd '$DEBUG_VIEWER_DIR' && cargo run --target $HOST_TARGET" C-m
-    tmux select-pane -t "$PANE_VIEWER" -T "debug_viewer"
+    if $WANT_EDITOR; then
+        PANE_VIEWER=$(tmux split-window -h -t "$PANE_LOGCAT" -l "60%" -P -F '#{pane_id}')
+        tmux send-keys -t "$PANE_VIEWER" \
+            "export DISABLE_AUTO_UPDATE=true; cd '$DEBUG_VIEWER_DIR' && cargo run --target $HOST_TARGET" C-m
+        tmux select-pane -t "$PANE_VIEWER" -T "debug_viewer"
 
-    PANE_KEEPALIVE=$(tmux split-window -v -t "$PANE_LOGCAT" -l "40%" -P -F '#{pane_id}')
-    tmux send-keys -t "$PANE_KEEPALIVE" \
-        "export DISABLE_AUTO_UPDATE=true; while true; do adb reverse tcp:7778 tcp:7778 2>/dev/null; sleep 5; done" C-m
-    tmux select-pane -t "$PANE_KEEPALIVE" -T "adb reverse keepalive"
+        PANE_KEEPALIVE=$(tmux split-window -v -t "$PANE_LOGCAT" -l "40%" -P -F '#{pane_id}')
+        tmux send-keys -t "$PANE_KEEPALIVE" \
+            "export DISABLE_AUTO_UPDATE=true; while true; do adb reverse tcp:7778 tcp:7778 2>/dev/null; sleep 5; done" C-m
+        tmux select-pane -t "$PANE_KEEPALIVE" -T "adb reverse keepalive"
 
-    tmux select-pane -t "$PANE_VIEWER"
-fi
-
-ok "Dashboard running in background tmux session (no window opened)."
-detail "Attach any time with: tmux attach -t $DASHBOARD_SESSION"
-
-if $WANT_EDITOR; then
-    wait_for_tcp_listener 7778
-fi
-
-step "Launching quest_app on headset..."
-adb shell am start -n "$PACKAGE/android.app.NativeActivity"
-
-tries=0
-until adb shell pidof "$PACKAGE" >/dev/null 2>&1; do
-    tries=$((tries + 1))
-    if [ "$tries" -ge 20 ]; then
-        warn "could not confirm $PACKAGE process started — check logcat."
-        break
+        tmux select-pane -t "$PANE_VIEWER"
     fi
-    sleep 1
-done
-ok "quest_app process running."
 
-step "All set."
-if $WANT_EDITOR; then
-    detail "Put on your headset and move around — debug_viewer shows the live scene + player."
+    ok "Dashboard running in background tmux session (no window opened)."
+    detail "Attach any time with: tmux attach -t $DASHBOARD_SESSION"
+
+    if $WANT_EDITOR; then
+        wait_for_tcp_listener 7778
+    fi
+
+    step "Launching quest_app on headset..."
+    adb shell am start -n "$PACKAGE/android.app.NativeActivity"
+
+    tries=0
+    until adb shell pidof "$PACKAGE" >/dev/null 2>&1; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 20 ]; then
+            warn "could not confirm $PACKAGE process started — check logcat."
+            break
+        fi
+        sleep 1
+    done
+    ok "quest_app process running."
+
+    step "All set."
+    if $WANT_EDITOR; then
+        detail "Put on your headset and move around — debug_viewer shows the live scene + player."
+    fi
+    detail "Dashboard: tmux attach -t $DASHBOARD_SESSION"
+
+    read -r -p "Press Enter when you're done to stop the dashboard and free up GPU/CPU... "
 fi
-detail "Dashboard: tmux attach -t $DASHBOARD_SESSION"
-
-read -r -p "Press Enter when you're done to stop the dashboard and free up GPU/CPU... "

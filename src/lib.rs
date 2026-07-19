@@ -1,12 +1,14 @@
 use log::{error, info};
 
-mod avatar;
+pub mod avatar;
 #[cfg(target_os = "android")]
 mod client_audio;
 #[cfg(target_os = "android")]
 mod grab_detect;
 #[cfg(target_os = "android")]
 mod network;
+#[cfg(target_os = "android")]
+mod particles;
 #[cfg(target_os = "android")]
 mod to_wire;
 
@@ -18,23 +20,23 @@ use openxr;
 use space_soup::renderer::xr_renderer::XrRenderer;
 #[cfg(target_os = "android")]
 use space_soup::renderer::{
-    Color3, Cuboid, CuboidStyle as SsCuboidStyle, GltfMesh, Light, LightKind as SsLightKind,
+    Beam, Color3, Cuboid, CuboidStyle as SsCuboidStyle, GltfMesh, Light, LightKind as SsLightKind,
     MeshInstance, MirrorSurface,
 };
 #[cfg(target_os = "android")]
 use space_soup::{Controllers, HandTrackers, Headset, VkContext, XrContext};
 #[cfg(target_os = "android")]
 use space_soup_engine::{
-    debug_sender, ButtonPress, DebugPacket, FingerJoint, Hand, HandSample, InputFrame,
+    debug_sender, ButtonPress, DebugPacket, Hand, HandSample, InputFrame,
     JointSample, Locomotion, LocomotionInput, LocomotionMode, LocomotionSample, Manifest, Pose,
     SceneSample, TeleportTarget, TimingSample,
 };
 #[cfg(target_os = "android")]
-use space_soup_hands::{build_player_rig, free_hand_finger_curl, hand_for_mesh_id, hand_skin_matrices};
+use space_soup_hands::{build_player_rig, load_synthetic_hand_config};
 #[cfg(target_os = "android")]
 use space_soup_protocol::{
     PlayerId, WireColor3, WireCuboidStyle, WireHeldGrip, WireLightKind, WireRenderCuboid,
-    WireRenderLight, WireRenderMesh,
+    WireRenderLaser, WireRenderLight, WireRenderMesh, WireRenderParticleEmitter,
 };
 #[cfg(target_os = "android")]
 use log::warn;
@@ -224,23 +226,18 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut live_objects = grab_detect::LiveObjects::default();
     let mut client_audio = client_audio::ClientAudio::new();
 
-    // The server's last-broadcast authoritative locomotion state — ground
-    // truth, used only to reconcile `predicted` below, never read directly
-    // for rendering or input (a real network round-trip to the droplet is
-    // ~90ms+, so waiting for this before showing any movement feels awful).
+    // The server's last-broadcast authoritative locomotion state — the only
+    // source of truth for where the player is; no local prediction anymore,
+    // so this is read directly for rendering and for building this frame's
+    // rig (see `locomotion` below), not just used to correct drift.
     let mut player_offset = Vec3::ZERO;
     let mut player_yaw = 0.0_f32;
 
-    // Client-side prediction: runs the exact same deterministic movement
-    // math the server runs (`Locomotion::update`, the actual engine type —
-    // not a reimplementation that could drift from it) locally, every
-    // frame, from this frame's own input, so the player sees themselves
-    // move instantly instead of waiting for a server round trip. Nudged
-    // gently toward `player_offset`/`player_yaw` (not snapped) whenever a
-    // fresh authoritative value arrives, so small prediction error against
-    // things the client can't simulate (wall/ground collision needs PhysX,
-    // server-only) gets corrected without a visible pop.
-    let mut predicted = Locomotion::new(LocomotionMode::Smooth);
+    // Mirrors `player_offset`/`player_yaw` into the actual engine type
+    // `build_player_rig` needs (`Locomotion::apply_to_head`) — never
+    // advanced locally via `.update()`, just kept in sync with the server's
+    // broadcast every frame below.
+    let mut locomotion = Locomotion::new(LocomotionMode::Smooth);
 
     let net = network::spawn(network::server_url());
 
@@ -250,15 +247,45 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     > = HashMap::new();
     let mut requested_mesh_ids: HashSet<String> = HashSet::new();
 
-    // Avatar bodies (local player + every remote player): one man.glb
+    // Avatar bodies (local player + every remote player): one boy.glb
     // instance per player, keyed by PlayerId rather than scene-object id —
-    // man.glb is a real rigged/skinned mesh, so bones are IK-driven toward
+    // boy.glb is a real rigged/skinned mesh, so bones are IK-driven toward
     // tracked head/hand positions each frame (see avatar::body_skin_matrices).
     let mut avatar_mesh_cache: HashMap<
         PlayerId,
         (GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform),
     > = HashMap::new();
-    let man_glb_path = dir.join("models/man.glb");
+    let boy_glb_path = dir.join("models/boy/boy.glb");
+    // Rig-specific calibration (bend hint signs, wrist offset, head tilt
+    // axis) is loaded from JSON rather than hardcoded — see `RigConfig`'s
+    // own doc comment for why — so it can be retuned by editing and
+    // re-pushing this one file instead of recompiling. Loaded once at
+    // startup, not re-read per frame — restart the app to pick up edits.
+    let rig_config = avatar::load_rig_config(&dir.join("avatar_rig.json"));
+    // Rest-pose geometry for the controller-driven synthetic hand (used
+    // whenever OpenXR hand-tracking joints aren't valid this frame) — same
+    // "load once at startup, retune via JSON without recompiling" contract
+    // as `rig_config` above.
+    let synthetic_hand_config = load_synthetic_hand_config(&dir.join("synthetic_hand.json"));
+
+    // Running maximum of each player's own observed (raw, HMD-tracked) head
+    // height, used to scale their avatar to their actual real size instead
+    // of one fixed generic-adult constant for everyone — see
+    // avatar::height_calibrated_scale. Keyed by PlayerId, same as
+    // avatar_mesh_cache, so it naturally follows players joining/leaving.
+    let mut calibrated_heights: HashMap<PlayerId, f32> = HashMap::new();
+
+    // A second, independent-skin instance of the local player's own avatar
+    // (shares vertex/index/texture GPU buffers with avatar_mesh_cache's copy
+    // — clone_with_independent_skin only allocates a fresh joint buffer),
+    // used solely for the local player's direct view with the head
+    // collapsed out of it (see avatar::body_skin_matrices' hide_head). The
+    // avatar_mesh_cache copy stays full-body, head included, for the mirror
+    // pass and other players' clients.
+    let mut local_direct_mesh: Option<(
+        GltfMesh,
+        space_soup::renderer::mesh_pipeline::ModelUniform,
+    )> = None;
 
     // Persistent request/response mesh loader — replaces the old one-shot
     // startup scan of `runtime.scene().objects`, since there's no local
@@ -294,6 +321,44 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         (req_tx, mesh_rx)
     };
 
+    // Same reasoning as mesh_loader above, for the one shared avatar mesh:
+    // `GltfMesh::load` parses a multi-MB glTF (boy.glb is ~6MB with embedded
+    // textures) and does the full GPU upload — done inline in the frame
+    // loop, that's a multi-second stall on first connect (and again for
+    // every remote player who joins), during which nothing else — input,
+    // rendering, locomotion — gets processed either. Loaded once here in
+    // the background; each player's own instance is then just the cheap
+    // `clone_with_independent_skin` (shares vertex/index/texture buffers,
+    // only allocates a fresh small joint uniform buffer) on the main thread.
+    let avatar_mesh_rx = {
+        let (tx, rx) = std::sync::mpsc::channel::<GltfMesh>();
+        let device = renderer.device().clone();
+        let queue = renderer.queue().clone();
+        // boy.glb is entirely skinned primitives, so this needs
+        // `SkinnedMeshPipeline`'s own texture layout, not
+        // `mesh_texture_layout()` (`MeshPipeline`'s) — a texture bind group
+        // built against the wrong one is invalid for the skinned draw pass
+        // that actually renders this mesh, even though the two layouts
+        // declare identical bindings; wgpu validates bind group/pipeline
+        // layout compatibility by identity, not structure. This was the
+        // actual cause of the avatar's face/hair textures never showing up
+        // (logged as a wall of "BindGroup ... is invalid" errors).
+        let layout = renderer.skinned_mesh_texture_layout().clone();
+        let path = boy_glb_path.clone();
+        std::thread::Builder::new()
+            .name("avatar_loader".into())
+            .spawn(move || match GltfMesh::load(&device, &queue, &layout, &path) {
+                Ok(mesh) => {
+                    info!("Avatar mesh loaded: '{}'", path.display());
+                    let _ = tx.send(mesh);
+                }
+                Err(e) => warn!("Failed to load avatar mesh '{}': {e}", path.display()),
+            })
+            .expect("failed to spawn avatar_loader");
+        rx
+    };
+    let mut avatar_master_mesh: Option<GltfMesh> = None;
+
     info!("All resources ready — entering event loop");
 
     let mut exit = false;
@@ -301,6 +366,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut input_log_timer: u64 = 0;
     let mut debug_reconnect_timer: u64 = 0;
     let mut last_time: Option<std::time::Instant> = None;
+    // Accumulated locally, never from the server — particles are purely
+    // cosmetic, so each client deterministically simulates its own particle
+    // positions from (broadcast emitter config, this clock) rather than the
+    // server broadcasting every individual particle's position every tick.
+    let mut sim_time: f32 = 0.0;
 
     let mut prev_r_trigger = false;
     let mut prev_l_trigger = false;
@@ -400,6 +470,12 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        if avatar_master_mesh.is_none() {
+            if let Ok(mesh) = avatar_mesh_rx.try_recv() {
+                avatar_master_mesh = Some(mesh);
+            }
+        }
+
         let time = frame_state.predicted_display_time;
 
         controllers.sync(&headset.session, &headset.stage, time)?;
@@ -437,10 +513,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .map(|t| now.duration_since(t).as_secs_f32())
             .unwrap_or(1.0 / 90.0);
         last_time = Some(now);
+        sim_time += dt;
 
         let cs = &controllers.state;
 
-        let rig = build_player_rig(&eye_views, &predicted, cs, &hands);
+        let rig = build_player_rig(&eye_views, &locomotion, cs, &hands, &synthetic_hand_config);
 
         // Pull whatever the server most recently broadcast. `None` until the
         // first tick after connecting — everything below degrades to "render
@@ -451,10 +528,17 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         let empty_meshes: Vec<WireRenderMesh> = Vec::new();
         let empty_lights: Vec<WireRenderLight> = Vec::new();
         let empty_bounds: Vec<space_soup_protocol::WireObjectBounds> = Vec::new();
+        let empty_particle_emitters: Vec<WireRenderParticleEmitter> = Vec::new();
+        let empty_lasers: Vec<WireRenderLaser> = Vec::new();
         let cuboids_src = world.as_ref().map(|w| &w.cuboids).unwrap_or(&empty_cuboids);
         let meshes_src = world.as_ref().map(|w| &w.meshes).unwrap_or(&empty_meshes);
         let lights_src = world.as_ref().map(|w| &w.lights).unwrap_or(&empty_lights);
         let object_bounds_src = world.as_ref().map(|w| &w.object_bounds).unwrap_or(&empty_bounds);
+        let particle_emitters_src = world
+            .as_ref()
+            .map(|w| &w.particle_emitters)
+            .unwrap_or(&empty_particle_emitters);
+        let lasers_src = world.as_ref().map(|w| &w.lasers).unwrap_or(&empty_lasers);
 
         if let Some(w) = &world {
             player_offset = Vec3::from(w.player_offset);
@@ -568,20 +652,12 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
         let teleport_target: Option<TeleportTarget> = None;
 
-        // Advance the local prediction using the same input this frame is
-        // about to send the server — this is what makes movement feel
-        // instant instead of waiting for a round trip. It can't know about
-        // wall/ground collision (that needs PhysX, server-only), so it may
-        // briefly overshoot near geometry; the gentle reconciliation below
-        // corrects that without a visible snap once the server catches up.
-        predicted.update(dt, &locomotion_input, &rig, teleport_target);
-        const RECONCILE_RATE: f32 = 6.0;
-        let reconcile_t = 1.0 - (-RECONCILE_RATE * dt).exp();
-        predicted.player_offset = predicted.player_offset.lerp(player_offset, reconcile_t);
-        let yaw_delta = (player_yaw - predicted.player_yaw + std::f32::consts::PI)
-            .rem_euclid(std::f32::consts::TAU)
-            - std::f32::consts::PI;
-        predicted.player_yaw += yaw_delta * reconcile_t;
+        // No local simulation — just mirror this frame's latest server
+        // broadcast (falls back to last-known if `world` hasn't updated
+        // this tick, since `player_offset`/`player_yaw` above are only
+        // overwritten inside `if let Some(w) = &world`).
+        locomotion.player_offset = player_offset;
+        locomotion.player_yaw = player_yaw;
 
         // Ship this frame's input to the server's authoritative simulation —
         // all physics/attachments/scripts run there now, not locally.
@@ -678,10 +754,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 },
 
                 locomotion: LocomotionSample {
-                    mode: "predicted (client-side)".to_string(),
-                    player_offset: predicted.player_offset.into(),
-                    player_yaw_deg: predicted.player_yaw.to_degrees(),
-                    teleport_aiming: predicted.is_teleport_aiming(),
+                    mode: "server-authoritative".to_string(),
+                    player_offset: locomotion.player_offset.into(),
+                    player_yaw_deg: locomotion.player_yaw.to_degrees(),
+                    // No local locomotion sim runs anymore to ever set this.
+                    teleport_aiming: false,
                 },
 
                 scene: SceneSample {
@@ -708,11 +785,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Render against the predicted (instant, locally-advanced) basis,
-        // not the raw last-known-authoritative one — this is what actually
-        // makes movement feel immediate instead of network-round-trip-gated.
-        let offset = predicted.player_offset;
-        let yaw_inv = Quat::from_rotation_y(-predicted.player_yaw);
+        // Render directly against the server's last-broadcast position/yaw
+        // — no local simulation or reconciliation.
+        let offset = locomotion.player_offset;
+        let yaw_inv = Quat::from_rotation_y(-locomotion.player_yaw);
 
         let head_pos = rig.head().position;
         const MAX_RENDER_DIST: f32 = 40.0;
@@ -748,27 +824,18 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
         for (id, state) in bodies.iter().copied() {
             if !avatar_mesh_cache.contains_key(&id) {
-                match GltfMesh::load(
-                    renderer.device(),
-                    renderer.queue(),
-                    renderer.mesh_texture_layout(),
-                    &man_glb_path,
-                ) {
-                    Ok(mut mesh) => {
-                        if mesh.is_skinned() {
-                            mesh.create_skin_bind_group(renderer.device(), renderer.skin_joint_layout());
-                            let model_uniform = renderer.create_skinned_model_uniform();
-                            avatar_mesh_cache.insert(id, (mesh, model_uniform));
-                        } else {
-                            warn!("'models/man.glb' has no skin — avatar bodies need a rigged mesh");
-                            let model_uniform = renderer.create_model_uniform();
-                            avatar_mesh_cache.insert(id, (mesh, model_uniform));
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to load avatar mesh 'models/man.glb' for player {id:?}: {e}");
-                        continue;
-                    }
+                // Master mesh still loading in the background (avatar_loader
+                // thread) — try again next frame instead of blocking here.
+                let Some(master) = &avatar_master_mesh else { continue };
+                let mut mesh = master.clone_with_independent_skin(renderer.device());
+                if mesh.is_skinned() {
+                    mesh.create_skin_bind_group(renderer.device(), renderer.skin_joint_layout());
+                    let model_uniform = renderer.create_skinned_model_uniform();
+                    avatar_mesh_cache.insert(id, (mesh, model_uniform));
+                } else {
+                    warn!("'models/boy/boy.glb' has no skin — avatar bodies need a rigged mesh");
+                    let model_uniform = renderer.create_model_uniform();
+                    avatar_mesh_cache.insert(id, (mesh, model_uniform));
                 }
             }
             let (mesh, _) = avatar_mesh_cache.get_mut(&id).expect("just inserted above");
@@ -777,12 +844,20 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             mesh.scale = Vec3::ONE;
             let Some(skin) = &mesh.skin else { continue };
 
+            let raw_bind_head_height = avatar::bind_head_height(skin);
+            let calibrated_height = calibrated_heights
+                .entry(id)
+                .and_modify(|h| *h = h.max(state.head.position.y))
+                .or_insert(state.head.position.y);
+            let root_scale = avatar::height_calibrated_scale(*calibrated_height, raw_bind_head_height);
+
             let to_render = |p: Vec3| yaw_inv * (p - offset);
-            let floor_drop = avatar::bind_head_height(skin) * avatar::MAN_GLB_SCALE;
+            let floor_drop = raw_bind_head_height * root_scale;
+            let head_rot = yaw_inv * state.head.rotation;
             let root = avatar::body_root_transform(
                 avatar::Transform {
                     position: to_render(state.head.position),
-                    rotation: yaw_inv * state.head.rotation,
+                    rotation: head_rot,
                 },
                 floor_drop,
             );
@@ -794,15 +869,88 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 position: to_render(h.position),
                 rotation: yaw_inv * h.rotation,
             });
+
+            // Finger curl isn't networked (only the local player's own
+            // controller state drives it), so only the local player's own
+            // avatar gets curled fingers — remote players' hands stay at
+            // bind pose, same fidelity the old hand.glb-based rendering had
+            // for them (it never sent curl over the wire either).
+            let (left_curl, right_curl) = if id == local_player {
+                let held_l = world.as_ref().and_then(|w| w.left_hand_held.as_ref());
+                let held_r = world.as_ref().and_then(|w| w.right_hand_held.as_ref());
+                let l = match held_l {
+                    Some(_) => avatar::HandCurl::held(cs.l_squeeze),
+                    None => avatar::HandCurl::free_hand(
+                        cs.l_trigger,
+                        cs.l_squeeze,
+                        cs.l_stick_touch,
+                        rig_config.thumb_touch_curl,
+                    ),
+                };
+                let r = match held_r {
+                    Some(_) => avatar::HandCurl::held(cs.r_squeeze),
+                    None => avatar::HandCurl::free_hand(
+                        cs.r_trigger,
+                        cs.r_squeeze,
+                        cs.r_stick_touch,
+                        rig_config.thumb_touch_curl,
+                    ),
+                };
+                (Some(l), Some(r))
+            } else {
+                (None, None)
+            };
+
+            // Full body, head included — used for the mirror pass and (via
+            // the network) other players' clients, neither of which has a
+            // first-person clipping concern.
             let skinned_mats = avatar::body_skin_matrices(
                 skin,
+                &rig_config,
                 root.position,
                 root.rotation,
-                avatar::MAN_GLB_SCALE,
+                head_rot,
+                root_scale,
                 left_hand,
                 right_hand,
+                left_curl,
+                right_curl,
             );
             skin.update_joint_matrices(renderer.queue(), &skinned_mats);
+
+            if id == local_player {
+                let direct = local_direct_mesh.get_or_insert_with(|| {
+                    // Head/hair/eye triangles are dropped outright (not just
+                    // scaled/moved via the skinning matrices) so no
+                    // partially-blended seam vertex can still peek through —
+                    // see `clone_with_independent_skin_excluding_joints`.
+                    let hidden_joints = avatar::head_and_descendant_joints(skin);
+                    let mut direct_mesh = mesh.clone_with_independent_skin_excluding_joints(
+                        renderer.device(),
+                        &hidden_joints,
+                    );
+                    direct_mesh.create_skin_bind_group(renderer.device(), renderer.skin_joint_layout());
+                    (direct_mesh, renderer.create_skinned_model_uniform())
+                });
+                direct.0.position = Vec3::ZERO;
+                direct.0.rotation = Quat::IDENTITY;
+                direct.0.scale = Vec3::ONE;
+                if let Some(direct_skin) = &direct.0.skin {
+                    let direct_mats = avatar::body_skin_matrices(
+                        direct_skin,
+                        &rig_config,
+                        root.position,
+                        root.rotation,
+                        head_rot,
+                        root_scale,
+                        left_hand,
+                        right_hand,
+                        left_curl,
+                        right_curl,
+                    );
+                    direct_skin.update_joint_matrices(renderer.queue(), &direct_mats);
+                }
+            }
         }
 
         let cuboids: Vec<Cuboid> = cuboids_src
@@ -855,70 +1003,13 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             mesh.rotation = yaw_inv * rot;
         }
 
-        for rm in meshes_src {
-            if let Some((mesh, _)) = mesh_cache.get(&rm.id) {
-                if let Some(skin) = &mesh.skin {
-                    let Some(hand) = hand_for_mesh_id(&rm.id) else {
-                        continue;
-                    };
-                    let (has_grip, squeeze, trigger, thumb_touch) = match hand {
-                        Hand::Left => (
-                            cs.l_grip_pose.is_some(),
-                            cs.l_squeeze,
-                            cs.l_trigger,
-                            cs.l_stick_touch,
-                        ),
-                        Hand::Right => (
-                            cs.r_grip_pose.is_some(),
-                            cs.r_squeeze,
-                            cs.r_trigger,
-                            cs.r_stick_touch,
-                        ),
-                    };
-                    let (root_pos, root_rot, curl) = if has_grip {
-                        let tf = rig.hand_grip(hand);
-                        (tf.position, tf.rotation, squeeze)
-                    } else {
-                        let tf = rig.finger(hand, FingerJoint::Wrist);
-                        (tf.position, tf.rotation, 0.0)
-                    };
-
-                    // Deliberately *not* re-deriving root_pos/root_rot from the
-                    // server's broadcast object position here (as this used to):
-                    // that made the hand mesh's rendered pose track the
-                    // server's round-trip-delayed report of the held object
-                    // instead of this frame's own instantly-tracked hand pose —
-                    // exactly backwards, and the most noticeable possible place
-                    // for latency (an object right in view lagging your real
-                    // hand). root_pos/root_rot above already come straight from
-                    // local tracking; the held object's own mesh transform is
-                    // instead predicted *from* that same local pose below,
-                    // keeping hand and object perfectly in sync with zero added
-                    // latency for both.
-                    let held: Option<&WireHeldGrip> = world.as_ref().and_then(|w| match hand {
-                        Hand::Left => w.left_hand_held.as_ref(),
-                        Hand::Right => w.right_hand_held.as_ref(),
-                    });
-
-                    let held_curl = held.map(|h| &h.finger_curl);
-                    let free_curl = if held_curl.is_none() {
-                        Some(free_hand_finger_curl(skin, trigger, squeeze, thumb_touch))
-                    } else {
-                        None
-                    };
-                    let finger_curl = held_curl.or(free_curl.as_ref());
-                    let skinned_mats =
-                        hand_skin_matrices(skin, root_pos, root_rot, curl, finger_curl);
-                    skin.update_joint_matrices(renderer.queue(), &skinned_mats);
-                }
-            }
-        }
-
-        // The local player's own avatar body is deliberately left out of
-        // the direct view entirely (not just the head) — you'd otherwise
-        // see your own untracked torso/legs hanging in your face. It's
-        // still handed to the renderer separately, for the mirror pass and
-        // (via the network) other players' clients to actually see.
+        // The local player's own body shows up in the direct view via
+        // local_direct_mesh — a separate skin instance with the head
+        // collapsed out of it (see the hide_head note above) so you can
+        // look down and see your own torso/arms/legs without your own face
+        // clipping through the camera. avatar_mesh_cache's copy of the
+        // local player stays full-body (head included) and is only used
+        // for the mirror pass and other players' clients below.
         let mesh_instances: Vec<MeshInstance> = meshes_src
             .iter()
             .filter(|rm| Vec3::from(rm.position).distance(head_pos) < MAX_RENDER_DIST)
@@ -931,6 +1022,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     .iter()
                     .filter(|(&id, _)| id != local_player)
                     .map(|(_, (mesh, model))| MeshInstance { mesh, model }),
+            )
+            .chain(
+                local_direct_mesh
+                    .iter()
+                    .map(|(mesh, model)| MeshInstance { mesh, model }),
             )
             .collect();
 
@@ -970,6 +1066,12 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
+        let particles = particles::simulate(particle_emitters_src, sim_time, offset, yaw_inv);
+        let beams: Vec<Beam> = lasers_src
+            .iter()
+            .map(|rl| to_space_soup_beam(rl, offset, yaw_inv))
+            .collect();
+
         let proj_views = renderer.render_frame_with_meshes(
             &headset.session,
             &headset.stage,
@@ -978,6 +1080,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &mesh_instances,
             &mirror_only_mesh_instances,
             &lights,
+            &particles,
+            &beams,
             mirror_surface,
         )?;
         let proj_layer = openxr::CompositionLayerProjection::new()
@@ -1049,6 +1153,20 @@ fn to_space_soup_light(rl: &WireRenderLight, offset: Vec3, yaw_inv: Quat) -> Lig
         intensity: rl.intensity,
         range: rl.range,
         cone_angle_deg: rl.cone_angle_deg,
+    }
+}
+
+/// Unlike everything else here, a laser's `end` is genuinely dynamic
+/// authoritative state (the server's own PhysX raycast, redone every tick),
+/// not something this client predicts or derives — both endpoints just get
+/// the same render-space transform applied.
+#[cfg(target_os = "android")]
+fn to_space_soup_beam(rl: &WireRenderLaser, offset: Vec3, yaw_inv: Quat) -> Beam {
+    Beam {
+        start: yaw_inv * (Vec3::from(rl.origin) - offset),
+        end: yaw_inv * (Vec3::from(rl.end) - offset),
+        width: rl.beam_width,
+        color: ss_color(rl.color),
     }
 }
 
