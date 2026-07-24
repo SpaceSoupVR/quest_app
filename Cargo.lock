@@ -306,6 +306,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "avatar_ik"
+version = "0.1.0"
+dependencies = [
+ "glam 0.29.3",
+ "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "avif-serialize"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2577,6 +2587,7 @@ name = "quest_app"
 version = "0.1.0"
 dependencies = [
  "android_logger",
+ "avatar_ik",
  "env_logger",
  "futures-util",
  "glam 0.29.3",
@@ -3142,6 +3153,7 @@ name = "space_soup_engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "avatar_ik",
  "glam 0.29.3",
  "gltf",
  "kira",

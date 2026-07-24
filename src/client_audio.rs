@@ -1,17 +1,3 @@
-//! Local playback of whatever sounds the server reports as active
-//! (`WireWorld::sounds`). Physics/game logic moved server-side, but audio
-//! can't follow it there: `kira`'s `AudioManager` is one local device with
-//! one listener, and a shared server can never correctly be *the* listener
-//! for several independent remote players at once (see
-//! `space_soup_engine::audio::SoundEngine`'s doc comment for the long
-//! version). So each client plays its own copy locally, spatialized against
-//! its own head, triggered by the server's sound-state broadcast.
-//!
-//! Deliberately not a reuse of `SoundEngine`: that type owns per-object
-//! authored data (directional cones, min/max distance, autoplay) that isn't
-//! on the wire — `WireSoundState` only carries what's needed for basic
-//! positional playback. Faking up `GameObject`s just to satisfy that API
-//! would be more confusing than a small purpose-built player.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -139,8 +125,6 @@ impl ClientAudio {
             .insert(sound.object_id.clone(), ActiveClip { track, handle });
     }
 
-    /// Reconciles currently-playing clips against the server's latest
-    /// `sounds` list and updates the local listener pose.
     pub fn update(&mut self, game_dir: &Path, sounds: &[WireSoundState], head: (Vec3, Quat)) {
         if let Some(listener) = self.listener.as_mut() {
             listener.set_position(to_mint_vec3(head.0), Tween::default());
@@ -182,3 +166,4 @@ impl Default for ClientAudio {
         Self::new()
     }
 }
+

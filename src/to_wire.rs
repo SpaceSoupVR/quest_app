@@ -1,8 +1,3 @@
-//! Conversions from local engine input types to the wire protocol's mirror
-//! types, so the client can send `ClientMessage::Input` to the server. Exact
-//! reverse of `space_soup_server/src/convert.rs`'s wire-to-engine direction —
-//! lives here rather than in `space_soup_protocol` since that crate stays
-//! engine-free by design.
 
 use space_soup_engine::{FingerJoint, Hand, InputFrame, JointId, LocomotionInput, PlayerRig, TeleportTarget, Transform};
 use space_soup_protocol::{
@@ -123,3 +118,4 @@ pub fn teleport_target_to_wire(target: TeleportTarget) -> WireTeleportTarget {
         valid: target.valid,
     }
 }
+

@@ -10,6 +10,7 @@ name       = "quest_app"
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
+avatar_ik         = { path = "../avatar_ik" }
 space_soup        = { path = "../space_soup", features = ["canvas"] }
 space_soup_engine = { path = "../space_soup_engine" }
 space_soup_hands  = { path = "../space_soup_hands" }
@@ -17,9 +18,6 @@ openxr            = { version = "0.18", features = ["loaded"] }
 glam              = { version = "0.29", features = ["serde"] }
 log               = "0.4"
 env_logger        = "0.11"
-# Also used on host by avatar.rs's RigConfig (JSON-tunable bend hints/wrist
-# calibration/etc, see game/avatar_rig.json) — not Android-only like
-# network.rs's serde_json usage below, since avatar.rs is host-tested.
 serde             = { version = "1.0", features = ["derive"] }
 serde_json        = "1.0"
 
@@ -28,18 +26,11 @@ android_logger = "0.14"
 ndk-glue       = { version = "0.7" }
 ndk            = { version = "0.7" }
 
-# network.rs is entirely `#[cfg(target_os = "android")]`-gated (this app has
-# no non-Android runtime), so these stay Android-only rather than bloating
-# host `cargo build`/`cargo test` (used throughout dev for avatar.rs etc).
 space_soup_protocol = { path = "../space_soup_protocol" }
 tokio               = { version = "1", features = ["rt", "net", "sync", "time", "macros"] }
 tokio-tungstenite   = "0.29"
 futures-util        = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
-# client_audio.rs plays WireWorld.sounds locally against this client's own
-# head (see space_soup_engine::audio's doc comment on why the server can't
-# be everyone's listener) — Android-only for the same reason as the rest of
-# this section.
 kira = "0.12.1"
 mint = "0.5"
 
