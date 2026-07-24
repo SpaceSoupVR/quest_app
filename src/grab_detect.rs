@@ -1,11 +1,3 @@
-//! Client-side grab-detection heuristics, now that physics/attachments live
-//! entirely on the server. `nearest_object_to`/`nearest_grip_point_to` used
-//! to read a local `GameRuntime`'s scene directly (see the now-deleted
-//! `space_soup_hands::query`); they need the same two pieces of data, just
-//! sourced differently: grip-point *definitions* are static per-scene
-//! authored data (loaded once via a plain JSON parse, no PhysX/Rhai
-//! involved), while object *positions* are live and come from whatever the
-//! server most recently broadcast in its `WireWorld`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -23,12 +15,6 @@ pub struct LiveCuboid {
     pub half_size: Vec3,
 }
 
-/// This tick's object interaction bounds, refreshed from the latest
-/// `WireWorld` broadcast's `object_bounds` — replaces reading
-/// `runtime.scene().objects` directly. Deliberately *not* sourced from
-/// `WireWorld::cuboids`: that list is render-only and skips any object with
-/// a mesh (a rifle, say), which would make mesh-rendered objects invisible
-/// to grab detection.
 #[derive(Default)]
 pub struct LiveObjects {
     pub by_id: HashMap<String, LiveCuboid>,
@@ -50,10 +36,6 @@ impl LiveObjects {
     }
 }
 
-/// Static grip-point definitions for the scene currently reported by the
-/// server (`WireWorld::scene_name`). Reloaded only when that name changes —
-/// this is authored content, not simulation, so a plain `Scene::load` (pure
-/// JSON parsing) is all it needs; no `GameRuntime`/PhysX/Rhai required.
 pub struct StaticScene {
     pub scene_name: String,
     pub grip_points: HashMap<String, Vec<GripPointDef>>,
@@ -107,8 +89,6 @@ pub fn nearest_grip_point_to(
         .iter()
         .flat_map(|(id, points)| {
             let live_c = live.by_id.get(id);
-            // A hand only considers points tagged for it — so a left hand
-            // never snaps into a pose authored for the right hand.
             points.iter().filter(move |gp| gp.hand == hand).filter_map(move |gp| {
                 let live_c = live_c?;
                 let obj_mat =
@@ -123,9 +103,6 @@ pub fn nearest_grip_point_to(
         .map(|(id, name, _, _, _)| (id, name))
 }
 
-/// What a hand is holding, for stamping `ButtonPress::object_id` — the
-/// server's own held-grip report if there is one, otherwise the same
-/// proximity fallback used for grab detection.
 pub fn held_object_id(
     held: Option<&WireHeldGrip>,
     live: &LiveObjects,
@@ -136,3 +113,4 @@ pub fn held_object_id(
     }
     nearest_object_to(live, hand_pos)
 }
+

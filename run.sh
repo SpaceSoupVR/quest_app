@@ -28,14 +28,7 @@ GAME_DIR="$XR_DIR/game"
 PACKAGE="com.example.questapp"
 REMOTE_GAME_DIR="/sdcard/Android/data/$PACKAGE/files/game"
 REMOTE_SERVER_URL_FILE="/sdcard/Android/data/$PACKAGE/files/server_url.txt"
-# The deployed multiplayer server (space_soup_server) on the DigitalOcean
-# droplet. Override with QUEST_SERVER_URL to point at a different server
-# (e.g. a local one on your LAN) without editing this script.
 SERVER_URL="${QUEST_SERVER_URL:-ws://137.184.21.78:9001}"
-# SSH access to that same droplet, used only to verify/restart the
-# space-soup-server systemd service before we tell the headset to connect
-# to it. Override with QUEST_SERVER_SSH_HOST/QUEST_SERVER_SSH_KEY if yours
-# differ.
 DROPLET_SSH_HOST="${QUEST_SERVER_SSH_HOST:-root@137.184.21.78}"
 DROPLET_SSH_KEY="${QUEST_SERVER_SSH_KEY:-$HOME/vr_digitalocean}"
 DROPLET_SERVICE="space-soup-server.service"
@@ -115,7 +108,6 @@ wait_for_app_data_dir() {
 }
 
 verify_remote_file() {
-    # $1 = remote path
     local path="$1"
     local size
     size=$(adb shell "stat -c %s '$path' 2>/dev/null || echo 0" | tr -d '\r')
@@ -127,7 +119,6 @@ verify_remote_file() {
 }
 
 wait_for_tcp_listener() {
-    # $1 = port
     local port="$1"
     local tries=0
     step "Waiting for listener on :$port..."
@@ -233,13 +224,6 @@ if $WANT_DEPLOY; then
     fi
 
     if [ -d "$GAME_DIR/models" ]; then
-        # Push files one at a time (not whole directories) — adb push of a
-        # directory that doesn't yet exist on-device tries to recursively
-        # create it via a sync-protocol mkdir that scoped storage rejects for
-        # app-private dirs ("remote secure_mkdirs failed: Operation not
-        # permitted"), even though a plain `adb shell mkdir -p` for the same
-        # path works fine. So we mkdir every subdirectory ourselves first,
-        # then push each file into its already-existing remote parent.
         while IFS= read -r -d '' d; do
             rel="${d#"$GAME_DIR"/models}"
             adb shell mkdir -p "$REMOTE_GAME_DIR/models$rel"
