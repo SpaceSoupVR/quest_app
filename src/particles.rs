@@ -1,20 +1,9 @@
-//! Client-side deterministic particle simulation. The server only ever
-//! broadcasts static emitter config (`WireRenderParticleEmitter`) — never
-//! individual particle positions — so every particle here is derived as a
-//! pure function of `(that config, this client's own accumulated sim_time)`.
-//! Nothing is stored between frames: a "resident slot" is just spawn index
-//! `i`'s current age given the current clock, recomputed from scratch every
-//! call. This mirrors the same "don't wait on the network for something
-//! cosmetic" reasoning behind this client's player-locomotion prediction.
 
 use glam::{Quat, Vec3};
 
 use space_soup::renderer::{Color3, Particle};
 use space_soup_protocol::WireRenderParticleEmitter;
 
-/// FNV-1a over the emitter id, folded with a slot-specific splitmix64 step —
-/// deterministic and stable across frames/clients for the same `(id, slot)`,
-/// with no shared mutable state to seed or leak.
 fn hash_to_unit_floats(id: &str, slot: usize) -> (f32, f32) {
     let id_hash = id
         .bytes()
@@ -36,10 +25,6 @@ fn hash_to_unit_floats(id: &str, slot: usize) -> (f32, f32) {
     )
 }
 
-/// A direction inside the cone of half-angle `spread_deg` around `forward`,
-/// picked by `(u1, u2)` (each in `[0, 1)`). Not physically-uniform solid-angle
-/// sampling — uniform over the angle instead — this is cosmetic dust, not a
-/// rendering-accuracy-critical distribution.
 fn cone_direction(forward: Vec3, spread_deg: f32, u1: f32, u2: f32) -> Vec3 {
     let forward = forward.normalize_or_zero();
     let axis_ref = if forward.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
@@ -55,9 +40,6 @@ fn cone_direction(forward: Vec3, spread_deg: f32, u1: f32, u2: f32) -> Vec3 {
     right * (sin_t * cos_p) + up * (sin_t * sin_p) + forward * cos_t
 }
 
-/// Every currently-visible particle across all emitters, in render space
-/// (the same `yaw_inv * (world_pos - offset)` transform cuboids/meshes/lights
-/// already use).
 pub fn simulate(
     emitters: &[WireRenderParticleEmitter],
     sim_time: f32,
@@ -92,3 +74,4 @@ pub fn simulate(
 
     out
 }
+

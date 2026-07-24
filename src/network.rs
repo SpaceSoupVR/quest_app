@@ -21,9 +21,6 @@ use crate::avatar::{LocalPose, RemotePlayerState, Transform};
 pub type RemotePlayers = Arc<Mutex<HashMap<PlayerId, RemotePlayerState>>>;
 pub type LatestWorld = Arc<Mutex<Option<WireWorld>>>;
 
-/// One frame's worth of input for the server's authoritative simulation —
-/// everything `ClientMessage::Input` needs, already converted to wire types
-/// by `to_wire.rs` before it crosses into this module.
 #[derive(Debug, Clone)]
 pub struct PendingInput {
     pub input: WireInputFrame,
@@ -70,9 +67,6 @@ fn from_wire(p: Pose) -> Transform {
     }
 }
 
-/// Reads the multiplayer server address pushed alongside `game/` (see
-/// `game_dir()`'s convention), falling back to a local default so the app
-/// still runs standalone if no file was pushed.
 pub fn server_url() -> String {
     let path = "/sdcard/Android/data/com.example.questapp/files/server_url.txt";
     std::fs::read_to_string(path)
@@ -82,10 +76,6 @@ pub fn server_url() -> String {
         .unwrap_or_else(|| "ws://127.0.0.1:9001".to_string())
 }
 
-/// Spawns a background OS thread owning a single-threaded Tokio runtime
-/// (there's exactly one socket and no parallel work, so a multi-worker pool
-/// would just be idle threads on a mobile device). Only plain data crosses
-/// back into the frame loop — never engine types like `GameRuntime`.
 pub fn spawn(server_url: String) -> NetworkHandle {
     let (local_pose_tx, local_pose_rx) = watch::channel(LocalPose {
         head: Transform {
@@ -133,10 +123,6 @@ async fn run_client(
     loop {
         match tokio_tungstenite::connect_async(&server_url).await {
             Ok((ws, _)) => {
-                // See the server-side handle_connection for why: without
-                // this, Nagle's algorithm batches our small, frequent
-                // pose/input frames, adding self-inflicted latency on top of
-                // the real droplet round-trip.
                 if let MaybeTlsStream::Plain(tcp) = ws.get_ref() {
                     let _ = tcp.set_nodelay(true);
                 }
@@ -236,11 +222,9 @@ fn handle_server_message(text: &str, remote_players: &RemotePlayers, latest_worl
         ServerMessage::PlayerLeft { id } => {
             remote_players.lock().unwrap().remove(&id);
         }
-        // Authoritative-simulation broadcast: the server already filters
-        // this to only the copy tagged for this connection (`for_player`),
-        // so whatever arrives here is unconditionally ours.
         ServerMessage::World(world) => {
             *latest_world.lock().unwrap() = Some(world);
         }
     }
 }
+
