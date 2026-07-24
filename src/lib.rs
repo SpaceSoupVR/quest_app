@@ -749,7 +749,18 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             let Some(skin) = &mesh.skin else { continue };
             let Some(skeleton) = avatar_skeleton_cache.get(&id) else { continue };
 
-            let raw_bind_head_height = avatar_ik::bind_head_height(skeleton);
+            // Measure head height along the rig's actual up axis, detected from the
+            // bind pose. Different glTF loaders present the same model in different
+            // bases: space_soup bakes this model's armature so its skeleton is Y-up,
+            // while Babylon (the web editor) keeps it Z-up. Detecting the axis makes
+            // the solver correct for whichever skeleton it is handed instead of
+            // assuming Y-up (which reads ~0 for a Z-up rig and blows up the scale).
+            // For space_soup's Y-up skeleton this resolves to +Y and is behaviour-
+            // preserving; head/hand poses below share this same (render) basis.
+            let mut rig_cfg = rig_config;
+            let up = avatar_ik::detect_up_axis(skeleton);
+            rig_cfg.up_axis = up.to_array();
+            let raw_bind_head_height = avatar_ik::bind_head_height_along(skeleton, up);
             let calibrated_height = calibrated_heights
                 .entry(id)
                 .and_modify(|h| *h = h.max(state.head.position.y))
@@ -759,12 +770,14 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             let to_render = |p: Vec3| yaw_inv * (p - offset);
             let floor_drop = raw_bind_head_height * root_scale;
             let head_rot = yaw_inv * state.head.rotation;
-            let root = avatar::body_root_transform(
+            let root = avatar_ik::body_root_transform_basis(
                 avatar::Transform {
                     position: to_render(state.head.position),
                     rotation: head_rot,
                 },
                 floor_drop,
+                up,
+                rig_cfg.forward(),
             );
             let left_hand = state.left_hand.map(|h| avatar::Transform {
                 position: to_render(h.position),
@@ -803,7 +816,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
             let skinned_mats = avatar_ik::body_skin_matrices(
                 skeleton,
-                &rig_config,
+                &rig_cfg,
                 root.position,
                 root.rotation,
                 head_rot,
@@ -831,7 +844,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(direct_skin) = &direct.0.skin {
                     let direct_mats = avatar_ik::body_skin_matrices(
                         skeleton,
-                        &rig_config,
+                        &rig_cfg,
                         root.position,
                         root.rotation,
                         head_rot,
