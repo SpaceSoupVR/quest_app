@@ -911,6 +911,7 @@ fn to_space_soup_light(rl: &RenderLight, offset: Vec3, yaw_inv: Quat) -> Light {
         kind: match rl.kind {
             EngineLightKind::Point => SsLightKind::Point,
             EngineLightKind::Spot => SsLightKind::Spot,
+            EngineLightKind::Directional => SsLightKind::Directional,
         },
         color: ss_color(rl.color),
         intensity: rl.intensity,
