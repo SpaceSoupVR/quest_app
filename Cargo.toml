@@ -30,6 +30,8 @@ space_soup_protocol = { path = "../space_soup_protocol" }
 tokio               = { version = "1", features = ["rt", "net", "sync", "time", "macros"] }
 tokio-tungstenite   = "0.29"
 futures-util        = { version = "0.3", default-features = false, features = ["sink", "std"] }
+image               = { version = "0.25.5", default-features = false, features = ["png"] }
+base64              = "0.22"
 
 kira = "0.12.1"
 mint = "0.5"

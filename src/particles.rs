@@ -63,10 +63,11 @@ pub fn simulate(
             let dir = cone_direction(direction, e.spread_deg, u1, u2);
             let local_pos = position + dir * e.speed * age;
             let alpha = (base_alpha * (1.0 - t) * 255.0).round() as u8;
+            let size = e.particle_size * (1.0 + e.size_growth * t);
 
             out.push(Particle {
                 position: yaw_inv * (local_pos - offset),
-                size: e.particle_size,
+                size,
                 color: Color3(e.color.0, e.color.1, e.color.2, alpha),
             });
         }

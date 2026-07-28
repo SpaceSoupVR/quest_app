@@ -6,6 +6,8 @@ mod client_audio;
 #[cfg(target_os = "android")]
 mod grab_detect;
 #[cfg(target_os = "android")]
+mod lightmap_client;
+#[cfg(target_os = "android")]
 mod network;
 #[cfg(target_os = "android")]
 mod particles;
@@ -217,6 +219,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut locomotion = Locomotion::new(LocomotionMode::Smooth);
 
     let net = network::spawn(network::server_url());
+    // Reconnecting on a live scene-name change (see the `w.scene_name !=
+    // static_scene.scene_name` handling below) isn't handled yet -- this
+    // subscribes once to whatever scene the app launched into.
+    let lightmap_rx = lightmap_client::spawn(entry_scene.clone());
 
     let mut mesh_cache: HashMap<
         String,
@@ -395,6 +401,14 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 let model_uniform = renderer.create_model_uniform();
                 mesh_cache.insert(obj_id, (mesh, model_uniform));
             }
+        }
+
+        // A given object_id is only ever rendered via one path (plain cuboid
+        // or mesh), so uploading to both caches is harmless -- whichever one
+        // isn't actually used for that id just sits unread.
+        for update in lightmap_rx.try_iter() {
+            renderer.set_cuboid_lightmap(&update.object_id, &update.rgba, update.width, update.height);
+            renderer.set_mesh_lightmap(&update.object_id, &update.rgba, update.width, update.height);
         }
 
         if avatar_master_mesh.is_none() {
@@ -903,24 +917,24 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|rm| Vec3::from(rm.position).distance(head_pos) < MAX_RENDER_DIST)
             .filter_map(|rm| {
                 let (mesh, model) = mesh_cache.get(&rm.id)?;
-                Some(MeshInstance { mesh, model })
+                Some(MeshInstance { mesh, model, lightmap_key: Some(rm.id.as_str()) })
             })
             .chain(
                 avatar_mesh_cache
                     .iter()
                     .filter(|(&id, _)| id != local_player)
-                    .map(|(_, (mesh, model))| MeshInstance { mesh, model }),
+                    .map(|(_, (mesh, model))| MeshInstance { mesh, model, lightmap_key: None }),
             )
             .chain(
                 local_direct_mesh
                     .iter()
-                    .map(|(mesh, model)| MeshInstance { mesh, model }),
+                    .map(|(mesh, model)| MeshInstance { mesh, model, lightmap_key: None }),
             )
             .collect();
 
         let mirror_only_mesh_instances: Vec<MeshInstance> = avatar_mesh_cache
             .get(&local_player)
-            .map(|(mesh, model)| MeshInstance { mesh, model })
+            .map(|(mesh, model)| MeshInstance { mesh, model, lightmap_key: None })
             .into_iter()
             .collect();
 
@@ -1011,6 +1025,8 @@ fn to_space_soup_cuboid(rc: &WireRenderCuboid, offset: Vec3, yaw_inv: Quat) -> C
         ),
     };
     c.rotation = yaw_inv * Quat::from_array(rc.rotation);
+    c.lightmap_key = Some(rc.id.clone());
+    c.reflectivity = rc.reflectivity.clamp(0.0, 1.0);
     c
 }
 
