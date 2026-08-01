@@ -12,6 +12,8 @@ mod network;
 #[cfg(target_os = "android")]
 mod particles;
 #[cfg(target_os = "android")]
+mod soundmap_client;
+#[cfg(target_os = "android")]
 mod to_wire;
 
 #[cfg(target_os = "android")]
@@ -19,11 +21,11 @@ use glam::{Quat, Vec3};
 #[cfg(target_os = "android")]
 use openxr;
 #[cfg(target_os = "android")]
-use space_soup::renderer::xr_renderer::XrRenderer;
+use space_soup::renderer::xr_renderer::{UiPanelRenderData, XrRenderer};
 #[cfg(target_os = "android")]
 use space_soup::renderer::{
-    Beam, Color3, Cuboid, CuboidStyle as SsCuboidStyle, GltfMesh, Light, LightKind as SsLightKind,
-    MeshInstance, MirrorSurface,
+    Beam, Color3, Cuboid, CuboidShape as SsCuboidShape, CuboidStyle as SsCuboidStyle, GltfMesh,
+    Light, LightKind as SsLightKind, MeshInstance, MirrorSurface,
 };
 #[cfg(target_os = "android")]
 use space_soup::{Controllers, HandTrackers, Headset, VkContext, XrContext};
@@ -37,8 +39,9 @@ use space_soup_engine::{
 use space_soup_hands::{build_player_rig, load_synthetic_hand_config};
 #[cfg(target_os = "android")]
 use space_soup_protocol::{
-    PlayerId, WireColor3, WireCuboidStyle, WireHeldGrip, WireLightKind, WireRenderCuboid,
-    WireRenderLaser, WireRenderLight, WireRenderMesh, WireRenderParticleEmitter,
+    PlayerId, WireColor3, WireCuboidShape, WireCuboidStyle, WireHeldGrip, WireLightKind,
+    WireRenderCuboid, WireRenderLaser, WireRenderLight, WireRenderMesh,
+    WireRenderParticleEmitter, WireRenderUiButton, WireRenderUiPanel,
 };
 #[cfg(target_os = "android")]
 use log::warn;
@@ -188,8 +191,20 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut controllers = Controllers::new(&xr.instance, &headset.session)?;
     info!("init: creating hand trackers");
     let mut hands = HandTrackers::new(&xr, &headset.session)?;
+
+    let dir = game_dir();
+    let ui_font_path = dir.join("font/Jetbrains.ttf");
+    let ui_font_bytes = match std::fs::read(&ui_font_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("Failed to read UI font from {}: {e}", ui_font_path.display());
+            error!("adb push your game folder to that path and relaunch.");
+            return Err(e.into());
+        }
+    };
+
     info!("init: creating XR renderer");
-    let mut renderer = XrRenderer::new(&vk, &xr, &headset.session)?;
+    let mut renderer = XrRenderer::new(&vk, &xr, &headset.session, &ui_font_bytes)?;
     info!("init: all subsystems ready");
 
     renderer.device().on_uncaptured_error(Box::new(|error| {
@@ -198,7 +213,6 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut debug_stream: Option<std::net::TcpStream> = None;
 
-    let dir = game_dir();
     let local_player = PlayerId::local();
 
     let entry_scene = match Manifest::load(&dir) {
@@ -213,16 +227,15 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut live_objects = grab_detect::LiveObjects::default();
     let mut client_audio = client_audio::ClientAudio::new();
 
-    let mut player_offset = Vec3::ZERO;
-    let mut player_yaw = 0.0_f32;
+    let mut server_player_offset: Option<Vec3> = None;
+    let mut server_player_yaw: Option<f32> = None;
 
     let mut locomotion = Locomotion::new(LocomotionMode::Smooth);
 
     let net = network::spawn(network::server_url());
-    // Reconnecting on a live scene-name change (see the `w.scene_name !=
-    // static_scene.scene_name` handling below) isn't handled yet -- this
-    // subscribes once to whatever scene the app launched into.
     let lightmap_rx = lightmap_client::spawn(entry_scene.clone());
+    let soundmap_rx = soundmap_client::spawn(entry_scene.clone());
+    let mut soundmap_grids: HashMap<String, soundmap_client::OcclusionGrid> = HashMap::new();
 
     let mut mesh_cache: HashMap<
         String,
@@ -403,12 +416,12 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // A given object_id is only ever rendered via one path (plain cuboid
-        // or mesh), so uploading to both caches is harmless -- whichever one
-        // isn't actually used for that id just sits unread.
         for update in lightmap_rx.try_iter() {
             renderer.set_cuboid_lightmap(&update.object_id, &update.rgba, update.width, update.height);
             renderer.set_mesh_lightmap(&update.object_id, &update.rgba, update.width, update.height);
+        }
+        for update in soundmap_rx.try_iter() {
+            soundmap_grids.insert(update.object_id, update.grid);
         }
 
         if avatar_master_mesh.is_none() {
@@ -468,6 +481,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         let empty_bounds: Vec<space_soup_protocol::WireObjectBounds> = Vec::new();
         let empty_particle_emitters: Vec<WireRenderParticleEmitter> = Vec::new();
         let empty_lasers: Vec<WireRenderLaser> = Vec::new();
+        let empty_ui_panels: Vec<WireRenderUiPanel> = Vec::new();
+        let empty_ui_buttons: Vec<WireRenderUiButton> = Vec::new();
         let cuboids_src = world.as_ref().map(|w| &w.cuboids).unwrap_or(&empty_cuboids);
         let meshes_src = world.as_ref().map(|w| &w.meshes).unwrap_or(&empty_meshes);
         let lights_src = world.as_ref().map(|w| &w.lights).unwrap_or(&empty_lights);
@@ -477,10 +492,12 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .map(|w| &w.particle_emitters)
             .unwrap_or(&empty_particle_emitters);
         let lasers_src = world.as_ref().map(|w| &w.lasers).unwrap_or(&empty_lasers);
+        let ui_panels_src = world.as_ref().map(|w| &w.ui_panels).unwrap_or(&empty_ui_panels);
+        let ui_buttons_src = world.as_ref().map(|w| &w.ui_buttons).unwrap_or(&empty_ui_buttons);
 
         if let Some(w) = &world {
-            player_offset = Vec3::from(w.player_offset);
-            player_yaw = w.player_yaw;
+            server_player_offset = Some(Vec3::from(w.player_offset));
+            server_player_yaw = Some(w.player_yaw);
 
             if w.scene_name != static_scene.scene_name {
                 info!(
@@ -586,8 +603,20 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
         let teleport_target: Option<TeleportTarget> = None;
 
-        locomotion.player_offset = player_offset;
-        locomotion.player_yaw = player_yaw;
+        locomotion.update(dt, &locomotion_input, &rig, teleport_target);
+
+        if let Some(sp) = server_player_offset {
+            const RECONCILE_RATE: f32 = 8.0;
+            let t = (RECONCILE_RATE * dt).min(1.0);
+            locomotion.player_offset = locomotion.player_offset.lerp(sp, t);
+        }
+        if let Some(sy) = server_player_yaw {
+            const RECONCILE_RATE: f32 = 8.0;
+            let t = (RECONCILE_RATE * dt).min(1.0);
+            let diff = (sy - locomotion.player_yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+                - std::f32::consts::PI;
+            locomotion.player_yaw += diff * t;
+        }
 
         let _ = net.input_tx.send(network::PendingInput {
             input: to_wire::input_frame_to_wire(&input),
@@ -679,7 +708,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 },
 
                 locomotion: LocomotionSample {
-                    mode: "server-authoritative".to_string(),
+                    mode: "client-predicted".to_string(),
                     player_offset: locomotion.player_offset.into(),
                     player_yaw_deg: locomotion.player_yaw.to_degrees(),
                     teleport_aiming: false,
@@ -763,14 +792,6 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             let Some(skin) = &mesh.skin else { continue };
             let Some(skeleton) = avatar_skeleton_cache.get(&id) else { continue };
 
-            // Measure head height along the rig's actual up axis, detected from the
-            // bind pose. Different glTF loaders present the same model in different
-            // bases: space_soup bakes this model's armature so its skeleton is Y-up,
-            // while Babylon (the web editor) keeps it Z-up. Detecting the axis makes
-            // the solver correct for whichever skeleton it is handed instead of
-            // assuming Y-up (which reads ~0 for a Z-up rig and blows up the scale).
-            // For space_soup's Y-up skeleton this resolves to +Y and is behaviour-
-            // preserving; head/hand poses below share this same (render) basis.
             let mut rig_cfg = rig_config;
             let up = avatar_ik::detect_up_axis(skeleton);
             rig_cfg.up_axis = up.to_array();
@@ -938,10 +959,20 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .into_iter()
             .collect();
 
+        let sounds_src = world.as_ref().map(|w| w.sounds.as_slice()).unwrap_or(&[]);
+        let occlusion: HashMap<String, f32> = sounds_src
+            .iter()
+            .filter_map(|s| {
+                let grid = soundmap_grids.get(&s.object_id)?;
+                let occ = grid.sample(Vec3::from(s.position), s.max_distance, rig.head().position);
+                Some((s.object_id.clone(), occ))
+            })
+            .collect();
         client_audio.update(
             &dir,
-            world.as_ref().map(|w| w.sounds.as_slice()).unwrap_or(&[]),
+            sounds_src,
             (rig.head().position, rig.head().rotation),
+            &occlusion,
         );
 
         let mirror_surface = cuboids_src.iter().find(|rc| rc.id == "mirror").map(|rc| {
@@ -962,6 +993,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|rl| to_space_soup_beam(rl, offset, yaw_inv))
             .collect();
+        let ui_panels: Vec<UiPanelRenderData> = ui_panels_src
+            .iter()
+            .map(|p| to_ui_panel_render_data(p, offset, yaw_inv))
+            .chain(ui_buttons_src.iter().map(|b| ui_button_render_data(b, offset, yaw_inv)))
+            .collect();
 
         let proj_views = renderer.render_frame_with_meshes(
             &headset.session,
@@ -974,6 +1010,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &particles,
             &beams,
             mirror_surface,
+            &ui_panels,
         )?;
         let proj_layer = openxr::CompositionLayerProjection::new()
             .space(&headset.stage)
@@ -1027,6 +1064,10 @@ fn to_space_soup_cuboid(rc: &WireRenderCuboid, offset: Vec3, yaw_inv: Quat) -> C
     c.rotation = yaw_inv * Quat::from_array(rc.rotation);
     c.lightmap_key = Some(rc.id.clone());
     c.reflectivity = rc.reflectivity.clamp(0.0, 1.0);
+    c.shape = match rc.shape {
+        WireCuboidShape::Box => SsCuboidShape::Box,
+        WireCuboidShape::Cylinder => SsCuboidShape::Cylinder,
+    };
     c
 }
 
@@ -1053,6 +1094,34 @@ fn to_space_soup_beam(rl: &WireRenderLaser, offset: Vec3, yaw_inv: Quat) -> Beam
         end: yaw_inv * (Vec3::from(rl.end) - offset),
         width: rl.beam_width,
         color: ss_color(rl.color),
+    }
+}
+
+#[cfg(target_os = "android")]
+fn to_ui_panel_render_data(p: &WireRenderUiPanel, offset: Vec3, yaw_inv: Quat) -> UiPanelRenderData {
+    UiPanelRenderData {
+        id: p.id.clone(),
+        position: yaw_inv * (Vec3::from(p.position) - offset),
+        rotation: yaw_inv * Quat::from_array(p.rotation),
+        width_m: p.width,
+        height_m: p.height,
+        background_color: ss_color(p.background_color),
+        text: p.title.clone(),
+        text_color: Color3(255, 255, 255, 255),
+    }
+}
+
+#[cfg(target_os = "android")]
+fn ui_button_render_data(b: &WireRenderUiButton, offset: Vec3, yaw_inv: Quat) -> UiPanelRenderData {
+    UiPanelRenderData {
+        id: b.id.clone(),
+        position: yaw_inv * (Vec3::from(b.position) - offset),
+        rotation: yaw_inv * Quat::from_array(b.rotation),
+        width_m: b.half_size[0] * 2.0,
+        height_m: b.half_size[1] * 2.0,
+        background_color: ss_color(b.color),
+        text: b.label.clone(),
+        text_color: ss_color(b.text_color),
     }
 }
 

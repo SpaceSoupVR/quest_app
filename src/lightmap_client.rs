@@ -8,10 +8,6 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio_tungstenite::tungstenite::Message;
 
-/// Same background-thread + dedicated current_thread runtime + channel
-/// handoff pattern as network.rs's multiplayer client -- keeps the main
-/// render thread's polling non-blocking (see LightmapUpdates::try_iter uses
-/// in lib.rs), unlike debug_protocol's direct blocking TcpStream calls.
 pub struct LightmapUpdate {
     pub object_id: String,
     pub width: u32,
@@ -27,9 +23,6 @@ struct WireLightmapMessage {
     png_b64: String,
 }
 
-/// Same hardcoded-localhost-dev-port precedent as debug_protocol's
-/// 127.0.0.1:7778 -- this is a local dev-loop tool (the scene editor's own
-/// FastAPI server), not a deployed/production endpoint.
 pub fn server_ws_url(scene_name: &str) -> String {
     format!("ws://127.0.0.1:8000/api/lightmap/{scene_name}")
 }

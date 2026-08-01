@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use glam::{Quat, Vec3};
+use kira::effect::filter::{FilterBuilder, FilterHandle, FilterMode};
 use kira::listener::ListenerHandle;
 use kira::sound::static_sound::{StaticSoundData, StaticSoundHandle};
 use kira::sound::PlaybackState;
@@ -11,9 +12,19 @@ use kira::{AudioManager, AudioManagerSettings, Decibels, DefaultBackend, Tween};
 
 use space_soup_protocol::WireSoundState;
 
+const FILTER_CUTOFF_OPEN: f64 = 20_000.0;
+const FILTER_CUTOFF_OCCLUDED: f64 = 600.0;
+fn filter_tween() -> Tween {
+    Tween {
+        duration: std::time::Duration::from_millis(150),
+        ..Tween::default()
+    }
+}
+
 struct ActiveClip {
     track: SpatialTrackHandle,
     handle: StaticSoundHandle,
+    filter: FilterHandle,
 }
 
 pub struct ClientAudio {
@@ -99,10 +110,16 @@ impl ClientAudio {
             return;
         };
 
+        let mut track_builder =
+            SpatialTrackBuilder::new().distances((sound.min_distance, sound.max_distance));
+        let filter = track_builder.add_effect(
+            FilterBuilder::new().mode(FilterMode::LowPass).cutoff(FILTER_CUTOFF_OPEN),
+        );
+
         let mut track = match manager.add_spatial_sub_track(
             listener.id(),
             to_mint_vec3(Vec3::from(sound.position)),
-            SpatialTrackBuilder::new().distances((1.0, 10.0)),
+            track_builder,
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -122,10 +139,16 @@ impl ClientAudio {
         };
 
         self.playing
-            .insert(sound.object_id.clone(), ActiveClip { track, handle });
+            .insert(sound.object_id.clone(), ActiveClip { track, handle, filter });
     }
 
-    pub fn update(&mut self, game_dir: &Path, sounds: &[WireSoundState], head: (Vec3, Quat)) {
+    pub fn update(
+        &mut self,
+        game_dir: &Path,
+        sounds: &[WireSoundState],
+        head: (Vec3, Quat),
+        occlusion: &HashMap<String, f32>,
+    ) {
         if let Some(listener) = self.listener.as_mut() {
             listener.set_position(to_mint_vec3(head.0), Tween::default());
             listener.set_orientation(to_mint_quat(head.1), Tween::default());
@@ -157,6 +180,10 @@ impl ClientAudio {
                 .set_position(to_mint_vec3(Vec3::from(sound.position)), Tween::default());
             active.handle.set_volume(linear_to_decibels(sound.volume), Tween::default());
             active.handle.set_playback_rate(sound.pitch as f64, Tween::default());
+
+            let occluded = occlusion.get(&sound.object_id).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            let cutoff = FILTER_CUTOFF_OPEN + (FILTER_CUTOFF_OCCLUDED - FILTER_CUTOFF_OPEN) * occluded as f64;
+            active.filter.set_cutoff(cutoff, filter_tween());
         }
     }
 }

@@ -43,33 +43,39 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if ! command -v tmux >/dev/null 2>&1; then
+WANT_DASHBOARD="${WANT_DASHBOARD:-true}"
+
+if $WANT_DASHBOARD && ! command -v tmux >/dev/null 2>&1; then
     fail "tmux not found — install it with: brew install tmux"
     exit 1
 fi
 
-WANT_CLEAN=false
-read -r -p "Clean all builds first? [y/N] " clean_reply
-case "$clean_reply" in
-    [yY]*) WANT_CLEAN=true ;;
-    *) WANT_CLEAN=false ;;
-esac
-
-WANT_DEPLOY=true
-read -r -p "Upload to headset and run? [Y/n] " deploy_reply
-case "$deploy_reply" in
-    [nN]*) WANT_DEPLOY=false ;;
-    *) WANT_DEPLOY=true ;;
-esac
-
-WANT_EDITOR=false
-if $WANT_DEPLOY; then
-    WANT_EDITOR=true
-    read -r -p "Do you want the scene editor? [Y/n] " editor_reply
-    case "$editor_reply" in
-        [nN]*) WANT_EDITOR=false ;;
-        *) WANT_EDITOR=true ;;
+if [ -z "${WANT_CLEAN+x}" ]; then
+    read -r -p "Clean all builds first? [y/N] " clean_reply
+    case "$clean_reply" in
+        [yY]*) WANT_CLEAN=true ;;
+        *) WANT_CLEAN=false ;;
     esac
+fi
+
+if [ -z "${WANT_DEPLOY+x}" ]; then
+    read -r -p "Upload to headset and run? [Y/n] " deploy_reply
+    case "$deploy_reply" in
+        [nN]*) WANT_DEPLOY=false ;;
+        *) WANT_DEPLOY=true ;;
+    esac
+fi
+
+if [ -z "${WANT_EDITOR+x}" ]; then
+    WANT_EDITOR=false
+    if $WANT_DEPLOY; then
+        WANT_EDITOR=true
+        read -r -p "Do you want the scene editor? [Y/n] " editor_reply
+        case "$editor_reply" in
+            [nN]*) WANT_EDITOR=false ;;
+            *) WANT_EDITOR=true ;;
+        esac
+    fi
 fi
 
 wait_for_remote_path() {
@@ -247,6 +253,17 @@ if $WANT_DEPLOY; then
         shopt -u nullglob
     fi
 
+    if [ -d "$GAME_DIR/font" ]; then
+        adb shell mkdir -p "$REMOTE_GAME_DIR/font"
+        shopt -s nullglob
+        for f in "$GAME_DIR"/font/*; do
+            fname=$(basename "$f")
+            adb push "$f" "$REMOTE_GAME_DIR/font/$fname"
+            verify_remote_file "$REMOTE_GAME_DIR/font/$fname"
+        done
+        shopt -u nullglob
+    fi
+
     ok "Game folder verified on device."
 
     step "Verifying multiplayer server is running on $DROPLET_SSH_HOST..."
@@ -266,45 +283,47 @@ if $WANT_DEPLOY; then
     echo "$SERVER_URL" | adb shell "cat > '$REMOTE_SERVER_URL_FILE'"
     verify_remote_file "$REMOTE_SERVER_URL_FILE"
 
-    step "Starting dev dashboard (tmux, running in background)..."
+    if $WANT_DASHBOARD; then
+        step "Starting dev dashboard (tmux, running in background)..."
 
-    tmux kill-session -t "$DASHBOARD_SESSION" 2>/dev/null || true
-    tmux new-session -d -s "$DASHBOARD_SESSION" -n dev -x 220 -y 52
+        tmux kill-session -t "$DASHBOARD_SESSION" 2>/dev/null || true
+        tmux new-session -d -s "$DASHBOARD_SESSION" -n dev -x 220 -y 52
 
-    tmux set-option -t "$DASHBOARD_SESSION" -g mouse on
-    tmux set-option -t "$DASHBOARD_SESSION" -g status-style "bg=colour234,fg=colour51"
-    tmux set-option -t "$DASHBOARD_SESSION" -g status-left "#[bold]  Quest App Dev  #[default]"
-    tmux set-option -t "$DASHBOARD_SESSION" -g status-left-length 20
-    tmux set-option -t "$DASHBOARD_SESSION" -g status-right "#[fg=colour244]%H:%M:%S "
-    tmux set-option -t "$DASHBOARD_SESSION" -g pane-border-status top
-    tmux set-option -t "$DASHBOARD_SESSION" -g pane-border-format " #{pane_title} "
-    tmux set-option -t "$DASHBOARD_SESSION" -g pane-active-border-style "fg=colour51"
-    tmux set-option -t "$DASHBOARD_SESSION" -g pane-border-style "fg=colour238"
+        tmux set-option -t "$DASHBOARD_SESSION" -g mouse on
+        tmux set-option -t "$DASHBOARD_SESSION" -g status-style "bg=colour234,fg=colour51"
+        tmux set-option -t "$DASHBOARD_SESSION" -g status-left "#[bold]  Quest App Dev  #[default]"
+        tmux set-option -t "$DASHBOARD_SESSION" -g status-left-length 20
+        tmux set-option -t "$DASHBOARD_SESSION" -g status-right "#[fg=colour244]%H:%M:%S "
+        tmux set-option -t "$DASHBOARD_SESSION" -g pane-border-status top
+        tmux set-option -t "$DASHBOARD_SESSION" -g pane-border-format " #{pane_title} "
+        tmux set-option -t "$DASHBOARD_SESSION" -g pane-active-border-style "fg=colour51"
+        tmux set-option -t "$DASHBOARD_SESSION" -g pane-border-style "fg=colour238"
 
-    PANE_LOGCAT=$(tmux display-message -t "$DASHBOARD_SESSION:dev" -p '#{pane_id}')
-    tmux send-keys -t "$PANE_LOGCAT" \
-        "export DISABLE_AUTO_UPDATE=true; cd '$QUEST_APP_DIR' && adb logcat -s quest_app" C-m
-    tmux select-pane -t "$PANE_LOGCAT" -T "logcat"
+        PANE_LOGCAT=$(tmux display-message -t "$DASHBOARD_SESSION:dev" -p '#{pane_id}')
+        tmux send-keys -t "$PANE_LOGCAT" \
+            "export DISABLE_AUTO_UPDATE=true; cd '$QUEST_APP_DIR' && adb logcat -s quest_app" C-m
+        tmux select-pane -t "$PANE_LOGCAT" -T "logcat"
 
-    if $WANT_EDITOR; then
-        PANE_VIEWER=$(tmux split-window -h -t "$PANE_LOGCAT" -l "60%" -P -F '#{pane_id}')
-        tmux send-keys -t "$PANE_VIEWER" \
-            "export DISABLE_AUTO_UPDATE=true; cd '$DEBUG_VIEWER_DIR' && cargo run --target $HOST_TARGET" C-m
-        tmux select-pane -t "$PANE_VIEWER" -T "debug_viewer"
+        if $WANT_EDITOR; then
+            PANE_VIEWER=$(tmux split-window -h -t "$PANE_LOGCAT" -l "60%" -P -F '#{pane_id}')
+            tmux send-keys -t "$PANE_VIEWER" \
+                "export DISABLE_AUTO_UPDATE=true; cd '$DEBUG_VIEWER_DIR' && cargo run --target $HOST_TARGET" C-m
+            tmux select-pane -t "$PANE_VIEWER" -T "debug_viewer"
 
-        PANE_KEEPALIVE=$(tmux split-window -v -t "$PANE_LOGCAT" -l "40%" -P -F '#{pane_id}')
-        tmux send-keys -t "$PANE_KEEPALIVE" \
-            "export DISABLE_AUTO_UPDATE=true; while true; do adb reverse tcp:7778 tcp:7778 2>/dev/null; sleep 5; done" C-m
-        tmux select-pane -t "$PANE_KEEPALIVE" -T "adb reverse keepalive"
+            PANE_KEEPALIVE=$(tmux split-window -v -t "$PANE_LOGCAT" -l "40%" -P -F '#{pane_id}')
+            tmux send-keys -t "$PANE_KEEPALIVE" \
+                "export DISABLE_AUTO_UPDATE=true; while true; do adb reverse tcp:7778 tcp:7778 2>/dev/null; sleep 5; done" C-m
+            tmux select-pane -t "$PANE_KEEPALIVE" -T "adb reverse keepalive"
 
-        tmux select-pane -t "$PANE_VIEWER"
-    fi
+            tmux select-pane -t "$PANE_VIEWER"
+        fi
 
-    ok "Dashboard running in background tmux session (no window opened)."
-    detail "Attach any time with: tmux attach -t $DASHBOARD_SESSION"
+        ok "Dashboard running in background tmux session (no window opened)."
+        detail "Attach any time with: tmux attach -t $DASHBOARD_SESSION"
 
-    if $WANT_EDITOR; then
-        wait_for_tcp_listener 7778
+        if $WANT_EDITOR; then
+            wait_for_tcp_listener 7778
+        fi
     fi
 
     step "Launching quest_app on headset..."
@@ -322,10 +341,12 @@ if $WANT_DEPLOY; then
     ok "quest_app process running."
 
     step "All set."
-    if $WANT_EDITOR; then
-        detail "Put on your headset and move around — debug_viewer shows the live scene + player."
-    fi
-    detail "Dashboard: tmux attach -t $DASHBOARD_SESSION"
+    if $WANT_DASHBOARD; then
+        if $WANT_EDITOR; then
+            detail "Put on your headset and move around — debug_viewer shows the live scene + player."
+        fi
+        detail "Dashboard: tmux attach -t $DASHBOARD_SESSION"
 
-    read -r -p "Press Enter when you're done to stop the dashboard and free up GPU/CPU... "
+        read -r -p "Press Enter when you're done to stop the dashboard and free up GPU/CPU... "
+    fi
 fi
