@@ -15,7 +15,7 @@ mod particles;
 mod to_wire;
 
 #[cfg(target_os = "android")]
-use glam::{Quat, Vec3};
+use glam::{Mat4, Quat, Vec3};
 #[cfg(target_os = "android")]
 use openxr;
 #[cfg(target_os = "android")]
@@ -26,12 +26,12 @@ use space_soup::renderer::{
     MeshInstance, MirrorSurface,
 };
 #[cfg(target_os = "android")]
-use space_soup::{Controllers, HandTrackers, Headset, VkContext, XrContext};
+use space_soup::{Controllers, ControllerState, HandTrackers, Headset, VkContext, XrContext};
 #[cfg(target_os = "android")]
 use space_soup_engine::{
     debug_sender, ButtonPress, DebugPacket, Hand, HandSample, InputFrame,
-    JointSample, Locomotion, LocomotionInput, LocomotionMode, LocomotionSample, Manifest, Pose,
-    SceneSample, TeleportTarget, TimingSample,
+    JointSample, Locomotion, LocomotionInput, LocomotionMode, LocomotionSample, Manifest,
+    PartDriver, Pose, SceneSample, TeleportTarget, TimingSample,
 };
 #[cfg(target_os = "android")]
 use space_soup_hands::{build_player_rig, load_synthetic_hand_config};
@@ -118,6 +118,81 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(target_os = "android")]
 fn game_dir() -> PathBuf {
     PathBuf::from("/sdcard/Android/data/com.example.questapp/files/game")
+}
+
+#[cfg(target_os = "android")]
+fn part_animation_blend(driver: PartDriver, hand: Hand, cs: &ControllerState) -> f32 {
+    match (driver, hand) {
+        (PartDriver::HoldTrigger, Hand::Left) => cs.l_trigger,
+        (PartDriver::HoldTrigger, Hand::Right) => cs.r_trigger,
+        (PartDriver::HoldGrip, Hand::Left) => cs.l_squeeze,
+        (PartDriver::HoldGrip, Hand::Right) => cs.r_squeeze,
+        (PartDriver::HandPull | PartDriver::Manual, _) => 0.0,
+    }
+}
+
+#[cfg(target_os = "android")]
+const PART_PULL_GRAB_RANGE: f32 = 0.09;
+
+#[cfg(target_os = "android")]
+fn hand_idx(hand: Hand) -> usize {
+    match hand {
+        Hand::Left => 0,
+        Hand::Right => 1,
+    }
+}
+
+#[cfg(target_os = "android")]
+struct PullSession {
+    object_id: String,
+    clip: String,
+    grab_local: Vec3,
+    axis_model: Vec3,
+    travel: f32,
+    b0: f32,
+    blend: f32,
+}
+
+#[cfg(target_os = "android")]
+fn try_start_pull(
+    object_id: &str,
+    gun_world: Mat4,
+    pull_hand_pos: Vec3,
+    static_scene: &grab_detect::StaticScene,
+    mesh_cache: &HashMap<String, (GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform)>,
+) -> Option<PullSession> {
+    let parts = static_scene.part_animations.get(object_id)?;
+    let (mesh, _) = mesh_cache.get(object_id)?;
+    let skin = mesh.skin.as_ref()?;
+    let hand_local = gun_world.inverse().transform_point3(pull_hand_pos);
+    for pa in parts.iter().filter(|pa| pa.driver == PartDriver::HandPull) {
+        let Some(clip_idx) = skin.animation_index(&pa.clip) else {
+            warn!("HandPull '{object_id}': clip '{}' not found in skin", pa.clip);
+            continue;
+        };
+        let Some((anchor_model, axis_model, travel)) = skin.pull_geometry(clip_idx) else {
+            warn!("HandPull '{object_id}': clip '{}' has no pull_geometry", pa.clip);
+            continue;
+        };
+        let anchor_world = gun_world.transform_point3(anchor_model);
+        let dist = pull_hand_pos.distance(anchor_world);
+        info!(
+            "HandPull '{object_id}' clip '{}': dist={dist:.3}m (need <={PART_PULL_GRAB_RANGE:.2}) anchor_world=({:.2},{:.2},{:.2}) travel={travel:.3}",
+            pa.clip, anchor_world.x, anchor_world.y, anchor_world.z
+        );
+        if dist <= PART_PULL_GRAB_RANGE {
+            return Some(PullSession {
+                object_id: object_id.to_string(),
+                clip: pa.clip.clone(),
+                grab_local: hand_local,
+                axis_model,
+                travel,
+                b0: 0.0,
+                blend: 0.0,
+            });
+        }
+    }
+    None
 }
 
 #[cfg(target_os = "android")]
@@ -219,9 +294,6 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut locomotion = Locomotion::new(LocomotionMode::Smooth);
 
     let net = network::spawn(network::server_url());
-    // Reconnecting on a live scene-name change (see the `w.scene_name !=
-    // static_scene.scene_name` handling below) isn't handled yet -- this
-    // subscribes once to whatever scene the app launched into.
     let lightmap_rx = lightmap_client::spawn(entry_scene.clone());
 
     let mut mesh_cache: HashMap<
@@ -239,7 +311,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let rig_config = avatar::load_rig_config(&dir.join("avatar_rig.json"));
     let synthetic_hand_config = load_synthetic_hand_config(&dir.join("synthetic_hand.json"));
 
-    let mut calibrated_heights: HashMap<PlayerId, f32> = HashMap::new();
+    let mut calibrated_heights: HashMap<PlayerId, avatar_ik::HeightCalibrator> = HashMap::new();
 
     let mut local_direct_mesh: Option<(
         GltfMesh,
@@ -309,6 +381,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut prev_l_trigger = false;
     let mut prev_r_squeeze = false;
     let mut prev_l_squeeze = false;
+    let mut pull_sessions: [Option<PullSession>; 2] = [None, None];
     let mut prev_btn_a = false;
     let mut prev_btn_b = false;
     let mut prev_btn_x = false;
@@ -395,6 +468,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         for (obj_id, mut mesh) in mesh_rx.try_iter() {
             if mesh.is_skinned() {
                 mesh.create_skin_bind_group(renderer.device(), renderer.skin_joint_layout());
+                if let Some(bind) = mesh.skin.as_ref().map(|s| s.skin_matrices_blended_multi(&[])) {
+                    mesh.update_joint_matrices(renderer.queue(), &bind);
+                }
                 let model_uniform = renderer.create_skinned_model_uniform();
                 mesh_cache.insert(obj_id, (mesh, model_uniform));
             } else {
@@ -403,9 +479,6 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // A given object_id is only ever rendered via one path (plain cuboid
-        // or mesh), so uploading to both caches is harmless -- whichever one
-        // isn't actually used for that id just sits unread.
         for update in lightmap_rx.try_iter() {
             renderer.set_cuboid_lightmap(&update.object_id, &update.rgba, update.width, update.height);
             renderer.set_mesh_lightmap(&update.object_id, &update.rgba, update.width, update.height);
@@ -501,39 +574,112 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         let r_trigger_only = cs.r_trigger > 0.5;
         let l_trigger_only = cs.l_trigger > 0.5;
 
+        let held_gun_world = |hand: Hand| -> Option<(String, Mat4)> {
+            let held = world.as_ref().and_then(|w| match hand {
+                Hand::Left => w.left_hand_held.as_ref(),
+                Hand::Right => w.right_hand_held.as_ref(),
+            })?;
+            let hand_tf = rig.hand_grip(hand);
+            let hand_mat = Mat4::from_rotation_translation(hand_tf.rotation, hand_tf.position);
+            let offset_mat = Mat4::from_rotation_translation(
+                Quat::from_array(held.point_local_rot),
+                Vec3::from(held.point_local_pos),
+            );
+            let (_, rot, pos) = (hand_mat * offset_mat.inverse()).to_scale_rotation_translation();
+            let scale = meshes_src
+                .iter()
+                .find(|m| m.id == held.object_id)
+                .map(|m| Vec3::from(m.scale))
+                .unwrap_or(Vec3::ONE);
+            Some((held.object_id.clone(), Mat4::from_scale_rotation_translation(scale, rot, pos)))
+        };
+
         if r_trigger_down && !(prev_r_trigger || prev_r_squeeze) {
             let p = rig.hand_grip(Hand::Right).position;
-            if let Some((id, point)) =
+            let pull = held_gun_world(Hand::Left)
+                .and_then(|(oid, gw)| try_start_pull(&oid, gw, p, &static_scene, &mesh_cache));
+            if let Some(session) = pull {
+                info!("GRAB R: started HandPull on '{}'", session.object_id);
+                pull_sessions[hand_idx(Hand::Right)] = Some(session);
+            } else if let Some((id, point)) =
                 grab_detect::nearest_grip_point_to(&live_objects, &static_scene, p, r_trigger_only, Hand::Right)
             {
+                info!("GRAB R: '{id}' via grip point '{point}'");
                 input.grabbed.push((id, Hand::Right, point));
             } else if let Some(id) = grab_detect::nearest_object_to(&live_objects, p) {
+                info!("GRAB R: '{id}' via proximity (no grip point)");
                 input.grabbed.push((id, Hand::Right, String::new()));
+            } else {
+                info!(
+                    "GRAB R: pressed, nothing in range (hand {:.2},{:.2},{:.2}; {} live objs)",
+                    p.x, p.y, p.z, live_objects.by_id.len()
+                );
             }
         }
         if !r_trigger_down && (prev_r_trigger || prev_r_squeeze) {
-            if let Some(id) =
-                grab_detect::nearest_object_to(&live_objects, rig.hand_grip(Hand::Right).position)
-            {
-                input.released.push((id, Hand::Right));
+            if pull_sessions[hand_idx(Hand::Right)].is_none() {
+                if let Some(id) =
+                    grab_detect::nearest_object_to(&live_objects, rig.hand_grip(Hand::Right).position)
+                {
+                    input.released.push((id, Hand::Right));
+                }
             }
         }
         if l_trigger_down && !(prev_l_trigger || prev_l_squeeze) {
             let p = rig.hand_grip(Hand::Left).position;
-            if let Some((id, point)) =
+            let pull = held_gun_world(Hand::Right)
+                .and_then(|(oid, gw)| try_start_pull(&oid, gw, p, &static_scene, &mesh_cache));
+            if let Some(session) = pull {
+                info!("GRAB L: started HandPull on '{}'", session.object_id);
+                pull_sessions[hand_idx(Hand::Left)] = Some(session);
+            } else if let Some((id, point)) =
                 grab_detect::nearest_grip_point_to(&live_objects, &static_scene, p, l_trigger_only, Hand::Left)
             {
+                info!("GRAB L: '{id}' via grip point '{point}'");
                 input.grabbed.push((id, Hand::Left, point));
             } else if let Some(id) = grab_detect::nearest_object_to(&live_objects, p) {
+                info!("GRAB L: '{id}' via proximity (no grip point)");
                 input.grabbed.push((id, Hand::Left, String::new()));
+            } else {
+                info!(
+                    "GRAB L: pressed, nothing in range (hand {:.2},{:.2},{:.2}; {} live objs)",
+                    p.x, p.y, p.z, live_objects.by_id.len()
+                );
             }
         }
         if !l_trigger_down && (prev_l_trigger || prev_l_squeeze) {
-            if let Some(id) =
-                grab_detect::nearest_object_to(&live_objects, rig.hand_grip(Hand::Left).position)
-            {
-                input.released.push((id, Hand::Left));
+            if pull_sessions[hand_idx(Hand::Left)].is_none() {
+                if let Some(id) =
+                    grab_detect::nearest_object_to(&live_objects, rig.hand_grip(Hand::Left).position)
+                {
+                    input.released.push((id, Hand::Left));
+                }
             }
+        }
+
+        for hand in [Hand::Left, Hand::Right] {
+            let idx = hand_idx(hand);
+            let Some(session) = pull_sessions[idx].as_mut() else {
+                continue;
+            };
+            let still_pulling = match hand {
+                Hand::Left => l_trigger_down,
+                Hand::Right => r_trigger_down,
+            };
+            let gun = held_gun_world(Hand::Left)
+                .filter(|(oid, _)| *oid == session.object_id)
+                .or_else(|| held_gun_world(Hand::Right).filter(|(oid, _)| *oid == session.object_id));
+            let Some((_, gun_world)) = gun else {
+                pull_sessions[idx] = None;
+                continue;
+            };
+            if !still_pulling {
+                pull_sessions[idx] = None;
+                continue;
+            }
+            let hand_local = gun_world.inverse().transform_point3(rig.hand_grip(hand).position);
+            let pulled = (hand_local - session.grab_local).dot(session.axis_model) / session.travel;
+            session.blend = (session.b0 + pulled).clamp(0.0, 1.0);
         }
 
         {
@@ -589,6 +735,17 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         locomotion.player_offset = player_offset;
         locomotion.player_yaw = player_yaw;
 
+        if frame_count % 30 == 0
+            && (cs.l_stick.x.abs() > 0.1 || cs.l_stick.y.abs() > 0.1 || cs.r_stick.x.abs() > 0.1)
+        {
+            info!(
+                "LOCO: Lstick=({:.2},{:.2}) Rstick.x={:.2} -> server off=({:.2},{:.2},{:.2}) yaw={:.1}deg conn={}",
+                cs.l_stick.x, cs.l_stick.y, cs.r_stick.x,
+                player_offset.x, player_offset.y, player_offset.z, player_yaw.to_degrees(),
+                world.is_some()
+            );
+        }
+
         let _ = net.input_tx.send(network::PendingInput {
             input: to_wire::input_frame_to_wire(&input),
             locomotion_input: to_wire::locomotion_input_to_wire(&locomotion_input),
@@ -610,12 +767,21 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
         if frame_count % 90 == 0 {
             info!(
-                "Frame {frame_count}: cuboids={} meshes={} lights={} connected={}",
+                "Frame {frame_count}: cuboids={} meshes={} lights={} bounds={} connected={}",
                 cuboids_src.len(),
                 meshes_src.len(),
                 lights_src.len(),
+                live_objects.by_id.len(),
                 world.is_some(),
             );
+        }
+
+        if frame_count % 30 == 0 {
+            for hand in [Hand::Left, Hand::Right] {
+                let hp = rig.hand_grip(hand).position;
+                let diag = grab_detect::grab_diagnostic(&live_objects, &static_scene, hp, hand);
+                info!("{}", diag.summary(hand, hp));
+            }
         }
 
         if let Some(ref mut stream) = debug_stream {
@@ -763,23 +929,15 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             let Some(skin) = &mesh.skin else { continue };
             let Some(skeleton) = avatar_skeleton_cache.get(&id) else { continue };
 
-            // Measure head height along the rig's actual up axis, detected from the
-            // bind pose. Different glTF loaders present the same model in different
-            // bases: space_soup bakes this model's armature so its skeleton is Y-up,
-            // while Babylon (the web editor) keeps it Z-up. Detecting the axis makes
-            // the solver correct for whichever skeleton it is handed instead of
-            // assuming Y-up (which reads ~0 for a Z-up rig and blows up the scale).
-            // For space_soup's Y-up skeleton this resolves to +Y and is behaviour-
-            // preserving; head/hand poses below share this same (render) basis.
             let mut rig_cfg = rig_config;
             let up = avatar_ik::detect_up_axis(skeleton);
             rig_cfg.up_axis = up.to_array();
             let raw_bind_head_height = avatar_ik::bind_head_height_along(skeleton, up);
             let calibrated_height = calibrated_heights
                 .entry(id)
-                .and_modify(|h| *h = h.max(state.head.position.y))
-                .or_insert(state.head.position.y);
-            let root_scale = avatar::height_calibrated_scale(*calibrated_height, raw_bind_head_height);
+                .or_default()
+                .observe(state.head.position.y);
+            let root_scale = avatar::height_calibrated_scale(calibrated_height, raw_bind_head_height);
 
             let to_render = |p: Vec3| yaw_inv * (p - offset);
             let floor_drop = raw_bind_head_height * root_scale;
@@ -910,6 +1068,32 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             let (_, rot, pos) = (hand_mat * offset_mat.inverse()).to_scale_rotation_translation();
             mesh.position = yaw_inv * (pos - offset);
             mesh.rotation = yaw_inv * rot;
+
+            if let Some(parts) = static_scene.part_animations.get(&held.object_id) {
+                if let Some(skin) = &mesh.skin {
+                    let targets: Vec<(usize, f32)> = parts
+                        .iter()
+                        .filter_map(|pa| {
+                            let clip_idx = skin.animation_index(&pa.clip)?;
+                            let raw = if pa.driver == PartDriver::HandPull {
+                                pull_sessions
+                                    .iter()
+                                    .flatten()
+                                    .find(|s| s.object_id == held.object_id && s.clip == pa.clip)
+                                    .map(|s| s.blend)
+                                    .unwrap_or(0.0)
+                            } else {
+                                part_animation_blend(pa.driver, hand, cs)
+                            };
+                            Some((clip_idx, pa.easing.apply(raw)))
+                        })
+                        .collect();
+                    if !targets.is_empty() {
+                        let mats = skin.skin_matrices_blended_multi(&targets);
+                        mesh.update_joint_matrices(renderer.queue(), &mats);
+                    }
+                }
+            }
         }
 
         let mesh_instances: Vec<MeshInstance> = meshes_src

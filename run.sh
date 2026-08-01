@@ -107,15 +107,36 @@ wait_for_app_data_dir() {
     ok "Data directory created."
 }
 
+# True if the remote file exists and is non-empty. Pure predicate — never exits.
 verify_remote_file() {
-    local path="$1"
-    local size
+    local path="$1" size
     size=$(adb shell "stat -c %s '$path' 2>/dev/null || echo 0" | tr -d '\r')
-    if [ "$size" -lt 1 ] 2>/dev/null; then
-        fail "$path missing or empty after push."
-        exit 1
-    fi
-    ok "OK: $path ($size bytes)"
+    [ "${size:-0}" -ge 1 ] 2>/dev/null
+}
+
+# Files that failed to push after retries — reported at the end instead of aborting.
+PUSH_FAILURES=()
+
+# push_file SRC DST — adb push with one retry + verify. Records failures instead of
+# killing the whole run. Previously a single bad file aborted the entire push via
+# `set -e` + verify_remote_file's `exit 1`, silently leaving every later asset (other
+# models, the editor's external .bin animation buffers) off the headset. Always
+# returns 0 so `set -e` can never trip on it.
+push_file() {
+    local src="$1" dst="$2" attempt size
+    for attempt in 1 2; do
+        if adb push "$src" "$dst" >/dev/null 2>&1 && verify_remote_file "$dst"; then
+            size=$(adb shell "stat -c %s '$dst' 2>/dev/null || echo 0" | tr -d '\r')
+            ok "OK: ${dst#"$REMOTE_GAME_DIR"/} ($size bytes)"
+            return 0
+        fi
+        if [ "$attempt" -eq 1 ]; then
+            warn "push failed for ${dst#"$REMOTE_GAME_DIR"/} — retrying..."
+        fi
+    done
+    fail "could not push ${dst#"$REMOTE_GAME_DIR"/} after 2 attempts"
+    PUSH_FAILURES+=("$dst")
+    return 0
 }
 
 wait_for_tcp_listener() {
@@ -204,21 +225,17 @@ if $WANT_DEPLOY; then
 
     step "Pushing game folder to Quest..."
     adb shell mkdir -p "$REMOTE_GAME_DIR"
-    adb push "$GAME_DIR/manifest.json" "$REMOTE_GAME_DIR/manifest.json"
-    verify_remote_file "$REMOTE_GAME_DIR/manifest.json"
+    push_file "$GAME_DIR/manifest.json" "$REMOTE_GAME_DIR/manifest.json"
 
     if [ -f "$GAME_DIR/avatar_rig.json" ]; then
-        adb push "$GAME_DIR/avatar_rig.json" "$REMOTE_GAME_DIR/avatar_rig.json"
-        verify_remote_file "$REMOTE_GAME_DIR/avatar_rig.json"
+        push_file "$GAME_DIR/avatar_rig.json" "$REMOTE_GAME_DIR/avatar_rig.json"
     fi
 
     if [ -d "$GAME_DIR/scenes" ]; then
         adb shell mkdir -p "$REMOTE_GAME_DIR/scenes"
         shopt -s nullglob
         for f in "$GAME_DIR"/scenes/*.json; do
-            fname=$(basename "$f")
-            adb push "$f" "$REMOTE_GAME_DIR/scenes/$fname"
-            verify_remote_file "$REMOTE_GAME_DIR/scenes/$fname"
+            push_file "$f" "$REMOTE_GAME_DIR/scenes/$(basename "$f")"
         done
         shopt -u nullglob
     fi
@@ -229,10 +246,11 @@ if $WANT_DEPLOY; then
             adb shell mkdir -p "$REMOTE_GAME_DIR/models$rel"
         done < <(find "$GAME_DIR/models" -type d -print0)
 
+        # -type f pulls in EVERYTHING: .glb meshes AND their sidecar .bin animation
+        # buffers / .json matrices. push_file keeps going if any single file fails.
         while IFS= read -r -d '' f; do
             rel="${f#"$GAME_DIR"/models/}"
-            adb push "$f" "$REMOTE_GAME_DIR/models/$rel"
-            verify_remote_file "$REMOTE_GAME_DIR/models/$rel"
+            push_file "$f" "$REMOTE_GAME_DIR/models/$rel"
         done < <(find "$GAME_DIR/models" -type f -print0)
     fi
 
@@ -240,14 +258,18 @@ if $WANT_DEPLOY; then
         adb shell mkdir -p "$REMOTE_GAME_DIR/sound"
         shopt -s nullglob
         for f in "$GAME_DIR"/sound/*; do
-            fname=$(basename "$f")
-            adb push "$f" "$REMOTE_GAME_DIR/sound/$fname"
-            verify_remote_file "$REMOTE_GAME_DIR/sound/$fname"
+            push_file "$f" "$REMOTE_GAME_DIR/sound/$(basename "$f")"
         done
         shopt -u nullglob
     fi
 
-    ok "Game folder verified on device."
+    if [ "${#PUSH_FAILURES[@]}" -gt 0 ]; then
+        fail "${#PUSH_FAILURES[@]} file(s) FAILED to reach the headset:"
+        for f in "${PUSH_FAILURES[@]}"; do detail "  ${f#"$REMOTE_GAME_DIR"/}"; done
+        warn "Scene may render incomplete (missing meshes or .bin animation buffers). Re-run to retry."
+    else
+        ok "Game folder verified on device — all files pushed."
+    fi
 
     step "Verifying multiplayer server is running on $DROPLET_SSH_HOST..."
     if [ -f "$DROPLET_SSH_KEY" ]; then
@@ -264,7 +286,11 @@ if $WANT_DEPLOY; then
     step "Pushing multiplayer server URL ($SERVER_URL)..."
     adb shell mkdir -p "$(dirname "$REMOTE_SERVER_URL_FILE")"
     echo "$SERVER_URL" | adb shell "cat > '$REMOTE_SERVER_URL_FILE'"
-    verify_remote_file "$REMOTE_SERVER_URL_FILE"
+    if verify_remote_file "$REMOTE_SERVER_URL_FILE"; then
+        ok "OK: server_url.txt ($SERVER_URL)"
+    else
+        warn "server_url.txt may not have written — client could fall back to its default server."
+    fi
 
     step "Starting dev dashboard (tmux, running in background)..."
 
