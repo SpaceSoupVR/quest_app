@@ -21,7 +21,7 @@ use glam::{Mat4, Quat, Vec3};
 #[cfg(target_os = "android")]
 use openxr;
 #[cfg(target_os = "android")]
-use space_soup::renderer::xr_renderer::{UiPanelRenderData, XrRenderer};
+use space_soup::renderer::xr_renderer::XrRenderer;
 #[cfg(target_os = "android")]
 use space_soup::renderer::{
     Beam, Color3, Cuboid, CuboidShape as SsCuboidShape, CuboidStyle as SsCuboidStyle, GltfMesh,
@@ -41,7 +41,7 @@ use space_soup_hands::{build_player_rig, load_synthetic_hand_config};
 use space_soup_protocol::{
     PlayerId, WireColor3, WireCuboidShape, WireCuboidStyle, WireHeldGrip, WireLightKind,
     WireRenderCuboid, WireRenderLaser, WireRenderLight, WireRenderMesh,
-    WireRenderParticleEmitter, WireRenderUiButton, WireRenderUiPanel,
+    WireRenderParticleEmitter,
 };
 #[cfg(target_os = "android")]
 use log::warn;
@@ -268,18 +268,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut hands = HandTrackers::new(&xr, &headset.session)?;
 
     let dir = game_dir();
-    let ui_font_path = dir.join("font/Jetbrains.ttf");
-    let ui_font_bytes = match std::fs::read(&ui_font_path) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            error!("Failed to read UI font from {}: {e}", ui_font_path.display());
-            error!("adb push your game folder to that path and relaunch.");
-            return Err(e.into());
-        }
-    };
 
     info!("init: creating XR renderer");
-    let mut renderer = XrRenderer::new(&vk, &xr, &headset.session, &ui_font_bytes)?;
+    let mut renderer = XrRenderer::new(&vk, &xr, &headset.session)?;
     info!("init: all subsystems ready");
 
     renderer.device().on_uncaptured_error(Box::new(|error| {
@@ -560,8 +551,6 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         let empty_bounds: Vec<space_soup_protocol::WireObjectBounds> = Vec::new();
         let empty_particle_emitters: Vec<WireRenderParticleEmitter> = Vec::new();
         let empty_lasers: Vec<WireRenderLaser> = Vec::new();
-        let empty_ui_panels: Vec<WireRenderUiPanel> = Vec::new();
-        let empty_ui_buttons: Vec<WireRenderUiButton> = Vec::new();
         let cuboids_src = world.as_ref().map(|w| &w.cuboids).unwrap_or(&empty_cuboids);
         let meshes_src = world.as_ref().map(|w| &w.meshes).unwrap_or(&empty_meshes);
         let lights_src = world.as_ref().map(|w| &w.lights).unwrap_or(&empty_lights);
@@ -571,8 +560,6 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .map(|w| &w.particle_emitters)
             .unwrap_or(&empty_particle_emitters);
         let lasers_src = world.as_ref().map(|w| &w.lasers).unwrap_or(&empty_lasers);
-        let ui_panels_src = world.as_ref().map(|w| &w.ui_panels).unwrap_or(&empty_ui_panels);
-        let ui_buttons_src = world.as_ref().map(|w| &w.ui_buttons).unwrap_or(&empty_ui_buttons);
 
         if let Some(w) = &world {
             server_player_offset = Some(Vec3::from(w.player_offset));
@@ -773,10 +760,12 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         if frame_count % 30 == 0
             && (cs.l_stick.x.abs() > 0.1 || cs.l_stick.y.abs() > 0.1 || cs.r_stick.x.abs() > 0.1)
         {
+            let logged_offset = server_player_offset.unwrap_or_default();
+            let logged_yaw = server_player_yaw.unwrap_or_default();
             info!(
                 "LOCO: Lstick=({:.2},{:.2}) Rstick.x={:.2} -> server off=({:.2},{:.2},{:.2}) yaw={:.1}deg conn={}",
                 cs.l_stick.x, cs.l_stick.y, cs.r_stick.x,
-                player_offset.x, player_offset.y, player_offset.z, player_yaw.to_degrees(),
+                logged_offset.x, logged_offset.y, logged_offset.z, logged_yaw.to_degrees(),
                 world.is_some()
             );
         }
@@ -1191,12 +1180,6 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|rl| to_space_soup_beam(rl, offset, yaw_inv))
             .collect();
-        let ui_panels: Vec<UiPanelRenderData> = ui_panels_src
-            .iter()
-            .map(|p| to_ui_panel_render_data(p, offset, yaw_inv))
-            .chain(ui_buttons_src.iter().map(|b| ui_button_render_data(b, offset, yaw_inv)))
-            .collect();
-
         let proj_views = renderer.render_frame_with_meshes(
             &headset.session,
             &headset.stage,
@@ -1208,7 +1191,6 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &particles,
             &beams,
             mirror_surface,
-            &ui_panels,
         )?;
         let proj_layer = openxr::CompositionLayerProjection::new()
             .space(&headset.stage)
@@ -1292,34 +1274,6 @@ fn to_space_soup_beam(rl: &WireRenderLaser, offset: Vec3, yaw_inv: Quat) -> Beam
         end: yaw_inv * (Vec3::from(rl.end) - offset),
         width: rl.beam_width,
         color: ss_color(rl.color),
-    }
-}
-
-#[cfg(target_os = "android")]
-fn to_ui_panel_render_data(p: &WireRenderUiPanel, offset: Vec3, yaw_inv: Quat) -> UiPanelRenderData {
-    UiPanelRenderData {
-        id: p.id.clone(),
-        position: yaw_inv * (Vec3::from(p.position) - offset),
-        rotation: yaw_inv * Quat::from_array(p.rotation),
-        width_m: p.width,
-        height_m: p.height,
-        background_color: ss_color(p.background_color),
-        text: p.title.clone(),
-        text_color: Color3(255, 255, 255, 255),
-    }
-}
-
-#[cfg(target_os = "android")]
-fn ui_button_render_data(b: &WireRenderUiButton, offset: Vec3, yaw_inv: Quat) -> UiPanelRenderData {
-    UiPanelRenderData {
-        id: b.id.clone(),
-        position: yaw_inv * (Vec3::from(b.position) - offset),
-        rotation: yaw_inv * Quat::from_array(b.rotation),
-        width_m: b.half_size[0] * 2.0,
-        height_m: b.half_size[1] * 2.0,
-        background_color: ss_color(b.color),
-        text: b.label.clone(),
-        text_color: ss_color(b.text_color),
     }
 }
 
