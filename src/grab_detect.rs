@@ -4,6 +4,7 @@ use std::path::Path;
 
 use glam::{Quat, Vec3};
 
+use space_soup_engine::scene::OpticDef;
 use space_soup_engine::{GripKind, GripPointDef, Hand, Manifest, PartAnimationDef, Scene};
 use space_soup_protocol::{WireHeldGrip, WireObjectBounds};
 
@@ -40,17 +41,22 @@ pub struct StaticScene {
     pub scene_name: String,
     pub grip_points: HashMap<String, Vec<GripPointDef>>,
     pub part_animations: HashMap<String, Vec<PartAnimationDef>>,
+    pub optics: HashMap<String, OpticDef>,
 }
 
 impl StaticScene {
     pub fn load(game_dir: &Path, scene_name: &str) -> Self {
         let path = Manifest::scene_path(game_dir, scene_name);
-        let (grip_points, part_animations) = match Scene::load(&path) {
+        let (grip_points, part_animations, optics) = match Scene::load(&path) {
             Ok(scene) => {
                 let mut grip_points = HashMap::new();
                 let mut part_animations = HashMap::new();
+                let mut optics = HashMap::new();
                 let total_objs = scene.objects.len();
                 for o in scene.objects {
+                    if let Some(optic) = o.optic.clone() {
+                        optics.insert(o.id.clone(), optic);
+                    }
                     if !o.grip_points.is_empty() {
                         let summary: Vec<String> = o
                             .grip_points
@@ -74,19 +80,20 @@ impl StaticScene {
                     grip_points.len(),
                     part_animations.len()
                 );
-                (grip_points, part_animations)
+                (grip_points, part_animations, optics)
             }
             Err(e) => {
                 log::warn!(
                     "grab_detect: failed to load scene '{scene_name}' for grip points/part animations: {e}"
                 );
-                (HashMap::new(), HashMap::new())
+                (HashMap::new(), HashMap::new(), HashMap::new())
             }
         };
         Self {
             scene_name: scene_name.to_string(),
             grip_points,
             part_animations,
+            optics,
         }
     }
 }

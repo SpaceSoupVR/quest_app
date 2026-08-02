@@ -24,11 +24,16 @@ use openxr;
 use space_soup::renderer::xr_renderer::XrRenderer;
 #[cfg(target_os = "android")]
 use space_soup::renderer::{
+    scope::{self, ScopeRender},
     Beam, Color3, Cuboid, CuboidShape as SsCuboidShape, CuboidStyle as SsCuboidStyle, GltfMesh,
     Light, LightKind as SsLightKind, MeshInstance, MirrorSurface,
 };
 #[cfg(target_os = "android")]
 use space_soup::{Controllers, ControllerState, HandTrackers, Headset, VkContext, XrContext};
+#[cfg(target_os = "android")]
+use space_soup_engine::optic::{OpticController, OpticalPathPose};
+#[cfg(target_os = "android")]
+use space_soup_engine::scene::{OpticalPathDef, OpticalPathsDef};
 #[cfg(target_os = "android")]
 use space_soup_engine::{
     debug_sender, ButtonPress, DebugPacket, Hand, HandSample, InputFrame,
@@ -50,6 +55,10 @@ use std::collections::{HashMap, HashSet};
 #[cfg(target_os = "android")]
 use std::path::PathBuf;
 
+#[cfg(target_os = "android")]
+const IPD_M: f32 = 0.064;
+#[cfg(target_os = "android")]
+const EYE_FOV_Y_RAD: f32 = 1.6;
 #[cfg(target_os = "android")]
 const ANDROID_LOOPER_ID_MAIN: u32 = 0;
 #[cfg(target_os = "android")]
@@ -291,6 +300,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut static_scene = grab_detect::StaticScene::load(&dir, &entry_scene);
     let mut live_objects = grab_detect::LiveObjects::default();
+    let mut optic_controllers: HashMap<String, OpticController> = HashMap::new();
     let mut client_audio = client_audio::ClientAudio::new();
 
     let mut server_player_offset: Option<Vec3> = None;
@@ -1120,6 +1130,78 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        let mut scope_renders: Vec<ScopeRender> = Vec::new();
+        for hand in [Hand::Left, Hand::Right] {
+            let held: Option<&WireHeldGrip> = world.as_ref().and_then(|w| match hand {
+                Hand::Left => w.left_hand_held.as_ref(),
+                Hand::Right => w.right_hand_held.as_ref(),
+            });
+            let Some(held) = held else { continue };
+            let Some((mesh, _)) = mesh_cache.get(&held.object_id) else {
+                continue;
+            };
+
+            let Some(optic) = static_scene.optics.get(&held.object_id) else {
+                continue;
+            };
+            let paths: Vec<&OpticalPathDef> = match &optic.paths {
+                OpticalPathsDef::Monocular { path } => vec![path],
+                OpticalPathsDef::Binocular { left, right, .. } => vec![left, right],
+            };
+
+            let ctrl = optic_controllers
+                .entry(held.object_id.clone())
+                .or_insert_with(|| OpticController::new(optic));
+            ctrl.advance(dt);
+
+            let head_tf = rig.head();
+            let eye_l = yaw_inv * (head_tf.position - offset);
+            let eye_r =
+                yaw_inv * (head_tf.position + (head_tf.rotation * Vec3::X) * IPD_M - offset);
+
+            let posed: Vec<OpticalPathPose> = paths
+                .iter()
+                .map(|pd| {
+                    let obj_w = mesh.position + mesh.rotation * Vec3::from_array(pd.objective_offset);
+                    let ocu_w = mesh.position + mesh.rotation * Vec3::from_array(pd.ocular_offset);
+                    OpticalPathPose {
+                        objective: obj_w,
+                        ocular: ocu_w,
+                        ocular_radius_m: pd.ocular_radius_m,
+                    }
+                })
+                .collect();
+
+            let view = ctrl.evaluate(optic, [eye_l, eye_r], &posed, EYE_FOV_Y_RAD);
+            if !view.render_needed {
+                continue;
+            }
+
+            for (i, pose) in posed.iter().enumerate() {
+                let occ = [
+                    view.eyes[0][i].eye_box.occupancy,
+                    view.eyes[1][i].eye_box.occupancy,
+                ];
+
+                let dir = |e: Vec3| -> [f32; 2] {
+                    let (right, up, _) = scope::scope_basis(pose.axis(), Vec3::Y);
+                    let rel = e - pose.ocular;
+                    [rel.dot(right), rel.dot(up)]
+                };
+
+                scope_renders.push(ScopeRender {
+                    objective: pose.objective,
+                    ocular: pose.ocular,
+                    axis: pose.axis(),
+                    ocular_radius_m: pose.ocular_radius_m,
+                    magnification: view.magnification,
+                    true_fov_y_rad: view.scope_fov_deg.to_radians(),
+                    occupancy: occ,
+                    offset_dir: [dir(eye_l), dir(eye_r)],
+                });
+            }
+        }
+
         let mesh_instances: Vec<MeshInstance> = meshes_src
             .iter()
             .filter(|rm| Vec3::from(rm.position).distance(head_pos) < MAX_RENDER_DIST)
@@ -1191,6 +1273,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &particles,
             &beams,
             mirror_surface,
+            &scope_renders,
         )?;
         let proj_layer = openxr::CompositionLayerProjection::new()
             .space(&headset.stage)
