@@ -2,7 +2,7 @@
 use glam::{Quat, Vec3};
 
 use space_soup::renderer::{Color3, Particle};
-use space_soup_protocol::WireRenderParticleEmitter;
+use space_soup_protocol::{WireRenderParticleBurst, WireRenderParticleEmitter};
 
 fn hash_to_unit_floats(id: &str, slot: usize) -> (f32, f32) {
     let id_hash = id
@@ -69,6 +69,36 @@ pub fn simulate(
                 position: yaw_inv * (local_pos - offset),
                 size,
                 color: Color3(e.color.0, e.color.1, e.color.2, alpha),
+            });
+        }
+    }
+
+    out
+}
+
+// Bursts are fire-and-forget: every particle in a burst was spawned at the same instant, so
+// they all share the server-authoritative `elapsed`/age instead of each computing its own from
+// sim_time -- only their fixed per-index direction jitter (from the same hash as the loop above)
+// makes them fan out over that shared age.
+pub fn simulate_bursts(bursts: &[WireRenderParticleBurst], offset: Vec3, yaw_inv: Quat) -> Vec<Particle> {
+    let mut out = Vec::new();
+
+    for b in bursts {
+        let t = (b.elapsed / b.lifetime.max(0.01)).clamp(0.0, 1.0);
+        let position = Vec3::from(b.position);
+        let direction = Vec3::from(b.direction);
+        let base_alpha = b.color.3 as f32 / 255.0;
+        let alpha = (base_alpha * (1.0 - t) * 255.0).round() as u8;
+
+        for i in 0..b.count as usize {
+            let (u1, u2) = hash_to_unit_floats(&b.id, i);
+            let dir = cone_direction(direction, b.spread_deg, u1, u2);
+            let local_pos = position + dir * b.speed * b.elapsed;
+
+            out.push(Particle {
+                position: yaw_inv * (local_pos - offset),
+                size: b.particle_size,
+                color: Color3(b.color.0, b.color.1, b.color.2, alpha),
             });
         }
     }

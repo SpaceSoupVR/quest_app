@@ -4,6 +4,7 @@ use std::path::Path;
 
 use glam::{Quat, Vec3};
 
+use space_soup_engine::rigid_physics::PhysicsWorld;
 use space_soup_engine::{GripKind, GripPointDef, Hand, Manifest, PartAnimationDef, Scene};
 use space_soup_protocol::{WireHeldGrip, WireObjectBounds};
 
@@ -40,13 +41,22 @@ pub struct StaticScene {
     pub scene_name: String,
     pub grip_points: HashMap<String, Vec<GripPointDef>>,
     pub part_animations: HashMap<String, Vec<PartAnimationDef>>,
+    // Client-local physics world (static rigid_body colliders only -- walls/floor/ramps),
+    // rebuilt from the same scene JSON the server loads. Lets the client run its own wall
+    // and ground collision for player movement without depending on the server (see
+    // movement::step_locomotion) -- the same PhysicsWorld type and rebuild() call the
+    // server uses, so client and server never disagree about where geometry is.
+    pub physics: PhysicsWorld,
 }
 
 impl StaticScene {
     pub fn load(game_dir: &Path, scene_name: &str) -> Self {
         let path = Manifest::scene_path(game_dir, scene_name);
+        let mut physics = PhysicsWorld::new();
         let (grip_points, part_animations) = match Scene::load(&path) {
             Ok(scene) => {
+                physics.rebuild(&scene, game_dir);
+
                 let mut grip_points = HashMap::new();
                 let mut part_animations = HashMap::new();
                 let total_objs = scene.objects.len();
@@ -87,6 +97,7 @@ impl StaticScene {
             scene_name: scene_name.to_string(),
             grip_points,
             part_animations,
+            physics,
         }
     }
 }

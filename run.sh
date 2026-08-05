@@ -68,7 +68,7 @@ fi
 
 if [ -z "${WANT_EDITOR+x}" ]; then
     WANT_EDITOR=false
-    if $WANT_DEPLOY; then
+    if $WANT_DEPLOY && [ -d "$DEBUG_VIEWER_DIR" ]; then
         WANT_EDITOR=true
         read -r -p "Do you want the scene editor? [Y/n] " editor_reply
         case "$editor_reply" in

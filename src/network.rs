@@ -39,6 +39,8 @@ impl Default for PendingInput {
                 teleport_pressed: false,
                 teleport_released: false,
                 teleport_hand: WireHand::Right,
+                player_offset: None,
+                player_yaw: None,
             },
             rig: WirePlayerRig::default(),
             teleport_target: None,

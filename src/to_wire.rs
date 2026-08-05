@@ -109,6 +109,9 @@ pub fn locomotion_input_to_wire(input: &LocomotionInput) -> WireLocomotionInput 
         teleport_pressed: input.teleport_pressed,
         teleport_released: input.teleport_released,
         teleport_hand: hand_to_wire(input.teleport_hand),
+        // Filled in by movement::step_locomotion after the local sim step.
+        player_offset: None,
+        player_yaw: None,
     }
 }
 

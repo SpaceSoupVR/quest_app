@@ -1,0 +1,264 @@
+#![cfg(target_os = "android")]
+
+use glam::{Mat4, Quat, Vec3};
+use log::{info, warn};
+use std::collections::HashMap;
+
+use space_soup::renderer::GltfMesh;
+use space_soup::ControllerState;
+use space_soup_engine::{ButtonPress, Hand, InputFrame, PartDriver, PlayerRig};
+use space_soup_protocol::{WireRenderMesh, WireWorld};
+
+use crate::grab_detect;
+use crate::grab_detect::LiveObjects;
+
+pub(crate) fn part_animation_blend(driver: PartDriver, hand: Hand, cs: &ControllerState) -> f32 {
+    match (driver, hand) {
+        (PartDriver::HoldTrigger, Hand::Left) => cs.l_trigger,
+        (PartDriver::HoldTrigger, Hand::Right) => cs.r_trigger,
+        (PartDriver::HoldGrip, Hand::Left) => cs.l_squeeze,
+        (PartDriver::HoldGrip, Hand::Right) => cs.r_squeeze,
+        (PartDriver::HandPull | PartDriver::Manual, _) => 0.0,
+    }
+}
+
+pub(crate) const PART_PULL_GRAB_RANGE: f32 = 0.09;
+
+pub(crate) fn hand_idx(hand: Hand) -> usize {
+    match hand {
+        Hand::Left => 0,
+        Hand::Right => 1,
+    }
+}
+
+pub(crate) struct PullSession {
+    pub(crate) object_id: String,
+    pub(crate) clip: String,
+    pub(crate) grab_local: Vec3,
+    pub(crate) axis_model: Vec3,
+    pub(crate) travel: f32,
+    pub(crate) b0: f32,
+    pub(crate) blend: f32,
+}
+
+pub(crate) fn try_start_pull(
+    object_id: &str,
+    gun_world: Mat4,
+    pull_hand_pos: Vec3,
+    static_scene: &grab_detect::StaticScene,
+    mesh_cache: &HashMap<String, (GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform)>,
+) -> Option<PullSession> {
+    let parts = static_scene.part_animations.get(object_id)?;
+    let (mesh, _) = mesh_cache.get(object_id)?;
+    let skin = mesh.skin.as_ref()?;
+    let hand_local = gun_world.inverse().transform_point3(pull_hand_pos);
+    for pa in parts.iter().filter(|pa| pa.driver == PartDriver::HandPull) {
+        let Some(clip_idx) = skin.animation_index(&pa.clip) else {
+            warn!("HandPull '{object_id}': clip '{}' not found in skin", pa.clip);
+            continue;
+        };
+        let Some((anchor_model, axis_model, travel)) = skin.pull_geometry(clip_idx) else {
+            warn!("HandPull '{object_id}': clip '{}' has no pull_geometry", pa.clip);
+            continue;
+        };
+        let anchor_world = gun_world.transform_point3(anchor_model);
+        let dist = pull_hand_pos.distance(anchor_world);
+        info!(
+            "HandPull '{object_id}' clip '{}': dist={dist:.3}m (need <={PART_PULL_GRAB_RANGE:.2}) anchor_world=({:.2},{:.2},{:.2}) travel={travel:.3}",
+            pa.clip, anchor_world.x, anchor_world.y, anchor_world.z
+        );
+        if dist <= PART_PULL_GRAB_RANGE {
+            return Some(PullSession {
+                object_id: object_id.to_string(),
+                clip: pa.clip.clone(),
+                grab_local: hand_local,
+                axis_model,
+                travel,
+                b0: 0.0,
+                blend: 0.0,
+            });
+        }
+    }
+    None
+}
+
+// Grab/release/button-press detection for one frame -- reads the previous
+// frame's trigger/squeeze/button state (to detect just-pressed/just-released
+// edges) and updates it for the next frame. Also advances any in-progress
+// HandPull sessions.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_input(
+    cs: &ControllerState,
+    rig: &PlayerRig,
+    world: &Option<WireWorld>,
+    meshes_src: &[WireRenderMesh],
+    static_scene: &grab_detect::StaticScene,
+    mesh_cache: &HashMap<String, (GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform)>,
+    live_objects: &LiveObjects,
+    pull_sessions: &mut [Option<PullSession>; 2],
+    prev_r_trigger: &mut bool,
+    prev_l_trigger: &mut bool,
+    prev_r_squeeze: &mut bool,
+    prev_l_squeeze: &mut bool,
+    prev_btn_a: &mut bool,
+    prev_btn_b: &mut bool,
+    prev_btn_x: &mut bool,
+    prev_btn_y: &mut bool,
+) -> InputFrame {
+    let mut input = InputFrame::default();
+
+    let r_trigger_down = cs.r_trigger > 0.5 || cs.r_squeeze > 0.5;
+    let l_trigger_down = cs.l_trigger > 0.5 || cs.l_squeeze > 0.5;
+    let r_trigger_only = cs.r_trigger > 0.5;
+    let l_trigger_only = cs.l_trigger > 0.5;
+
+    let held_gun_world = |hand: Hand| -> Option<(String, Mat4)> {
+        let held = world.as_ref().and_then(|w| match hand {
+            Hand::Left => w.left_hand_held.as_ref(),
+            Hand::Right => w.right_hand_held.as_ref(),
+        })?;
+        let hand_tf = rig.hand_grip(hand);
+        let hand_mat = Mat4::from_rotation_translation(hand_tf.rotation, hand_tf.position);
+        let offset_mat = Mat4::from_rotation_translation(
+            Quat::from_array(held.point_local_rot),
+            Vec3::from(held.point_local_pos),
+        );
+        let (_, rot, pos) = (hand_mat * offset_mat.inverse()).to_scale_rotation_translation();
+        let scale = meshes_src
+            .iter()
+            .find(|m| m.id == held.object_id)
+            .map(|m| Vec3::from(m.scale))
+            .unwrap_or(Vec3::ONE);
+        Some((held.object_id.clone(), Mat4::from_scale_rotation_translation(scale, rot, pos)))
+    };
+
+    if r_trigger_down && !(*prev_r_trigger || *prev_r_squeeze) {
+        let p = rig.hand_grip(Hand::Right).position;
+        let pull = held_gun_world(Hand::Left)
+            .and_then(|(oid, gw)| try_start_pull(&oid, gw, p, static_scene, mesh_cache));
+        if let Some(session) = pull {
+            info!("GRAB R: started HandPull on '{}'", session.object_id);
+            pull_sessions[hand_idx(Hand::Right)] = Some(session);
+        } else if let Some((id, point)) =
+            grab_detect::nearest_grip_point_to(live_objects, static_scene, p, r_trigger_only, Hand::Right)
+        {
+            info!("GRAB R: '{id}' via grip point '{point}'");
+            input.grabbed.push((id, Hand::Right, point));
+        } else if let Some(id) = grab_detect::nearest_object_to(live_objects, p) {
+            info!("GRAB R: '{id}' via proximity (no grip point)");
+            input.grabbed.push((id, Hand::Right, String::new()));
+        } else {
+            info!(
+                "GRAB R: pressed, nothing in range (hand {:.2},{:.2},{:.2}; {} live objs)",
+                p.x, p.y, p.z, live_objects.by_id.len()
+            );
+        }
+    }
+    if !r_trigger_down && (*prev_r_trigger || *prev_r_squeeze) {
+        if pull_sessions[hand_idx(Hand::Right)].is_none() {
+            if let Some(id) =
+                grab_detect::nearest_object_to(live_objects, rig.hand_grip(Hand::Right).position)
+            {
+                input.released.push((id, Hand::Right));
+            }
+        }
+    }
+    if l_trigger_down && !(*prev_l_trigger || *prev_l_squeeze) {
+        let p = rig.hand_grip(Hand::Left).position;
+        let pull = held_gun_world(Hand::Right)
+            .and_then(|(oid, gw)| try_start_pull(&oid, gw, p, static_scene, mesh_cache));
+        if let Some(session) = pull {
+            info!("GRAB L: started HandPull on '{}'", session.object_id);
+            pull_sessions[hand_idx(Hand::Left)] = Some(session);
+        } else if let Some((id, point)) =
+            grab_detect::nearest_grip_point_to(live_objects, static_scene, p, l_trigger_only, Hand::Left)
+        {
+            info!("GRAB L: '{id}' via grip point '{point}'");
+            input.grabbed.push((id, Hand::Left, point));
+        } else if let Some(id) = grab_detect::nearest_object_to(live_objects, p) {
+            info!("GRAB L: '{id}' via proximity (no grip point)");
+            input.grabbed.push((id, Hand::Left, String::new()));
+        } else {
+            info!(
+                "GRAB L: pressed, nothing in range (hand {:.2},{:.2},{:.2}; {} live objs)",
+                p.x, p.y, p.z, live_objects.by_id.len()
+            );
+        }
+    }
+    if !l_trigger_down && (*prev_l_trigger || *prev_l_squeeze) {
+        if pull_sessions[hand_idx(Hand::Left)].is_none() {
+            if let Some(id) =
+                grab_detect::nearest_object_to(live_objects, rig.hand_grip(Hand::Left).position)
+            {
+                input.released.push((id, Hand::Left));
+            }
+        }
+    }
+
+    for hand in [Hand::Left, Hand::Right] {
+        let idx = hand_idx(hand);
+        let Some(session) = pull_sessions[idx].as_mut() else {
+            continue;
+        };
+        let still_pulling = match hand {
+            Hand::Left => l_trigger_down,
+            Hand::Right => r_trigger_down,
+        };
+        let gun = held_gun_world(Hand::Left)
+            .filter(|(oid, _)| *oid == session.object_id)
+            .or_else(|| held_gun_world(Hand::Right).filter(|(oid, _)| *oid == session.object_id));
+        let Some((_, gun_world)) = gun else {
+            pull_sessions[idx] = None;
+            continue;
+        };
+        if !still_pulling {
+            pull_sessions[idx] = None;
+            continue;
+        }
+        let hand_local = gun_world.inverse().transform_point3(rig.hand_grip(hand).position);
+        let pulled = (hand_local - session.grab_local).dot(session.axis_model) / session.travel;
+        session.blend = (session.b0 + pulled).clamp(0.0, 1.0);
+    }
+
+    {
+        let held_r = grab_detect::held_object_id(
+            world.as_ref().and_then(|w| w.right_hand_held.as_ref()),
+            live_objects,
+            rig.hand_grip(Hand::Right).position,
+        );
+        let held_l = grab_detect::held_object_id(
+            world.as_ref().and_then(|w| w.left_hand_held.as_ref()),
+            live_objects,
+            rig.hand_grip(Hand::Left).position,
+        );
+        let presses = [
+            ("btn_a", cs.btn_a && !*prev_btn_a, held_r.clone()),
+            ("btn_b", cs.btn_b && !*prev_btn_b, held_r.clone()),
+            ("btn_x", cs.btn_x && !*prev_btn_x, held_l.clone()),
+            ("btn_y", cs.btn_y && !*prev_btn_y, held_l.clone()),
+            ("trigger", cs.r_trigger > 0.5 && !*prev_r_trigger, held_r.clone()),
+            ("trigger", cs.l_trigger > 0.5 && !*prev_l_trigger, held_l.clone()),
+            ("grip", cs.r_squeeze > 0.5 && !*prev_r_squeeze, held_r),
+            ("grip", cs.l_squeeze > 0.5 && !*prev_l_squeeze, held_l),
+        ];
+        for (button, pressed, object_id) in presses {
+            if pressed {
+                input.button_presses.push(ButtonPress {
+                    button: button.to_string(),
+                    object_id,
+                });
+            }
+        }
+    }
+
+    *prev_r_trigger = cs.r_trigger > 0.5;
+    *prev_l_trigger = cs.l_trigger > 0.5;
+    *prev_r_squeeze = cs.r_squeeze > 0.5;
+    *prev_l_squeeze = cs.l_squeeze > 0.5;
+    *prev_btn_a = cs.btn_a;
+    *prev_btn_b = cs.btn_b;
+    *prev_btn_x = cs.btn_x;
+    *prev_btn_y = cs.btn_y;
+
+    input
+}

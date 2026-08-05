@@ -1,14 +1,15 @@
 # NDK config for building quest_app to aarch64-linux-android.
 #
 # This [env] block keeps getting lost across branches; without it a fresh physx-sys
-# compile panics with `environment variable "ANDROID_NDK_ROOT" has not been set`. NDK r30
+# compile panics with `environment variable "ANDROID_NDK_ROOT" has not been set`. The NDK
 # ships only versioned clang wrappers, so CC/CXX/AR must be spelled out. Not `force`d, so
-# run.sh's exported values still win when it sets them.
+# run.sh's exported values still win when it sets them. NOTE: these are machine-local
+# absolute paths -- update the NDK version/home if you build on a different machine.
 [target.aarch64-linux-android]
-linker = "/Users/iz3xypug/Library/Android/sdk/ndk/30.0.14904198/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android30-clang"
+linker = "/Users/frank/Library/Android/sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android30-clang"
 
 [env]
-ANDROID_NDK_ROOT = "/Users/iz3xypug/Library/Android/sdk/ndk/30.0.14904198"
-"CC_aarch64-linux-android" = "/Users/iz3xypug/Library/Android/sdk/ndk/30.0.14904198/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android30-clang"
-"CXX_aarch64-linux-android" = "/Users/iz3xypug/Library/Android/sdk/ndk/30.0.14904198/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android30-clang++"
-"AR_aarch64-linux-android" = "/Users/iz3xypug/Library/Android/sdk/ndk/30.0.14904198/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
+ANDROID_NDK_ROOT = "/Users/frank/Library/Android/sdk/ndk/26.3.11579264"
+"CC_aarch64-linux-android" = "/Users/frank/Library/Android/sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android30-clang"
+"CXX_aarch64-linux-android" = "/Users/frank/Library/Android/sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android30-clang++"
+"AR_aarch64-linux-android" = "/Users/frank/Library/Android/sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
