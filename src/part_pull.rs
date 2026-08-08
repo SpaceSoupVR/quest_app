@@ -28,6 +28,45 @@ pub(crate) const BUTTON_THRESHOLD: f32 = 0.5;
 
 pub(crate) const PART_PULL_GRAB_RANGE: f32 = 0.09;
 
+/// The blend each of an object's part-animation clips sits at this frame.
+///
+/// One implementation, used twice: render_prep poses the skeleton with it, and
+/// handle_input reports it upward so the engine can evaluate blend-threshold
+/// triggers. Computing it twice would let the pose the player sees and the
+/// trigger that fires disagree, which is the kind of desync nobody would think
+/// to look for.
+///
+/// The client owns this because it is the only side that can compute it -- a
+/// HandPull blend comes from where the hand is relative to the posed part.
+pub(crate) fn blends_for_object(
+    object_id: &str,
+    parts: &[space_soup_engine::PartAnimationDef],
+    hand: Hand,
+    cs: &ControllerState,
+    pull_sessions: &[Option<PullSession>; 2],
+    manual: Option<&HashMap<String, f32>>,
+) -> HashMap<String, f32> {
+    parts
+        .iter()
+        .map(|pa| {
+            let raw = match pa.driver {
+                PartDriver::HandPull => pull_sessions
+                    .iter()
+                    .flatten()
+                    .find(|s| s.object_id == object_id && s.clip == pa.clip)
+                    .map(|s| s.blend)
+                    .unwrap_or(0.0),
+                PartDriver::Manual => {
+                    manual.and_then(|m| m.get(&pa.clip).copied()).unwrap_or(0.0)
+                }
+                _ => part_animation_blend(pa.driver, hand, cs),
+            };
+            (pa.clip.clone(), pa.easing.apply(raw))
+        })
+        .collect()
+}
+
+
 pub(crate) fn hand_idx(hand: Hand) -> usize {
     match hand {
         Hand::Left => 0,
@@ -261,6 +300,27 @@ pub(crate) fn handle_input(
                     .button_releases
                     .push(ButtonPress::new(button, object_id, hand));
             }
+        }
+    }
+
+    // Report every held object's part blends so the engine can evaluate
+    // blend-threshold triggers. Those actions -- spawning a magazine, handing it
+    // to physics -- are authoritative world state, so the decision cannot live on
+    // a headset even though only a headset can compute the input to it.
+    for hand in [Hand::Left, Hand::Right] {
+        let held = world.as_ref().and_then(|w| match hand {
+            Hand::Left => w.left_hand_held.as_ref(),
+            Hand::Right => w.right_hand_held.as_ref(),
+        });
+        let Some(held) = held else { continue };
+        let Some(parts) = static_scene.part_animations.get(&held.object_id) else { continue };
+        let manual = meshes_src
+            .iter()
+            .find(|m| m.id == held.object_id)
+            .map(|m| &m.manual_part_blends);
+        let blends = blends_for_object(&held.object_id, parts, hand, cs, pull_sessions, manual);
+        if !blends.is_empty() {
+            input.part_blends.insert(held.object_id.clone(), blends);
         }
     }
 
