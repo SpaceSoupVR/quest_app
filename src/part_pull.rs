@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use space_soup::renderer::GltfMesh;
 use space_soup::ControllerState;
-use space_soup_engine::{ButtonPress, Hand, InputFrame, PartDriver, PlayerRig};
+use space_soup_engine::{ButtonPress, Hand, InputAxes, InputFrame, PartDriver, PlayerRig};
 use space_soup_protocol::{WireRenderMesh, WireWorld};
 
 use crate::grab_detect;
@@ -21,6 +21,10 @@ pub(crate) fn part_animation_blend(driver: PartDriver, hand: Hand, cs: &Controll
         (PartDriver::HandPull | PartDriver::Manual, _) => 0.0,
     }
 }
+
+/// Analog pull at which trigger/grip counts as a button edge. Scripts wanting a
+/// different break point read the raw value with get_trigger()/get_grip().
+pub(crate) const BUTTON_THRESHOLD: f32 = 0.5;
 
 pub(crate) const PART_PULL_GRAB_RANGE: f32 = 0.09;
 
@@ -231,25 +235,45 @@ pub(crate) fn handle_input(
             live_objects,
             rig.hand_grip(Hand::Left).position,
         );
-        let presses = [
-            ("btn_a", cs.btn_a && !*prev_btn_a, held_r.clone()),
-            ("btn_b", cs.btn_b && !*prev_btn_b, held_r.clone()),
-            ("btn_x", cs.btn_x && !*prev_btn_x, held_l.clone()),
-            ("btn_y", cs.btn_y && !*prev_btn_y, held_l.clone()),
-            ("trigger", cs.r_trigger > 0.5 && !*prev_r_trigger, held_r.clone()),
-            ("trigger", cs.l_trigger > 0.5 && !*prev_l_trigger, held_l.clone()),
-            ("grip", cs.r_squeeze > 0.5 && !*prev_r_squeeze, held_r),
-            ("grip", cs.l_squeeze > 0.5 && !*prev_l_squeeze, held_l),
+        // (button, is-down-now, was-down-last-frame, which hand, held object).
+        // Both edges are derived from the same pair so a press and its release
+        // can never disagree about which object or hand they belong to.
+        let edges = [
+            ("btn_a", cs.btn_a, *prev_btn_a, Hand::Right, held_r.clone()),
+            ("btn_b", cs.btn_b, *prev_btn_b, Hand::Right, held_r.clone()),
+            ("btn_x", cs.btn_x, *prev_btn_x, Hand::Left, held_l.clone()),
+            ("btn_y", cs.btn_y, *prev_btn_y, Hand::Left, held_l.clone()),
+            ("trigger", cs.r_trigger > BUTTON_THRESHOLD, *prev_r_trigger, Hand::Right, held_r.clone()),
+            ("trigger", cs.l_trigger > BUTTON_THRESHOLD, *prev_l_trigger, Hand::Left, held_l.clone()),
+            ("grip", cs.r_squeeze > BUTTON_THRESHOLD, *prev_r_squeeze, Hand::Right, held_r),
+            ("grip", cs.l_squeeze > BUTTON_THRESHOLD, *prev_l_squeeze, Hand::Left, held_l),
         ];
-        for (button, pressed, object_id) in presses {
-            if pressed {
-                input.button_presses.push(ButtonPress {
-                    button: button.to_string(),
-                    object_id,
-                });
+        for (button, down, was_down, hand, object_id) in edges {
+            if down && !was_down {
+                input
+                    .button_presses
+                    .push(ButtonPress::new(button, object_id, hand));
+            } else if !down && was_down {
+                // The up edge. Without it a script can see a trigger pulled but has
+                // nothing telling it the trigger was let go -- there is no
+                // button-release event at all, and `on_release` means grab release.
+                input
+                    .button_releases
+                    .push(ButtonPress::new(button, object_id, hand));
             }
         }
     }
+
+    // Continuous values, every frame, so a script can poll what an edge cannot say:
+    // how hard, and still held.
+    input.axes = InputAxes {
+        l_trigger: cs.l_trigger,
+        r_trigger: cs.r_trigger,
+        l_grip: cs.l_squeeze,
+        r_grip: cs.r_squeeze,
+        l_stick: [cs.l_stick.x, cs.l_stick.y],
+        r_stick: [cs.r_stick.x, cs.r_stick.y],
+    };
 
     *prev_r_trigger = cs.r_trigger > 0.5;
     *prev_l_trigger = cs.l_trigger > 0.5;
