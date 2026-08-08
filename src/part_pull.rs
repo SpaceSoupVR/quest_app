@@ -12,13 +12,32 @@ use space_soup_protocol::{WireRenderMesh, WireWorld};
 use crate::grab_detect;
 use crate::grab_detect::LiveObjects;
 
-pub(crate) fn part_animation_blend(driver: PartDriver, hand: Hand, cs: &ControllerState) -> f32 {
+pub(crate) fn part_animation_blend(
+    driver: PartDriver,
+    hand: Hand,
+    cs: &ControllerState,
+    elapsed: f32,
+) -> f32 {
     match (driver, hand) {
         (PartDriver::HoldTrigger, Hand::Left) => cs.l_trigger,
         (PartDriver::HoldTrigger, Hand::Right) => cs.r_trigger,
         (PartDriver::HoldGrip, Hand::Left) => cs.l_squeeze,
         (PartDriver::HoldGrip, Hand::Right) => cs.r_squeeze,
         (PartDriver::HandPull | PartDriver::Manual, _) => 0.0,
+        // A triangle wave: out and back, repeatedly, for as long as the trigger
+        // is held. Triangle rather than a sine so the bolt spends no time
+        // loitering at full travel -- a real one turns around immediately.
+        (PartDriver::Cyclic { cycles_per_second }, h) => {
+            let held = match h {
+                Hand::Left => cs.l_trigger,
+                Hand::Right => cs.r_trigger,
+            };
+            if held <= BUTTON_THRESHOLD || cycles_per_second <= 0.0 {
+                return 0.0;
+            }
+            let phase = (elapsed * cycles_per_second).fract();
+            if phase < 0.5 { phase * 2.0 } else { 2.0 - phase * 2.0 }
+        }
     }
 }
 
@@ -45,6 +64,7 @@ pub(crate) fn blends_for_object(
     cs: &ControllerState,
     pull_sessions: &[Option<PullSession>; 2],
     manual: Option<&HashMap<String, f32>>,
+    elapsed: f32,
 ) -> HashMap<String, f32> {
     parts
         .iter()
@@ -59,7 +79,7 @@ pub(crate) fn blends_for_object(
                 PartDriver::Manual => {
                     manual.and_then(|m| m.get(&pa.clip).copied()).unwrap_or(0.0)
                 }
-                _ => part_animation_blend(pa.driver, hand, cs),
+                _ => part_animation_blend(pa.driver, hand, cs, elapsed),
             };
             (pa.clip.clone(), pa.easing.apply(raw))
         })
@@ -147,6 +167,10 @@ pub(crate) fn handle_input(
     prev_btn_b: &mut bool,
     prev_btn_x: &mut bool,
     prev_btn_y: &mut bool,
+    // Seconds since app start, for time-driven clips (PartDriver::Cyclic).
+    elapsed: f32,
+    // Last frame's posed part transforms, published by render_prep.
+    part_transforms: &HashMap<String, HashMap<String, ([f32; 3], [f32; 4])>>,
 ) -> InputFrame {
     let mut input = InputFrame::default();
 
@@ -318,11 +342,13 @@ pub(crate) fn handle_input(
             .iter()
             .find(|m| m.id == held.object_id)
             .map(|m| &m.manual_part_blends);
-        let blends = blends_for_object(&held.object_id, parts, hand, cs, pull_sessions, manual);
+        let blends = blends_for_object(&held.object_id, parts, hand, cs, pull_sessions, manual, elapsed);
         if !blends.is_empty() {
             input.part_blends.insert(held.object_id.clone(), blends);
         }
     }
+
+    input.part_transforms = part_transforms.clone();
 
     // Continuous values, every frame, so a script can poll what an edge cannot say:
     // how hard, and still held.

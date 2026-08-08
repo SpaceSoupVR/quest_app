@@ -149,6 +149,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         (Vec<String>, GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform),
     > = HashMap::new();
     let mut requested_mesh_ids: HashSet<String> = HashSet::new();
+    // Posed part transforms published by the previous frame's render pass, sent
+    // up so the engine can resolve part-anchored sockets and spawn detached parts
+    // where the part actually is.
+    let mut part_transforms: HashMap<String, HashMap<String, ([f32; 3], [f32; 4])>> =
+        HashMap::new();
 
     let mut avatar_mesh_cache: HashMap<
         PlayerId,
@@ -365,6 +370,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &mut prev_btn_b,
             &mut prev_btn_x,
             &mut prev_btn_y,
+            sim_time,
+            &part_transforms,
         );
 
         movement::step_locomotion(
@@ -451,6 +458,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 offset,
                 yaw_inv,
                 head_pos,
+                sim_time,
+                &mut part_transforms,
             );
 
         let sounds_src = world.as_ref().map(|w| w.sounds.as_slice()).unwrap_or(&[]);
