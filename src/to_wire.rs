@@ -108,6 +108,7 @@ pub fn input_frame_to_wire(input: &InputFrame) -> WireInputFrame {
         // is relative to the posed part -- but the actions they fire (spawning a
         // magazine, handing it to physics) are authoritative world state.
         part_blends: input.part_blends.clone(),
+        part_transforms: input.part_transforms.clone(),
     }
 }
 
