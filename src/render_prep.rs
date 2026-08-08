@@ -30,6 +30,7 @@ pub(crate) fn build_render_lists<'a>(
     lights_src: &[WireRenderLight],
     meshes_src: &'a [WireRenderMesh],
     mesh_cache: &'a mut HashMap<String, (GltfMesh, ModelUniform)>,
+    hidden_cache: &'a mut HashMap<String, (Vec<String>, GltfMesh, ModelUniform)>,
     avatar_mesh_cache: &'a HashMap<PlayerId, (GltfMesh, ModelUniform)>,
     local_direct_mesh: &'a Option<(GltfMesh, ModelUniform)>,
     local_player: PlayerId,
@@ -87,25 +88,16 @@ pub(crate) fn build_render_lists<'a>(
                     .iter()
                     .find(|m| m.id == held.object_id)
                     .map(|m| &m.manual_part_blends);
+                // Same helper handle_input reports upward, so the pose the player
+                // sees and the blend a trigger fires on cannot drift apart.
+                let blends = crate::part_pull::blends_for_object(
+                    &held.object_id, parts, hand, cs, pull_sessions, manual_blends,
+                );
                 let targets: Vec<(usize, f32)> = parts
                     .iter()
                     .filter_map(|pa| {
                         let clip_idx = skin.animation_index(&pa.clip)?;
-                        let raw = if pa.driver == PartDriver::HandPull {
-                            pull_sessions
-                                .iter()
-                                .flatten()
-                                .find(|s| s.object_id == held.object_id && s.clip == pa.clip)
-                                .map(|s| s.blend)
-                                .unwrap_or(0.0)
-                        } else if pa.driver == PartDriver::Manual {
-                            manual_blends
-                                .and_then(|m| m.get(&pa.clip).copied())
-                                .unwrap_or(0.0)
-                        } else {
-                            part_animation_blend(pa.driver, hand, cs)
-                        };
-                        Some((clip_idx, pa.easing.apply(raw)))
+                        Some((clip_idx, blends.get(&pa.clip).copied().unwrap_or(0.0)))
                     })
                     .collect();
                 if !targets.is_empty() {
@@ -116,10 +108,47 @@ pub(crate) fn build_render_lists<'a>(
         }
     }
 
+    // Parts an object hides are removed from the geometry, using the same
+    // joint-exclusion path that hides the local player's own head. That rebuilds
+    // vertex and index buffers, so it is cached and only redone when the hidden
+    // set actually changes -- doing it per frame would be a performance fault
+    // wearing a feature's clothes.
+    for rm in meshes_src {
+        if rm.hidden_parts.is_empty() {
+            hidden_cache.remove(&rm.id);
+            continue;
+        }
+        let already_current = hidden_cache
+            .get(&rm.id)
+            .is_some_and(|(built_for, _, _)| built_for == &rm.hidden_parts);
+        if already_current {
+            continue;
+        }
+        let Some((base, _)) = mesh_cache.get(&rm.id) else { continue };
+        let Some(skin) = base.skin.as_ref() else { continue };
+        let excluded: Vec<usize> = rm
+            .hidden_parts
+            .iter()
+            .filter_map(|name| skin.joint_names.iter().position(|j| j == name))
+            .collect();
+        if excluded.is_empty() {
+            continue;
+        }
+        let mut variant = base.clone_with_independent_skin_excluding_joints(renderer.device(), &excluded);
+        variant.create_skin_bind_group(renderer.device(), renderer.skin_joint_layout());
+        hidden_cache.insert(
+            rm.id.clone(),
+            (rm.hidden_parts.clone(), variant, renderer.create_skinned_model_uniform()),
+        );
+    }
+
     let mesh_instances: Vec<MeshInstance> = meshes_src
         .iter()
         .filter(|rm| Vec3::from(rm.position).distance(head_pos) < MAX_RENDER_DIST)
         .filter_map(|rm| {
+            if let Some((_, mesh, model)) = hidden_cache.get(&rm.id) {
+                return Some(MeshInstance { mesh, model, lightmap_key: Some(rm.id.as_str()) });
+            }
             let (mesh, model) = mesh_cache.get(&rm.id)?;
             Some(MeshInstance { mesh, model, lightmap_key: Some(rm.id.as_str()) })
         })

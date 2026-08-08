@@ -141,6 +141,13 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         String,
         (GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform),
     > = HashMap::new();
+    // Geometry variants with hidden parts removed, keyed by object id and tagged
+    // with the hidden set they were built for. Rebuilding one costs new vertex and
+    // index buffers, so it happens only when that set changes.
+    let mut hidden_part_meshes: HashMap<
+        String,
+        (Vec<String>, GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform),
+    > = HashMap::new();
     let mut requested_mesh_ids: HashSet<String> = HashSet::new();
 
     let mut avatar_mesh_cache: HashMap<
@@ -431,6 +438,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 lights_src,
                 meshes_src,
                 &mut mesh_cache,
+                &mut hidden_part_meshes,
                 &avatar_mesh_cache,
                 &local_direct_mesh,
                 local_player,
