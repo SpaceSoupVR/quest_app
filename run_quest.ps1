@@ -13,8 +13,10 @@
       * ./gradlew -> .\gradlew.bat
       * the NDK's prebuilt toolchain is windows-x86_64, not darwin-x86_64, and its
         clang wrappers are .cmd files
-      * .cargo/config.toml hardcodes another developer's macOS NDK paths; its [env]
-        block is not `force`d, so exporting our own values overrides it
+      * the toolchain comes from here, not .cargo/config.toml, which no longer
+        holds absolute paths. It used to pin a macOS NDK, and exporting these was
+        believed to override it -- it did not, because cargo's [env] used the
+        hyphenated names and these are underscored, which are different variables
       * `nc -z` -> System.Net.Sockets.TcpClient
       * `echo url | adb shell "cat > file"` -> write a temp file and adb push it
 
@@ -24,6 +26,7 @@
     passes them through untouched.
 #>
 param(
+    [switch]$PrintEnv,
     [switch]$Clean,
     [switch]$NoDeploy,
     [switch]$NoDashboard,
@@ -115,9 +118,11 @@ if (-not $NdkHome) {
 }
 
 # --- Cross-compile environment ----------------------------------------------
-# .cargo/config.toml pins another developer's macOS NDK paths. Its [env] block is
-# not `force`d, so real environment variables take precedence -- set ours here or
-# physx-sys fails with `environment variable "ANDROID_NDK_ROOT" has not been set`,
+# The toolchain lives here. .cargo/config.toml deliberately holds no absolute
+# paths any more -- it used to pin a macOS NDK whose [env] names were hyphenated
+# while these are underscored, so these never actually won and cc-rs resolved a
+# darwin path on Windows. Without ANDROID_NDK_ROOT physx-sys fails with
+# `environment variable "ANDROID_NDK_ROOT" has not been set`,
 # or the link step dies looking for a darwin-x86_64 toolchain that does not exist.
 $Prebuilt = Join-Path $NdkHome 'toolchains\llvm\prebuilt\windows-x86_64'
 $NdkBin   = Join-Path $Prebuilt 'bin'
@@ -148,6 +153,19 @@ $env:CC_aarch64_linux_android                     = $Clang
 $env:CXX_aarch64_linux_android                    = $ClangPP
 $env:AR_aarch64_linux_android                     = $Ar
 $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER    = $Clang
+
+# -PrintEnv: emit the detected toolchain and stop, so cargo can be driven
+# directly without anyone hand-copying paths that then go stale.
+#   . ./run_quest.ps1 -PrintEnv
+if ($PrintEnv) {
+    Write-Output "`$env:ANDROID_NDK_ROOT = '$NdkHome'"
+    Write-Output "`$env:ANDROID_NDK_HOME = '$NdkHome'"
+    Write-Output "`$env:CC_aarch64_linux_android = '$Clang'"
+    Write-Output "`$env:CXX_aarch64_linux_android = '$ClangPP'"
+    Write-Output "`$env:AR_aarch64_linux_android = '$Ar'"
+    Write-Output "`$env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = '$Clang'"
+    exit 0
+}
 Add-PathFront $NdkBin
 
 $HostTarget = (& rustc -vV | Select-String '^host:\s*(.+)$').Matches[0].Groups[1].Value.Trim()

@@ -2,6 +2,19 @@
 
 set -e
 
+# --print-env: resolve the NDK toolchain, print it as shell exports, and stop
+# before doing any building or deploying. Lets `cargo` be driven directly
+# without anyone hand-copying paths that then go stale.
+PRINT_ENV=0
+case "${1:-}" in
+    --print-env) PRINT_ENV=1 ;;
+    -h|--help)
+        echo "usage: $0 [--print-env]"
+        echo "  --print-env  print the detected Android toolchain as shell exports and exit"
+        exit 0
+        ;;
+esac
+
 if [ -t 1 ]; then
     C_STEP=$'\033[1;36m'
     C_OK=$'\033[1;32m'
@@ -88,9 +101,18 @@ MIN_SDK=$(awk '/minSdk/ {print $2; exit}' "$QUEST_APP_DIR/android/app/build.grad
 case "$MIN_SDK" in ''|*[!0-9]*) MIN_SDK=29 ;; esac
 if [ "$MIN_SDK" -lt 24 ]; then MIN_SDK=24; fi
 
-# .cargo/config.toml pins one developer's absolute macOS NDK paths. Its [env]
-# block is deliberately not `force`d, so exporting these here overrides it and
-# the same checkout builds for everyone. Without them physx-sys panics with
+# The toolchain lives here, not in .cargo/config.toml, which deliberately holds
+# no absolute paths any more.
+#
+# It used to pin one developer's macOS NDK, and these exports were believed to
+# override it. They did not: cargo's [env] set the HYPHENATED names
+# (CC_aarch64-linux-android) while these are UNDERSCORED, which are different
+# variables -- a non-forced [env] entry only yields to a real variable of the
+# same name. So cc-rs kept resolving the macOS path on every other machine, and
+# reported it as a missing clang++.exe far downstream. cc-rs accepts either
+# spelling, so with that file cleaned out these are what take effect.
+#
+# Without ANDROID_NDK_ROOT, physx-sys panics with
 # `environment variable "ANDROID_NDK_ROOT" has not been set`.
 export ANDROID_NDK_ROOT="$NDK_HOME"
 export ANDROID_NDK_HOME="$NDK_HOME"
@@ -106,6 +128,26 @@ for tool in "$CC_aarch64_linux_android" "$CXX_aarch64_linux_android" "$AR_aarch6
     fi
 done
 detail "NDK: $NDK_HOME ($NDK_PREBUILT, API $MIN_SDK)"
+
+# Emit the discovered toolchain as shell exports, so a plain `cargo build` gets
+# the same values this script would use:  eval "$(./run.sh --print-env)"
+# Discovery has to stay in one place; duplicating these paths into a shell
+# profile is how they go stale and how absolute paths end up committed again.
+if [ "${PRINT_ENV:-0}" = "1" ]; then
+    printf 'export ANDROID_NDK_ROOT=%s
+' "$NDK_HOME"
+    printf 'export ANDROID_NDK_HOME=%s
+' "$NDK_HOME"
+    printf 'export CC_aarch64_linux_android=%s
+' "$CC_aarch64_linux_android"
+    printf 'export CXX_aarch64_linux_android=%s
+' "$CXX_aarch64_linux_android"
+    printf 'export AR_aarch64_linux_android=%s
+' "$AR_aarch64_linux_android"
+    printf 'export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=%s
+' "$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
+    exit 0
+fi
 
 cleanup() {
     tmux kill-session -t "$DASHBOARD_SESSION" 2>/dev/null || true
