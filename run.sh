@@ -81,9 +81,27 @@ if [ -z "$NDK_HOME" ] || [ ! -d "$NDK_HOME" ]; then
     # Newest NDK that actually has a toolchain for THIS host, rather than the
     # newest directory name -- a partially-installed NDK sorts highest and then
     # fails at link time with a confusing missing-compiler error.
-    for dir in $(ls -d "$SDK_HOME/ndk/"* 2>/dev/null | sort -V | tac); do
-        if [ -d "$dir/toolchains/llvm/prebuilt/$NDK_PREBUILT/bin" ]; then NDK_HOME="$dir"; break; fi
+    #
+    # Deliberately no `sort -V` and no `tac`: neither exists on macOS. Using them
+    # here made the pipeline produce nothing on a Mac, so the loop found zero
+    # candidates and the script reported "Android NDK not found" while pointing
+    # at the directory the NDK was sitting in. A portability script that is not
+    # itself portable is worse than no script -- the error blames the user's
+    # install. Ordering by dot-separated numeric fields works on BSD and GNU sort
+    # alike, and `tail -1` replaces `tac | head`.
+    candidates=""
+    for dir in "$SDK_HOME"/ndk/*; do
+        if [ -d "$dir/toolchains/llvm/prebuilt/$NDK_PREBUILT/bin" ]; then
+            candidates="$candidates$(basename "$dir")
+"
+        fi
     done
+    # Built with an explicit `if` rather than `[ ... ] && ...`: under `set -e` a
+    # trailing false test is the loop's exit status and would kill the script.
+    if [ -n "$candidates" ]; then
+        newest=$(printf '%s' "$candidates" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+        NDK_HOME="$SDK_HOME/ndk/$newest"
+    fi
 fi
 
 if [ ! -d "$NDK_HOME" ]; then
