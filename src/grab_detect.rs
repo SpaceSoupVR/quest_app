@@ -114,12 +114,30 @@ pub fn nearest_object_to(live: &LiveObjects, point: Vec3) -> Option<String> {
         .map(|(id, _)| id)
 }
 
+/// The posed transform of the part a grip rides, if it rides one.
+///
+/// `part_transforms` holds world-space poses published by render_prep last frame
+/// -- the headset is the only place a skinned pose exists. The composition
+/// itself lives on `GripPointDef` in the engine, where it is unit-tested; this
+/// is only the map lookup, which is all the client knows that the engine does
+/// not.
+pub fn part_pose(
+    gp: &GripPointDef,
+    object_id: &str,
+    part_transforms: &HashMap<String, HashMap<String, ([f32; 3], [f32; 4])>>,
+) -> Option<(Vec3, Quat)> {
+    let name = gp.part.as_ref()?;
+    let (pos, rot) = part_transforms.get(object_id)?.get(name)?;
+    Some((Vec3::from(*pos), Quat::from_array(*rot)))
+}
+
 pub fn nearest_grip_point_to(
     live: &LiveObjects,
     static_scene: &StaticScene,
     point: Vec3,
     trigger_only: bool,
     hand: Hand,
+    part_transforms: &HashMap<String, HashMap<String, ([f32; 3], [f32; 4])>>,
 ) -> Option<(String, String)> {
     static_scene
         .grip_points
@@ -128,9 +146,11 @@ pub fn nearest_grip_point_to(
             let live_c = live.by_id.get(id);
             points.iter().filter(move |gp| gp.hand == hand).filter_map(move |gp| {
                 let live_c = live_c?;
-                let obj_mat =
-                    glam::Mat4::from_rotation_translation(live_c.rotation, live_c.position);
-                let world_pos = obj_mat.transform_point3(Vec3::from(gp.local_pos));
+                let (world_pos, _) = gp.anchor_world(
+                    live_c.position,
+                    live_c.rotation,
+                    part_pose(gp, id, part_transforms),
+                );
                 let range = gp.grab_range.unwrap_or(GRAB_RANGE);
                 Some((id.clone(), gp.name.clone(), gp.kind, point.distance(world_pos), range))
             })

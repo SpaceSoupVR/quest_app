@@ -423,6 +423,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         let remotes = net.remote_players.lock().unwrap().clone();
         let bodies = avatar_render::build_bodies(local_player, &rig, &remotes);
 
+        let pull_hands = part_pull::pull_hand_poses(
+            &pull_sessions, &static_scene, &live_objects, &part_transforms,
+        );
         avatar_render::update_avatar_bodies(
             &mut renderer,
             &mut avatar_mesh_cache,
@@ -437,6 +440,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &world,
             cs,
             &bodies,
+            &pull_hands,
         );
 
         let (cuboids, lights, mesh_instances, mirror_only_mesh_instances, mirror_surface) =

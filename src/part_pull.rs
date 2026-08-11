@@ -109,6 +109,78 @@ pub(crate) struct PullSession {
     pub(crate) travel: f32,
     pub(crate) b0: f32,
     pub(crate) blend: f32,
+    /// Grip point the pulling hand is posed from, from the clip's `grip_point`.
+    /// Poses the hand only -- a pull is not an attachment, so the object does
+    /// not follow this hand.
+    pub(crate) grip_point: Option<String>,
+}
+
+/// The authored grip a hand is posing from while it pulls a part.
+///
+/// A HandPull drives its blend from the hand's position but leaves the hand
+/// itself in whatever pose it had -- an open palm dragging a charging handle
+/// across the receiver. This is what gives that hand a real grip: the authored
+/// finger curl, and a transform on the part rather than wherever the player's
+/// controller happens to be.
+///
+/// Returns None when the hand is not pulling, or when the clip named no grip
+/// point. That is the behaviour from before `grip_point` existed, so every clip
+/// authored to date is unaffected.
+pub(crate) fn pull_grip<'a>(
+    pull_sessions: &'a [Option<PullSession>; 2],
+    static_scene: &'a grab_detect::StaticScene,
+    hand: Hand,
+) -> Option<(&'a str, &'a space_soup_engine::GripPointDef)> {
+    let session = pull_sessions[hand_idx(hand)].as_ref()?;
+    let name = session.grip_point.as_deref()?;
+    let gp = static_scene
+        .grip_points
+        .get(&session.object_id)?
+        .iter()
+        .find(|gp| gp.name == name)?;
+    Some((session.object_id.as_str(), gp))
+}
+
+/// A pulling hand, resolved to everything the avatar renderer needs.
+///
+/// Resolved here rather than inside the renderer so that avatar_render stays a
+/// renderer: it draws the hand it is given and knows nothing about pulls, grip
+/// points or part poses.
+pub(crate) struct PullHandPose {
+    pub(crate) position: Vec3,
+    pub(crate) rotation: Quat,
+    pub(crate) finger_curl: HashMap<String, f32>,
+}
+
+/// Where each pulling hand is drawn: on the part it is pulling.
+///
+/// The hand's *tracked* position still drives the blend, so the part follows the
+/// player exactly as before -- only the drawn hand is moved, onto the handle it
+/// is holding. Without this the hand slides off the part as the part travels,
+/// because the part moves along its own axis and the controller does not.
+///
+/// The cost is that a player whose hand wanders far off the handle sees it stay
+/// glued. That is the right trade for a 3 cm charging-handle stroke, and it is
+/// opt-in per clip -- a clip with no `grip_point` gets None and is untouched.
+pub(crate) fn pull_hand_poses(
+    pull_sessions: &[Option<PullSession>; 2],
+    static_scene: &grab_detect::StaticScene,
+    live_objects: &LiveObjects,
+    part_transforms: &HashMap<String, HashMap<String, ([f32; 3], [f32; 4])>>,
+) -> [Option<PullHandPose>; 2] {
+    [Hand::Left, Hand::Right].map(|hand| {
+        let (object_id, gp) = pull_grip(pull_sessions, static_scene, hand)?;
+        let live = live_objects.by_id.get(object_id)?;
+        // hand_world honours hand_offset_* on top of the part pose, so the reach
+        // zone and the hand can sit apart -- the same split the carried-object
+        // path already uses. Composition lives in the engine and is tested there.
+        let (position, rotation) = gp.hand_world(
+            live.position,
+            live.rotation,
+            grab_detect::part_pose(gp, object_id, part_transforms),
+        );
+        Some(PullHandPose { position, rotation, finger_curl: gp.finger_curl.clone() })
+    })
 }
 
 pub(crate) fn try_start_pull(
@@ -146,6 +218,7 @@ pub(crate) fn try_start_pull(
                 travel,
                 b0: 0.0,
                 blend: 0.0,
+                grip_point: pa.grip_point.clone(),
             });
         }
     }
@@ -214,7 +287,9 @@ pub(crate) fn handle_input(
             info!("GRAB R: started HandPull on '{}'", session.object_id);
             pull_sessions[hand_idx(Hand::Right)] = Some(session);
         } else if let Some((id, point)) =
-            grab_detect::nearest_grip_point_to(live_objects, static_scene, p, r_trigger_only, Hand::Right)
+            grab_detect::nearest_grip_point_to(
+                live_objects, static_scene, p, r_trigger_only, Hand::Right, part_transforms,
+            )
         {
             info!("GRAB R: '{id}' via grip point '{point}'");
             input.grabbed.push((id, Hand::Right, point));
@@ -245,7 +320,9 @@ pub(crate) fn handle_input(
             info!("GRAB L: started HandPull on '{}'", session.object_id);
             pull_sessions[hand_idx(Hand::Left)] = Some(session);
         } else if let Some((id, point)) =
-            grab_detect::nearest_grip_point_to(live_objects, static_scene, p, l_trigger_only, Hand::Left)
+            grab_detect::nearest_grip_point_to(
+                live_objects, static_scene, p, l_trigger_only, Hand::Left, part_transforms,
+            )
         {
             info!("GRAB L: '{id}' via grip point '{point}'");
             input.grabbed.push((id, Hand::Left, point));
