@@ -99,6 +99,11 @@ pub(crate) fn build_render_lists<'a>(
                 // sees and the blend a trigger fires on cannot drift apart.
                 let blends = crate::part_pull::blends_for_object(
                     &held.object_id, parts, hand, cs, pull_sessions, manual_blends, app_elapsed,
+                    meshes_src
+                        .iter()
+                        .find(|m| m.id == held.object_id)
+                        .map(|m| m.disabled_clips.as_slice())
+                        .unwrap_or(&[]),
                 );
                 let targets: Vec<(usize, f32, ClipBlendMode)> = parts
                     .iter()
