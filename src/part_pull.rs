@@ -65,10 +65,17 @@ pub(crate) fn blends_for_object(
     pull_sessions: &[Option<PullSession>; 2],
     manual: Option<&HashMap<String, f32>>,
     elapsed: f32,
+    // Clips the server has gated off by their `enabled_when` state. Blended at
+    // zero here rather than filtered out, so a gated clip still steps aside for a
+    // lower-priority one instead of holding its joints at rest.
+    disabled: &[String],
 ) -> HashMap<String, f32> {
     parts
         .iter()
         .map(|pa| {
+            if disabled.iter().any(|c| c == &pa.clip) {
+                return (pa.clip.clone(), 0.0);
+            }
             let raw = match pa.driver {
                 PartDriver::HandPull => pull_sessions
                     .iter()
@@ -342,7 +349,12 @@ pub(crate) fn handle_input(
             .iter()
             .find(|m| m.id == held.object_id)
             .map(|m| &m.manual_part_blends);
-        let blends = blends_for_object(&held.object_id, parts, hand, cs, pull_sessions, manual, elapsed);
+        let disabled = meshes_src
+            .iter()
+            .find(|m| m.id == held.object_id)
+            .map(|m| m.disabled_clips.as_slice())
+            .unwrap_or(&[]);
+        let blends = blends_for_object(&held.object_id, parts, hand, cs, pull_sessions, manual, elapsed, disabled);
         if !blends.is_empty() {
             input.part_blends.insert(held.object_id.clone(), blends);
         }
