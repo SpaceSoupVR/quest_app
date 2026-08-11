@@ -50,6 +50,9 @@ pub(crate) fn update_avatar_bodies(
     world: &Option<WireWorld>,
     cs: &ControllerState,
     bodies: &[(PlayerId, avatar::RemotePlayerState)],
+    // Local player's hands that are mid-pull, already resolved onto the part
+    // they are pulling. [left, right]; None means the hand is drawn as tracked.
+    pull_hands: &[Option<crate::part_pull::PullHandPose>; 2],
 ) {
     avatar_mesh_cache.retain(|id, _| bodies.iter().any(|(bid, _)| *bid == *id));
     avatar_skeleton_cache.retain(|id, _| bodies.iter().any(|(bid, _)| *bid == *id));
@@ -100,30 +103,50 @@ pub(crate) fn update_avatar_bodies(
             up,
             rig_cfg.forward(),
         );
-        let left_hand = state.left_hand.map(|h| avatar::Transform {
-            position: to_render(h.position),
-            rotation: yaw_inv * h.rotation,
-        });
-        let right_hand = state.right_hand.map(|h| avatar::Transform {
-            position: to_render(h.position),
-            rotation: yaw_inv * h.rotation,
-        });
+        // A hand pulling an authored grip is drawn on that grip instead of on the
+        // controller, so it stays wrapped around the handle as the part travels.
+        // Only the local player has pull sessions; remote hands come over the wire
+        // already posed.
+        let posed = |h: avatar::Transform, idx: usize| -> avatar::Transform {
+            match pull_hands[idx].as_ref().filter(|_| id == local_player) {
+                Some(p) => avatar::Transform {
+                    position: to_render(p.position),
+                    rotation: yaw_inv * p.rotation,
+                },
+                None => avatar::Transform {
+                    position: to_render(h.position),
+                    rotation: yaw_inv * h.rotation,
+                },
+            }
+        };
+        let left_hand = state.left_hand.map(|h| posed(h, 0));
+        let right_hand = state.right_hand.map(|h| posed(h, 1));
 
         let (left_curl, right_curl) = if id == local_player {
             let held_l = world.as_ref().and_then(|w| w.left_hand_held.as_ref());
             let held_r = world.as_ref().and_then(|w| w.right_hand_held.as_ref());
-            let l = match held_l {
-                Some(held) => avatar::HandCurl::from_finger_curl(&held.finger_curl, cs.l_squeeze),
-                None => avatar::HandCurl::free_hand(
+            let l = match (held_l, pull_hands[0].as_ref()) {
+                (Some(held), _) => {
+                    avatar::HandCurl::from_finger_curl(&held.finger_curl, cs.l_squeeze)
+                }
+                (None, Some(pull)) => {
+                    avatar::HandCurl::from_finger_curl(&pull.finger_curl, cs.l_squeeze)
+                }
+                (None, None) => avatar::HandCurl::free_hand(
                     cs.l_trigger,
                     cs.l_squeeze,
                     cs.l_stick_touch,
                     rig_config.thumb_touch_curl,
                 ),
             };
-            let r = match held_r {
-                Some(held) => avatar::HandCurl::from_finger_curl(&held.finger_curl, cs.r_squeeze),
-                None => avatar::HandCurl::free_hand(
+            let r = match (held_r, pull_hands[1].as_ref()) {
+                (Some(held), _) => {
+                    avatar::HandCurl::from_finger_curl(&held.finger_curl, cs.r_squeeze)
+                }
+                (None, Some(pull)) => {
+                    avatar::HandCurl::from_finger_curl(&pull.finger_curl, cs.r_squeeze)
+                }
+                (None, None) => avatar::HandCurl::free_hand(
                     cs.r_trigger,
                     cs.r_squeeze,
                     cs.r_stick_touch,
