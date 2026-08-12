@@ -81,7 +81,7 @@ pub(crate) fn update_avatar_bodies(
         let Some(skin) = &mesh.skin else { continue };
         let Some(skeleton) = avatar_skeleton_cache.get(&id) else { continue };
 
-        let mut rig_cfg = *rig_config;
+        let mut rig_cfg = rig_config.clone();
         let up = avatar_ik::detect_up_axis(skeleton);
         rig_cfg.up_axis = up.to_array();
         let raw_bind_head_height = avatar_ik::bind_head_height_along(skeleton, up);
