@@ -125,32 +125,44 @@ pub(crate) fn update_avatar_bodies(
         let (left_curl, right_curl) = if id == local_player {
             let held_l = world.as_ref().and_then(|w| w.left_hand_held.as_ref());
             let held_r = world.as_ref().and_then(|w| w.right_hand_held.as_ref());
+            // The authored pose when the server sent one -- it carries spread and
+            // twist, which a curl map has no axis for. The curl is the fallback
+            // for a server older than that field, and for a hand holding nothing.
+            let max = rig_config.finger_curl_max_deg;
             let l = match (held_l, pull_hands[0].as_ref()) {
-                (Some(held), _) => {
-                    avatar::HandCurl::from_finger_curl(&held.finger_curl, cs.l_squeeze)
-                }
-                (None, Some(pull)) => {
-                    avatar::HandCurl::from_finger_curl(&pull.finger_curl, cs.l_squeeze)
-                }
-                (None, None) => avatar::HandCurl::free_hand(
-                    cs.l_trigger,
-                    cs.l_squeeze,
-                    cs.l_stick_touch,
-                    rig_config.thumb_touch_curl,
+                (Some(held), _) => held.hand_pose.unwrap_or_else(|| {
+                    avatar::HandPose::from_curl(
+                        avatar::HandCurl::from_finger_curl(&held.finger_curl, cs.l_squeeze),
+                        max,
+                    )
+                }),
+                (None, Some(pull)) => pull.hand_pose,
+                (None, None) => avatar::HandPose::from_curl(
+                    avatar::HandCurl::free_hand(
+                        cs.l_trigger,
+                        cs.l_squeeze,
+                        cs.l_stick_touch,
+                        rig_config.thumb_touch_curl,
+                    ),
+                    max,
                 ),
             };
             let r = match (held_r, pull_hands[1].as_ref()) {
-                (Some(held), _) => {
-                    avatar::HandCurl::from_finger_curl(&held.finger_curl, cs.r_squeeze)
-                }
-                (None, Some(pull)) => {
-                    avatar::HandCurl::from_finger_curl(&pull.finger_curl, cs.r_squeeze)
-                }
-                (None, None) => avatar::HandCurl::free_hand(
-                    cs.r_trigger,
-                    cs.r_squeeze,
-                    cs.r_stick_touch,
-                    rig_config.thumb_touch_curl,
+                (Some(held), _) => held.hand_pose.unwrap_or_else(|| {
+                    avatar::HandPose::from_curl(
+                        avatar::HandCurl::from_finger_curl(&held.finger_curl, cs.r_squeeze),
+                        max,
+                    )
+                }),
+                (None, Some(pull)) => pull.hand_pose,
+                (None, None) => avatar::HandPose::from_curl(
+                    avatar::HandCurl::free_hand(
+                        cs.r_trigger,
+                        cs.r_squeeze,
+                        cs.r_stick_touch,
+                        rig_config.thumb_touch_curl,
+                    ),
+                    max,
                 ),
             };
             (Some(l), Some(r))
