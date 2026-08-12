@@ -149,7 +149,7 @@ pub(crate) fn pull_grip<'a>(
 pub(crate) struct PullHandPose {
     pub(crate) position: Vec3,
     pub(crate) rotation: Quat,
-    pub(crate) finger_curl: HashMap<String, f32>,
+    pub(crate) hand_pose: avatar_ik::HandPose,
 }
 
 /// Where each pulling hand is drawn: on the part it is pulling.
@@ -179,7 +179,7 @@ pub(crate) fn pull_hand_poses(
             live.rotation,
             grab_detect::part_pose(gp, object_id, part_transforms),
         );
-        Some(PullHandPose { position, rotation, finger_curl: gp.finger_curl.clone() })
+        Some(PullHandPose { position, rotation, hand_pose: gp.hand_pose() })
     })
 }
 
