@@ -239,6 +239,9 @@ pub(crate) fn handle_input(
     mesh_cache: &HashMap<String, (GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform)>,
     live_objects: &LiveObjects,
     pull_sessions: &mut [Option<PullSession>; 2],
+    // What each hand grabbed and has not released yet, so a release can name the
+    // object it is actually letting go of. See the release arms below.
+    grabbed_ids: &mut [Option<String>; 2],
     prev_r_trigger: &mut bool,
     prev_l_trigger: &mut bool,
     prev_r_squeeze: &mut bool,
@@ -292,9 +295,13 @@ pub(crate) fn handle_input(
             )
         {
             info!("GRAB R: '{id}' via grip point '{point}'");
+            grabbed_ids[hand_idx(Hand::Right)] = Some(id.clone());
             input.grabbed.push((id, Hand::Right, point));
-        } else if let Some(id) = grab_detect::nearest_object_to(live_objects, p) {
+        } else if let Some(id) =
+            grab_detect::nearest_grabbable_object_to(live_objects, static_scene, p)
+        {
             info!("GRAB R: '{id}' via proximity (no grip point)");
+            grabbed_ids[hand_idx(Hand::Right)] = Some(id.clone());
             input.grabbed.push((id, Hand::Right, String::new()));
         } else {
             info!(
@@ -305,9 +312,17 @@ pub(crate) fn handle_input(
     }
     if !r_trigger_down && (*prev_r_trigger || *prev_r_squeeze) {
         if pull_sessions[hand_idx(Hand::Right)].is_none() {
-            if let Some(id) =
-                grab_detect::nearest_object_to(live_objects, rig.hand_grip(Hand::Right).position)
-            {
+            // Release the object this hand grabbed -- NOT whatever is nearest to
+            // the hand now.
+            //
+            // The proximity version detached the wrong thing routinely. `floor`
+            // is a visible 100x100 m box, so letting go anywhere near the ground
+            // resolved to it, sent Detach{id:"floor"} (a no-op, floor is not
+            // attached), and left the weapon welded to the hand -- after which
+            // it follows the hand forever and reads as "grabbed from far away".
+            // If nothing at all was within 15 cm it returned None and detached
+            // nothing, with the same result.
+            if let Some(id) = grabbed_ids[hand_idx(Hand::Right)].take() {
                 input.released.push((id, Hand::Right));
             }
         }
@@ -325,9 +340,13 @@ pub(crate) fn handle_input(
             )
         {
             info!("GRAB L: '{id}' via grip point '{point}'");
+            grabbed_ids[hand_idx(Hand::Left)] = Some(id.clone());
             input.grabbed.push((id, Hand::Left, point));
-        } else if let Some(id) = grab_detect::nearest_object_to(live_objects, p) {
+        } else if let Some(id) =
+            grab_detect::nearest_grabbable_object_to(live_objects, static_scene, p)
+        {
             info!("GRAB L: '{id}' via proximity (no grip point)");
+            grabbed_ids[hand_idx(Hand::Left)] = Some(id.clone());
             input.grabbed.push((id, Hand::Left, String::new()));
         } else {
             info!(
@@ -338,9 +357,7 @@ pub(crate) fn handle_input(
     }
     if !l_trigger_down && (*prev_l_trigger || *prev_l_squeeze) {
         if pull_sessions[hand_idx(Hand::Left)].is_none() {
-            if let Some(id) =
-                grab_detect::nearest_object_to(live_objects, rig.hand_grip(Hand::Left).position)
-            {
+            if let Some(id) = grabbed_ids[hand_idx(Hand::Left)].take() {
                 input.released.push((id, Hand::Left));
             }
         }
@@ -374,11 +391,13 @@ pub(crate) fn handle_input(
     {
         let held_r = grab_detect::held_object_id(
             world.as_ref().and_then(|w| w.right_hand_held.as_ref()),
+            grabbed_ids[hand_idx(Hand::Right)].as_deref(),
             live_objects,
             rig.hand_grip(Hand::Right).position,
         );
         let held_l = grab_detect::held_object_id(
             world.as_ref().and_then(|w| w.left_hand_held.as_ref()),
+            grabbed_ids[hand_idx(Hand::Left)].as_deref(),
             live_objects,
             rig.hand_grip(Hand::Left).position,
         );
