@@ -189,6 +189,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut prev_r_squeeze = false;
     let mut prev_l_squeeze = false;
     let mut pull_sessions: [Option<PullSession>; 2] = [None, None];
+    // What each hand grabbed and has not released. Client-side because the
+    // server cannot always tell us: a proximity grab records no grip point name,
+    // so resolve_held_grip reports an empty hand for an object the player is
+    // plainly carrying.
+    let mut grabbed_ids: [Option<String>; 2] = [None, None];
     let mut prev_btn_a = false;
     let mut prev_btn_b = false;
     let mut prev_btn_x = false;
@@ -362,6 +367,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &mesh_cache,
             &live_objects,
             &mut pull_sessions,
+            &mut grabbed_ids,
             &mut prev_r_trigger,
             &mut prev_l_trigger,
             &mut prev_r_squeeze,
