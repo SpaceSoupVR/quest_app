@@ -47,6 +47,9 @@ pub(crate) fn build_render_lists<'a>(
     head_pos: Vec3,
     // Seconds since app start, for time-driven clips (PartDriver::Cyclic).
     app_elapsed: f32,
+    // wrist_tune * wrist_cal per hand [Left, Right] -- the same calibration the visual
+    // hand uses, so a held object sits in the frame the grip was authored against.
+    held_grip_cal: [Quat; 2],
     // Filled with each held object's posed part transforms, for the engine to use
     // next frame. See the comment at the write site.
     part_transforms_out: &mut HashMap<String, HashMap<String, ([f32; 3], [f32; 4])>>,
@@ -80,7 +83,14 @@ pub(crate) fn build_render_lists<'a>(
             continue;
         };
         let hand_tf = rig.hand_grip(hand);
-        let hand_mat = Mat4::from_rotation_translation(hand_tf.rotation, hand_tf.position);
+        // Attach in the wrist-calibrated hand frame (matching pose.rs and the editor),
+        // not the raw controller grip -- otherwise every held object is rotated off by
+        // the calibration. See held_grip_cal in lib.rs.
+        let cal = held_grip_cal[match hand {
+            Hand::Left => 0,
+            Hand::Right => 1,
+        }];
+        let hand_mat = Mat4::from_rotation_translation(hand_tf.rotation * cal, hand_tf.position);
         let offset_mat = Mat4::from_rotation_translation(
             Quat::from_array(held.point_local_rot),
             Vec3::from(held.point_local_pos),

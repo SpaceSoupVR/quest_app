@@ -449,6 +449,26 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &pull_hands,
         );
 
+        // A held object attaches to the SAME wrist-calibrated hand frame the visual
+        // hand uses (pose.rs: hand.rotation * wrist_tune * wrist_cal), so what you
+        // authored in the editor is what appears in-game -- one frame correction for
+        // every object, no per-object tuning. Indexed [Left, Right].
+        let held_grip_cal: [glam::Quat; 2] = {
+            let skel = avatar_skeleton_cache.get(&local_player);
+            let cal_for = |side: &str| -> glam::Quat {
+                let wrist_cal = if rig_config.wrist_calibration_auto {
+                    skel.and_then(|s| {
+                        avatar_ik::derive_wrist_calibration(s, side, &rig_config.bone_map)
+                    })
+                    .unwrap_or_else(|| rig_config.wrist_calibration_offset())
+                } else {
+                    rig_config.wrist_calibration_offset()
+                };
+                rig_config.wrist_tune(side) * wrist_cal
+            };
+            [cal_for("Left"), cal_for("Right")]
+        };
+
         let (cuboids, lights, mesh_instances, mirror_only_mesh_instances, mirror_surface) =
             render_prep::build_render_lists(
                 cuboids_src,
@@ -469,6 +489,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 yaw_inv,
                 head_pos,
                 sim_time,
+                held_grip_cal,
                 &mut part_transforms,
             );
 
