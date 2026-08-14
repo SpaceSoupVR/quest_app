@@ -53,6 +53,10 @@ pub(crate) fn update_avatar_bodies(
     // Local player's hands that are mid-pull, already resolved onto the part
     // they are pulling. [left, right]; None means the hand is drawn as tracked.
     pull_hands: &[Option<crate::part_pull::PullHandPose>; 2],
+    // Out: the local player's arm-reach constraint per hand [Left, Right] as
+    // (shoulder world position, max reach in meters). A held object clamps to this
+    // same sphere so it never separates from the hand when the arm over-extends.
+    local_arm_reach: &mut [Option<(Vec3, f32)>; 2],
 ) {
     avatar_mesh_cache.retain(|id, _| bodies.iter().any(|(bid, _)| *bid == *id));
     avatar_skeleton_cache.retain(|id, _| bodies.iter().any(|(bid, _)| *bid == *id));
@@ -103,6 +107,29 @@ pub(crate) fn update_avatar_bodies(
             up,
             rig_cfg.forward(),
         );
+
+        // Capture the arm-reach sphere for the held-object clamp (local player only).
+        // Same shoulder + bone lengths the arm IK uses, in the player's tracking space
+        // (converted back from render space) so it matches rig.hand_grip positions.
+        if id == local_player {
+            let bind = skeleton.hierarchical_transforms(&skeleton.joint_local_bind);
+            for (idx, side) in [(0usize, "Left"), (1usize, "Right")] {
+                local_arm_reach[idx] = avatar_ik::find_arm_chain(
+                    &skeleton.joint_names,
+                    side,
+                    &rig_cfg.bone_map,
+                )
+                .map(|chain| {
+                    let sh = bind[chain.upper].transform_point3(Vec3::ZERO);
+                    let el = bind[chain.lower].transform_point3(Vec3::ZERO);
+                    let wr = bind[chain.end].transform_point3(Vec3::ZERO);
+                    let max_reach = ((el - sh).length() + (wr - el).length()) * root_scale;
+                    let shoulder_render = root.position + root.rotation * (sh * root_scale);
+                    let shoulder_world = yaw_inv.inverse() * shoulder_render + offset;
+                    (shoulder_world, max_reach)
+                });
+            }
+        }
         // A hand pulling an authored grip is drawn on that grip instead of on the
         // controller, so it stays wrapped around the handle as the part travels.
         // Only the local player has pull sessions; remote hands come over the wire

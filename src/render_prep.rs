@@ -57,6 +57,10 @@ pub(crate) fn build_render_lists<'a>(
     // grip frame -- the palm-normal gap between the reported grip and the palm. One
     // value for every held object.
     held_grip_offset: Vec3,
+    // The arm-reach sphere per hand [Left, Right] as (shoulder world pos, max reach).
+    // A held object clamps to it so it can't drift past the (clamped) visual hand when
+    // the controller reaches beyond the avatar's arm.
+    arm_reach: [Option<(Vec3, f32)>; 2],
     // Filled with each held object's posed part transforms, for the engine to use
     // next frame. See the comment at the write site.
     part_transforms_out: &mut HashMap<String, HashMap<String, ([f32; 3], [f32; 4])>>,
@@ -90,18 +94,27 @@ pub(crate) fn build_render_lists<'a>(
             continue;
         };
         let hand_tf = rig.hand_grip(hand);
+        let hand_idx = match hand {
+            Hand::Left => 0,
+            Hand::Right => 1,
+        };
         // Attach in the wrist-calibrated hand frame (matching pose.rs and the editor),
         // not the raw controller grip -- otherwise every held object is rotated off by
         // the calibration. See held_grip_cal in lib.rs.
-        let cal = held_grip_cal[match hand {
-            Hand::Left => 0,
-            Hand::Right => 1,
-        }];
-        let hand_rot = hand_tf.rotation * cal;
-        // wrist_pos_offset is in the raw grip frame (matches pose.rs); held_grip_offset
-        // is in the calibrated frame so "into the palm" stays consistent as the hand turns.
-        let hand_pos =
-            hand_tf.position + hand_tf.rotation * wrist_pos_offset + hand_rot * held_grip_offset;
+        let hand_rot = hand_tf.rotation * held_grip_cal[hand_idx];
+        // The wrist target is what the arm IK clamps (matches pose.rs). Clamp it to the
+        // same reach sphere so the held object stops where the visual hand does.
+        let mut wrist_target = hand_tf.position + hand_tf.rotation * wrist_pos_offset;
+        if let Some((shoulder, max_reach)) = arm_reach[hand_idx] {
+            let to_wrist = wrist_target - shoulder;
+            let dist = to_wrist.length();
+            if dist > max_reach {
+                wrist_target = shoulder + to_wrist * (max_reach / dist);
+            }
+        }
+        // held_grip_offset is in the calibrated frame so "into the palm" stays consistent
+        // as the hand turns.
+        let hand_pos = wrist_target + hand_rot * held_grip_offset;
         let hand_mat = Mat4::from_rotation_translation(hand_rot, hand_pos);
         let offset_mat = Mat4::from_rotation_translation(
             Quat::from_array(held.point_local_rot),

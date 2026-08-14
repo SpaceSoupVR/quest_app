@@ -432,6 +432,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         let pull_hands = part_pull::pull_hand_poses(
             &pull_sessions, &static_scene, &live_objects, &part_transforms,
         );
+        let mut local_arm_reach: [Option<(glam::Vec3, f32)>; 2] = [None, None];
         avatar_render::update_avatar_bodies(
             &mut renderer,
             &mut avatar_mesh_cache,
@@ -447,6 +448,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             cs,
             &bodies,
             &pull_hands,
+            &mut local_arm_reach,
         );
 
         // A held object attaches to the SAME wrist-calibrated hand frame the visual
@@ -492,6 +494,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 held_grip_cal,
                 rig_config.wrist_position_offset(),
                 rig_config.held_grip_offset(),
+                local_arm_reach,
                 &mut part_transforms,
             );
 
