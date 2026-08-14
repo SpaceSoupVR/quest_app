@@ -50,6 +50,9 @@ pub(crate) fn build_render_lists<'a>(
     // wrist_tune * wrist_cal per hand [Left, Right] -- the same calibration the visual
     // hand uses, so a held object sits in the frame the grip was authored against.
     held_grip_cal: [Quat; 2],
+    // The wrist's position offset from the raw grip (same value pose.rs applies to the
+    // visual hand), so the held object's grip lands ON the hand, not a few cm off it.
+    wrist_pos_offset: Vec3,
     // Filled with each held object's posed part transforms, for the engine to use
     // next frame. See the comment at the write site.
     part_transforms_out: &mut HashMap<String, HashMap<String, ([f32; 3], [f32; 4])>>,
@@ -90,7 +93,8 @@ pub(crate) fn build_render_lists<'a>(
             Hand::Left => 0,
             Hand::Right => 1,
         }];
-        let hand_mat = Mat4::from_rotation_translation(hand_tf.rotation * cal, hand_tf.position);
+        let hand_pos = hand_tf.position + hand_tf.rotation * wrist_pos_offset;
+        let hand_mat = Mat4::from_rotation_translation(hand_tf.rotation * cal, hand_pos);
         let offset_mat = Mat4::from_rotation_translation(
             Quat::from_array(held.point_local_rot),
             Vec3::from(held.point_local_pos),
