@@ -432,7 +432,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         let pull_hands = part_pull::pull_hand_poses(
             &pull_sessions, &static_scene, &live_objects, &part_transforms,
         );
-        let mut local_arm_reach: [Option<(glam::Vec3, f32)>; 2] = [None, None];
+        let mut local_hand_world: [Option<avatar_ik::Transform>; 2] = [None, None];
         avatar_render::update_avatar_bodies(
             &mut renderer,
             &mut avatar_mesh_cache,
@@ -448,28 +448,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             cs,
             &bodies,
             &pull_hands,
-            &mut local_arm_reach,
+            &mut local_hand_world,
         );
-
-        // A held object attaches to the SAME wrist-calibrated hand frame the visual
-        // hand uses (pose.rs: hand.rotation * wrist_tune * wrist_cal), so what you
-        // authored in the editor is what appears in-game -- one frame correction for
-        // every object, no per-object tuning. Indexed [Left, Right].
-        let held_grip_cal: [glam::Quat; 2] = {
-            let skel = avatar_skeleton_cache.get(&local_player);
-            let cal_for = |side: &str| -> glam::Quat {
-                let wrist_cal = if rig_config.wrist_calibration_auto {
-                    skel.and_then(|s| {
-                        avatar_ik::derive_wrist_calibration(s, side, &rig_config.bone_map)
-                    })
-                    .unwrap_or_else(|| rig_config.wrist_calibration_offset())
-                } else {
-                    rig_config.wrist_calibration_offset()
-                };
-                rig_config.wrist_tune(side) * wrist_cal
-            };
-            [cal_for("Left"), cal_for("Right")]
-        };
 
         let (cuboids, lights, mesh_instances, mirror_only_mesh_instances, mirror_surface) =
             render_prep::build_render_lists(
@@ -482,7 +462,6 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 &local_direct_mesh,
                 local_player,
                 &world,
-                &rig,
                 &static_scene,
                 &pull_sessions,
                 cs,
@@ -491,10 +470,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 yaw_inv,
                 head_pos,
                 sim_time,
-                held_grip_cal,
-                rig_config.wrist_position_offset(),
+                local_hand_world,
                 rig_config.held_grip_offset(),
-                local_arm_reach,
                 &mut part_transforms,
             );
 

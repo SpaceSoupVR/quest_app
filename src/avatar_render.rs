@@ -53,10 +53,11 @@ pub(crate) fn update_avatar_bodies(
     // Local player's hands that are mid-pull, already resolved onto the part
     // they are pulling. [left, right]; None means the hand is drawn as tracked.
     pull_hands: &[Option<crate::part_pull::PullHandPose>; 2],
-    // Out: the local player's arm-reach constraint per hand [Left, Right] as
-    // (shoulder world position, max reach in meters). A held object clamps to this
-    // same sphere so it never separates from the hand when the arm over-extends.
-    local_arm_reach: &mut [Option<(Vec3, f32)>; 2],
+    // Out: the local player's posed wrist-joint world transform per hand [Left, Right],
+    // in render space. A held object attaches to this exact bone (object = wrist *
+    // hand_offset^-1), reproducing the editor's authored pose with no reconstruction --
+    // and inheriting the arm IK's reach clamp for free.
+    local_hand_world: &mut [Option<avatar_ik::Transform>; 2],
 ) {
     avatar_mesh_cache.retain(|id, _| bodies.iter().any(|(bid, _)| *bid == *id));
     avatar_skeleton_cache.retain(|id, _| bodies.iter().any(|(bid, _)| *bid == *id));
@@ -108,28 +109,6 @@ pub(crate) fn update_avatar_bodies(
             rig_cfg.forward(),
         );
 
-        // Capture the arm-reach sphere for the held-object clamp (local player only).
-        // Same shoulder + bone lengths the arm IK uses, in the player's tracking space
-        // (converted back from render space) so it matches rig.hand_grip positions.
-        if id == local_player {
-            let bind = skeleton.hierarchical_transforms(&skeleton.joint_local_bind);
-            for (idx, side) in [(0usize, "Left"), (1usize, "Right")] {
-                local_arm_reach[idx] = avatar_ik::find_arm_chain(
-                    &skeleton.joint_names,
-                    side,
-                    &rig_cfg.bone_map,
-                )
-                .map(|chain| {
-                    let sh = bind[chain.upper].transform_point3(Vec3::ZERO);
-                    let el = bind[chain.lower].transform_point3(Vec3::ZERO);
-                    let wr = bind[chain.end].transform_point3(Vec3::ZERO);
-                    let max_reach = ((el - sh).length() + (wr - el).length()) * root_scale;
-                    let shoulder_render = root.position + root.rotation * (sh * root_scale);
-                    let shoulder_world = yaw_inv.inverse() * shoulder_render + offset;
-                    (shoulder_world, max_reach)
-                });
-            }
-        }
         // A hand pulling an authored grip is drawn on that grip instead of on the
         // controller, so it stays wrapped around the handle as the part travels.
         // Only the local player has pull sessions; remote hands come over the wire
@@ -210,6 +189,22 @@ pub(crate) fn update_avatar_bodies(
             right_curl,
         );
         skin.update_joint_matrices(renderer.queue(), &skinned_mats);
+
+        if id == local_player {
+            // The exact posed wrist a held object attaches to (same solve, render space).
+            *local_hand_world = avatar_ik::posed_hand_worlds(
+                skeleton,
+                &rig_cfg,
+                root.position,
+                root.rotation,
+                head_rot,
+                root_scale,
+                left_hand,
+                right_hand,
+                left_curl,
+                right_curl,
+            );
+        }
 
         if id == local_player {
             let direct = local_direct_mesh.get_or_insert_with(|| {
