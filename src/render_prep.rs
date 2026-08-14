@@ -8,7 +8,7 @@ use space_soup::renderer::mesh_pipeline::ModelUniform;
 use space_soup::renderer::xr_renderer::XrRenderer;
 use space_soup::renderer::{Cuboid, GltfMesh, Light, MeshInstance, MirrorSurface};
 use space_soup::ControllerState;
-use space_soup_engine::{Hand, PartDriver, PlayerRig};
+use space_soup_engine::{Hand, PartDriver};
 use space_soup_protocol::{
     PlayerId, WireHeldGrip, WireRenderCuboid, WireRenderLight, WireRenderMesh, WireWorld,
 };
@@ -37,7 +37,6 @@ pub(crate) fn build_render_lists<'a>(
     local_direct_mesh: &'a Option<(GltfMesh, ModelUniform)>,
     local_player: PlayerId,
     world: &Option<WireWorld>,
-    rig: &PlayerRig,
     static_scene: &StaticScene,
     pull_sessions: &[Option<PullSession>; 2],
     cs: &ControllerState,
@@ -47,20 +46,14 @@ pub(crate) fn build_render_lists<'a>(
     head_pos: Vec3,
     // Seconds since app start, for time-driven clips (PartDriver::Cyclic).
     app_elapsed: f32,
-    // wrist_tune * wrist_cal per hand [Left, Right] -- the same calibration the visual
-    // hand uses, so a held object sits in the frame the grip was authored against.
-    held_grip_cal: [Quat; 2],
-    // The wrist's position offset from the raw grip (same value pose.rs applies to the
-    // visual hand), so the held object's grip lands ON the hand, not a few cm off it.
-    wrist_pos_offset: Vec3,
-    // Per-rig calibration of where a held object rests in the hand, in the calibrated
-    // grip frame -- the palm-normal gap between the reported grip and the palm. One
-    // value for every held object.
+    // The local player's posed wrist-joint world transform per hand [Left, Right], in
+    // render space -- the exact bone the editor authors grips against. A held object
+    // attaches to it directly (object = wrist * hand_offset^-1), so it reproduces the
+    // authored pose with zero reconstruction and inherits the arm's reach clamp.
+    hand_world: [Option<avatar_ik::Transform>; 2],
+    // Optional per-rig nudge in the wrist frame; 0 with the posed-wrist attach. Kept for
+    // fine-tuning only.
     held_grip_offset: Vec3,
-    // The arm-reach sphere per hand [Left, Right] as (shoulder world pos, max reach).
-    // A held object clamps to it so it can't drift past the (clamped) visual hand when
-    // the controller reaches beyond the avatar's arm.
-    arm_reach: [Option<(Vec3, f32)>; 2],
     // Filled with each held object's posed part transforms, for the engine to use
     // next frame. See the comment at the write site.
     part_transforms_out: &mut HashMap<String, HashMap<String, ([f32; 3], [f32; 4])>>,
@@ -93,36 +86,27 @@ pub(crate) fn build_render_lists<'a>(
         let Some((mesh, _)) = mesh_cache.get_mut(&held.object_id) else {
             continue;
         };
-        let hand_tf = rig.hand_grip(hand);
         let hand_idx = match hand {
             Hand::Left => 0,
             Hand::Right => 1,
         };
-        // Attach in the wrist-calibrated hand frame (matching pose.rs and the editor),
-        // not the raw controller grip -- otherwise every held object is rotated off by
-        // the calibration. See held_grip_cal in lib.rs.
-        let hand_rot = hand_tf.rotation * held_grip_cal[hand_idx];
-        // The wrist target is what the arm IK clamps (matches pose.rs). Clamp it to the
-        // same reach sphere so the held object stops where the visual hand does.
-        let mut wrist_target = hand_tf.position + hand_tf.rotation * wrist_pos_offset;
-        if let Some((shoulder, max_reach)) = arm_reach[hand_idx] {
-            let to_wrist = wrist_target - shoulder;
-            let dist = to_wrist.length();
-            if dist > max_reach {
-                wrist_target = shoulder + to_wrist * (max_reach / dist);
-            }
-        }
-        // held_grip_offset is in the calibrated frame so "into the palm" stays consistent
-        // as the hand turns.
-        let hand_pos = wrist_target + hand_rot * held_grip_offset;
-        let hand_mat = Mat4::from_rotation_translation(hand_rot, hand_pos);
+        // Attach to the EXACT posed wrist the editor authored against (render space).
+        // The editor drives this bone to object*hand_offset; placing the object at
+        // wrist*hand_offset^-1 reproduces that precisely -- no reconstruction, no
+        // calibration -- and the wrist is already reach-clamped by the arm IK.
+        let Some(wrist) = hand_world[hand_idx] else { continue };
+        // held_grip_offset is 0 with the posed-wrist attach; a nonzero value nudges in
+        // the wrist frame, kept only for fine-tuning.
+        let hand_pos = wrist.position + wrist.rotation * held_grip_offset;
+        let hand_mat = Mat4::from_rotation_translation(wrist.rotation, hand_pos);
         let offset_mat = Mat4::from_rotation_translation(
             Quat::from_array(held.point_local_rot),
             Vec3::from(held.point_local_pos),
         );
+        // wrist is already render space, so the object transform is too -- no yaw_inv.
         let (_, rot, pos) = (hand_mat * offset_mat.inverse()).to_scale_rotation_translation();
-        mesh.position = yaw_inv * (pos - offset);
-        mesh.rotation = yaw_inv * rot;
+        mesh.position = pos;
+        mesh.rotation = rot;
 
         if let Some(parts) = static_scene.part_animations.get(&held.object_id) {
             if let Some(skin) = &mesh.skin {
