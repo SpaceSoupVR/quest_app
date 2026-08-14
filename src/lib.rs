@@ -491,6 +491,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 sim_time,
                 held_grip_cal,
                 rig_config.wrist_position_offset(),
+                rig_config.held_grip_offset(),
                 &mut part_transforms,
             );
 
