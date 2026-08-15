@@ -2554,6 +2554,7 @@ dependencies = [
 name = "space_soup_protocol"
 version = "0.1.0"
 dependencies = [
+ "avatar_ik",
  "serde",
  "serde_json",
  "uuid",

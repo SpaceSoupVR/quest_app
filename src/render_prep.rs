@@ -8,14 +8,16 @@ use space_soup::renderer::mesh_pipeline::ModelUniform;
 use space_soup::renderer::xr_renderer::XrRenderer;
 use space_soup::renderer::{Cuboid, GltfMesh, Light, MeshInstance, MirrorSurface};
 use space_soup::ControllerState;
-use space_soup_engine::{Hand, PartDriver, PlayerRig};
+use space_soup_engine::{Hand, PartDriver};
 use space_soup_protocol::{
     PlayerId, WireHeldGrip, WireRenderCuboid, WireRenderLight, WireRenderMesh, WireWorld,
 };
 
 use crate::convert::{to_space_soup_cuboid, to_space_soup_light};
 use crate::grab_detect::StaticScene;
-use crate::part_pull::{part_animation_blend, PullSession};
+use crate::part_pull::PullSession;
+use space_soup::renderer::mesh::ClipBlendMode;
+use space_soup_engine::ClipBlendMode as EngineBlendMode;
 
 const MAX_RENDER_DIST: f32 = 40.0;
 
@@ -30,11 +32,11 @@ pub(crate) fn build_render_lists<'a>(
     lights_src: &[WireRenderLight],
     meshes_src: &'a [WireRenderMesh],
     mesh_cache: &'a mut HashMap<String, (GltfMesh, ModelUniform)>,
+    hidden_cache: &'a mut HashMap<String, (Vec<String>, GltfMesh, ModelUniform)>,
     avatar_mesh_cache: &'a HashMap<PlayerId, (GltfMesh, ModelUniform)>,
     local_direct_mesh: &'a Option<(GltfMesh, ModelUniform)>,
     local_player: PlayerId,
     world: &Option<WireWorld>,
-    rig: &PlayerRig,
     static_scene: &StaticScene,
     pull_sessions: &[Option<PullSession>; 2],
     cs: &ControllerState,
@@ -42,6 +44,19 @@ pub(crate) fn build_render_lists<'a>(
     offset: Vec3,
     yaw_inv: Quat,
     head_pos: Vec3,
+    // Seconds since app start, for time-driven clips (PartDriver::Cyclic).
+    app_elapsed: f32,
+    // The local player's posed wrist-joint world transform per hand [Left, Right], in
+    // render space -- the exact bone the editor authors grips against. A held object
+    // attaches to it directly (object = wrist * hand_offset^-1), so it reproduces the
+    // authored pose with zero reconstruction and inherits the arm's reach clamp.
+    hand_world: [Option<avatar_ik::Transform>; 2],
+    // Optional per-rig nudge in the wrist frame; 0 with the posed-wrist attach. Kept for
+    // fine-tuning only.
+    held_grip_offset: Vec3,
+    // Filled with each held object's posed part transforms, for the engine to use
+    // next frame. See the comment at the write site.
+    part_transforms_out: &mut HashMap<String, HashMap<String, ([f32; 3], [f32; 4])>>,
 ) -> (Vec<Cuboid>, Vec<Light>, Vec<MeshInstance<'a>>, Vec<MeshInstance<'a>>, Option<MirrorSurface>) {
     let cuboids: Vec<Cuboid> = cuboids_src
         .iter()
@@ -71,15 +86,27 @@ pub(crate) fn build_render_lists<'a>(
         let Some((mesh, _)) = mesh_cache.get_mut(&held.object_id) else {
             continue;
         };
-        let hand_tf = rig.hand_grip(hand);
-        let hand_mat = Mat4::from_rotation_translation(hand_tf.rotation, hand_tf.position);
+        let hand_idx = match hand {
+            Hand::Left => 0,
+            Hand::Right => 1,
+        };
+        // Attach to the EXACT posed wrist the editor authored against (render space).
+        // The editor drives this bone to object*hand_offset; placing the object at
+        // wrist*hand_offset^-1 reproduces that precisely -- no reconstruction, no
+        // calibration -- and the wrist is already reach-clamped by the arm IK.
+        let Some(wrist) = hand_world[hand_idx] else { continue };
+        // held_grip_offset is 0 with the posed-wrist attach; a nonzero value nudges in
+        // the wrist frame, kept only for fine-tuning.
+        let hand_pos = wrist.position + wrist.rotation * held_grip_offset;
+        let hand_mat = Mat4::from_rotation_translation(wrist.rotation, hand_pos);
         let offset_mat = Mat4::from_rotation_translation(
             Quat::from_array(held.point_local_rot),
             Vec3::from(held.point_local_pos),
         );
+        // wrist is already render space, so the object transform is too -- no yaw_inv.
         let (_, rot, pos) = (hand_mat * offset_mat.inverse()).to_scale_rotation_translation();
-        mesh.position = yaw_inv * (pos - offset);
-        mesh.rotation = yaw_inv * rot;
+        mesh.position = pos;
+        mesh.rotation = rot;
 
         if let Some(parts) = static_scene.part_animations.get(&held.object_id) {
             if let Some(skin) = &mesh.skin {
@@ -87,39 +114,96 @@ pub(crate) fn build_render_lists<'a>(
                     .iter()
                     .find(|m| m.id == held.object_id)
                     .map(|m| &m.manual_part_blends);
-                let targets: Vec<(usize, f32)> = parts
+                // Same helper handle_input reports upward, so the pose the player
+                // sees and the blend a trigger fires on cannot drift apart.
+                let blends = crate::part_pull::blends_for_object(
+                    &held.object_id, parts, hand, cs, pull_sessions, manual_blends, app_elapsed,
+                    meshes_src
+                        .iter()
+                        .find(|m| m.id == held.object_id)
+                        .map(|m| m.disabled_clips.as_slice())
+                        .unwrap_or(&[]),
+                );
+                let targets: Vec<(usize, f32, ClipBlendMode)> = parts
                     .iter()
                     .filter_map(|pa| {
                         let clip_idx = skin.animation_index(&pa.clip)?;
-                        let raw = if pa.driver == PartDriver::HandPull {
-                            pull_sessions
-                                .iter()
-                                .flatten()
-                                .find(|s| s.object_id == held.object_id && s.clip == pa.clip)
-                                .map(|s| s.blend)
-                                .unwrap_or(0.0)
-                        } else if pa.driver == PartDriver::Manual {
-                            manual_blends
-                                .and_then(|m| m.get(&pa.clip).copied())
-                                .unwrap_or(0.0)
-                        } else {
-                            part_animation_blend(pa.driver, hand, cs)
+                        let mode = match pa.blend_mode {
+                            EngineBlendMode::Additive => ClipBlendMode::Additive,
+                            EngineBlendMode::Override => ClipBlendMode::Override,
                         };
-                        Some((clip_idx, pa.easing.apply(raw)))
+                        Some((clip_idx, blends.get(&pa.clip).copied().unwrap_or(0.0), mode))
                     })
                     .collect();
                 if !targets.is_empty() {
                     let mats = skin.skin_matrices_blended_multi(&targets);
                     mesh.update_joint_matrices(renderer.queue(), &mats);
+
+                    // Publish where each part ended up, for the engine to resolve
+                    // part-anchored sockets and spawn detached parts in the right
+                    // place. Taken from the pose just computed rather than
+                    // recomputed, so it cannot disagree with what was drawn -- the
+                    // engine reads it next frame, and 11 ms of lag on a spawn
+                    // point is invisible next to duplicating the pose maths.
+                    let local = space_soup::renderer::mesh::blend_joint_local(
+                        &skin.joint_local_bind, &skin.animations, &targets,
+                    );
+                    let model = Mat4::from_scale_rotation_translation(
+                        mesh.scale, mesh.rotation, mesh.position,
+                    );
+                    let world = skin.hierarchical_transforms(&local);
+                    let mut out = HashMap::new();
+                    for (ji, name) in skin.joint_names.iter().enumerate() {
+                        let (_, rot, pos) = (model * world[ji]).to_scale_rotation_translation();
+                        out.insert(name.clone(), (pos.to_array(), rot.to_array()));
+                    }
+                    part_transforms_out.insert(held.object_id.clone(), out);
                 }
             }
         }
+    }
+
+    // Parts an object hides are removed from the geometry, using the same
+    // joint-exclusion path that hides the local player's own head. That rebuilds
+    // vertex and index buffers, so it is cached and only redone when the hidden
+    // set actually changes -- doing it per frame would be a performance fault
+    // wearing a feature's clothes.
+    for rm in meshes_src {
+        if rm.hidden_parts.is_empty() {
+            hidden_cache.remove(&rm.id);
+            continue;
+        }
+        let already_current = hidden_cache
+            .get(&rm.id)
+            .is_some_and(|(built_for, _, _)| built_for == &rm.hidden_parts);
+        if already_current {
+            continue;
+        }
+        let Some((base, _)) = mesh_cache.get(&rm.id) else { continue };
+        let Some(skin) = base.skin.as_ref() else { continue };
+        let excluded: Vec<usize> = rm
+            .hidden_parts
+            .iter()
+            .filter_map(|name| skin.joint_names.iter().position(|j| j == name))
+            .collect();
+        if excluded.is_empty() {
+            continue;
+        }
+        let mut variant = base.clone_with_independent_skin_excluding_joints(renderer.device(), &excluded);
+        variant.create_skin_bind_group(renderer.device(), renderer.skin_joint_layout());
+        hidden_cache.insert(
+            rm.id.clone(),
+            (rm.hidden_parts.clone(), variant, renderer.create_skinned_model_uniform()),
+        );
     }
 
     let mesh_instances: Vec<MeshInstance> = meshes_src
         .iter()
         .filter(|rm| Vec3::from(rm.position).distance(head_pos) < MAX_RENDER_DIST)
         .filter_map(|rm| {
+            if let Some((_, mesh, model)) = hidden_cache.get(&rm.id) {
+                return Some(MeshInstance { mesh, model, lightmap_key: Some(rm.id.as_str()) });
+            }
             let (mesh, model) = mesh_cache.get(&rm.id)?;
             Some(MeshInstance { mesh, model, lightmap_key: Some(rm.id.as_str()) })
         })

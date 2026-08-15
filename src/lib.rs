@@ -141,7 +141,19 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         String,
         (GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform),
     > = HashMap::new();
+    // Geometry variants with hidden parts removed, keyed by object id and tagged
+    // with the hidden set they were built for. Rebuilding one costs new vertex and
+    // index buffers, so it happens only when that set changes.
+    let mut hidden_part_meshes: HashMap<
+        String,
+        (Vec<String>, GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform),
+    > = HashMap::new();
     let mut requested_mesh_ids: HashSet<String> = HashSet::new();
+    // Posed part transforms published by the previous frame's render pass, sent
+    // up so the engine can resolve part-anchored sockets and spawn detached parts
+    // where the part actually is.
+    let mut part_transforms: HashMap<String, HashMap<String, ([f32; 3], [f32; 4])>> =
+        HashMap::new();
 
     let mut avatar_mesh_cache: HashMap<
         PlayerId,
@@ -177,6 +189,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut prev_r_squeeze = false;
     let mut prev_l_squeeze = false;
     let mut pull_sessions: [Option<PullSession>; 2] = [None, None];
+    // What each hand grabbed and has not released. Client-side because the
+    // server cannot always tell us: a proximity grab records no grip point name,
+    // so resolve_held_grip reports an empty hand for an object the player is
+    // plainly carrying.
+    let mut grabbed_ids: [Option<String>; 2] = [None, None];
     let mut prev_btn_a = false;
     let mut prev_btn_b = false;
     let mut prev_btn_x = false;
@@ -350,6 +367,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &mesh_cache,
             &live_objects,
             &mut pull_sessions,
+            &mut grabbed_ids,
             &mut prev_r_trigger,
             &mut prev_l_trigger,
             &mut prev_r_squeeze,
@@ -358,6 +376,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &mut prev_btn_b,
             &mut prev_btn_x,
             &mut prev_btn_y,
+            sim_time,
+            &part_transforms,
         );
 
         movement::step_locomotion(
@@ -409,6 +429,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         let remotes = net.remote_players.lock().unwrap().clone();
         let bodies = avatar_render::build_bodies(local_player, &rig, &remotes);
 
+        let pull_hands = part_pull::pull_hand_poses(
+            &pull_sessions, &static_scene, &live_objects, &part_transforms,
+        );
+        let mut local_hand_world: [Option<avatar_ik::Transform>; 2] = [None, None];
         avatar_render::update_avatar_bodies(
             &mut renderer,
             &mut avatar_mesh_cache,
@@ -423,6 +447,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &world,
             cs,
             &bodies,
+            &pull_hands,
+            &mut local_hand_world,
         );
 
         let (cuboids, lights, mesh_instances, mirror_only_mesh_instances, mirror_surface) =
@@ -431,11 +457,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 lights_src,
                 meshes_src,
                 &mut mesh_cache,
+                &mut hidden_part_meshes,
                 &avatar_mesh_cache,
                 &local_direct_mesh,
                 local_player,
                 &world,
-                &rig,
                 &static_scene,
                 &pull_sessions,
                 cs,
@@ -443,6 +469,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 offset,
                 yaw_inv,
                 head_pos,
+                sim_time,
+                local_hand_world,
+                rig_config.held_grip_offset(),
+                &mut part_transforms,
             );
 
         let sounds_src = world.as_ref().map(|w| w.sounds.as_slice()).unwrap_or(&[]);

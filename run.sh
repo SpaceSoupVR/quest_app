@@ -2,6 +2,19 @@
 
 set -e
 
+# --print-env: resolve the NDK toolchain, print it as shell exports, and stop
+# before doing any building or deploying. Lets `cargo` be driven directly
+# without anyone hand-copying paths that then go stale.
+PRINT_ENV=0
+case "${1:-}" in
+    --print-env) PRINT_ENV=1 ;;
+    -h|--help)
+        echo "usage: $0 [--print-env]"
+        echo "  --print-env  print the detected Android toolchain as shell exports and exit"
+        exit 0
+        ;;
+esac
+
 if [ -t 1 ]; then
     C_STEP=$'\033[1;36m'
     C_OK=$'\033[1;32m'
@@ -33,9 +46,126 @@ DROPLET_SSH_HOST="${QUEST_SERVER_SSH_HOST:-root@137.184.21.78}"
 DROPLET_SSH_KEY="${QUEST_SERVER_SSH_KEY:-$HOME/vr_digitalocean}"
 DROPLET_SERVICE="space-soup-server.service"
 HOST_TARGET=$(rustc -vV | awk '/host:/ {print $2}')
-SDK_HOME="${ANDROID_SDK_HOME:-$HOME/Library/Android/sdk}"
-NDK_HOME="${ANDROID_NDK_HOME:-$(ls -d "$SDK_HOME/ndk/"* 2>/dev/null | sort -V | tail -1)}"
 DASHBOARD_SESSION="quest_app"
+
+# ── Host / SDK / NDK discovery ───────────────────────────────────────────────
+# Previously this hardcoded macOS: $HOME/Library/Android/sdk and a
+# darwin-x86_64 toolchain. That works on exactly one developer's machine layout
+# and fails on Linux, on a different SDK location, or under a different user.
+case "$(uname -s)" in
+    Darwin) NDK_PREBUILT="darwin-x86_64"; DEFAULT_SDK="$HOME/Library/Android/sdk"; PKG_HINT="brew install tmux" ;;
+    Linux)  NDK_PREBUILT="linux-x86_64";  DEFAULT_SDK="$HOME/Android/Sdk";         PKG_HINT="sudo apt install tmux  (or your distro's equivalent)" ;;
+    MINGW*|MSYS*|CYGWIN*)
+        # Git Bash / MSYS on Windows. Do not guess a toolchain here: MSYS also
+        # rewrites leading-slash arguments into Windows paths, so adb targets
+        # like /sdcard/... intermittently become C:/Program Files/Git/sdcard/...
+        # and the push appears to fail at random. run_quest.ps1 is the supported
+        # Windows path and has full parity with this script.
+        fail "Running under $(uname -s). Use PowerShell instead: .\\run_quest.ps1"
+        detail "Git Bash mangles adb's /sdcard/... paths, so deploys fail unpredictably."
+        exit 1 ;;
+    *)      NDK_PREBUILT="linux-x86_64";  DEFAULT_SDK="$HOME/Android/Sdk";         PKG_HINT="install tmux with your package manager" ;;
+esac
+
+# Honour the standard variables first, then the per-OS default, then the other
+# common install locations, so nobody has to edit this file to build.
+SDK_HOME="${ANDROID_SDK_ROOT:-${ANDROID_SDK_HOME:-${ANDROID_HOME:-}}}"
+if [ -z "$SDK_HOME" ] || [ ! -d "$SDK_HOME" ]; then
+    for candidate in "$DEFAULT_SDK" "$HOME/Library/Android/sdk" "$HOME/Android/Sdk" "/usr/local/lib/android/sdk" "/opt/android-sdk"; do
+        if [ -d "$candidate" ]; then SDK_HOME="$candidate"; break; fi
+    done
+fi
+
+NDK_HOME="${ANDROID_NDK_ROOT:-${ANDROID_NDK_HOME:-}}"
+if [ -z "$NDK_HOME" ] || [ ! -d "$NDK_HOME" ]; then
+    # Newest NDK that actually has a toolchain for THIS host, rather than the
+    # newest directory name -- a partially-installed NDK sorts highest and then
+    # fails at link time with a confusing missing-compiler error.
+    #
+    # Deliberately no `sort -V` and no `tac`: neither exists on macOS. Using them
+    # here made the pipeline produce nothing on a Mac, so the loop found zero
+    # candidates and the script reported "Android NDK not found" while pointing
+    # at the directory the NDK was sitting in. A portability script that is not
+    # itself portable is worse than no script -- the error blames the user's
+    # install. Ordering by dot-separated numeric fields works on BSD and GNU sort
+    # alike, and `tail -1` replaces `tac | head`.
+    candidates=""
+    for dir in "$SDK_HOME"/ndk/*; do
+        if [ -d "$dir/toolchains/llvm/prebuilt/$NDK_PREBUILT/bin" ]; then
+            candidates="$candidates$(basename "$dir")
+"
+        fi
+    done
+    # Built with an explicit `if` rather than `[ ... ] && ...`: under `set -e` a
+    # trailing false test is the loop's exit status and would kill the script.
+    if [ -n "$candidates" ]; then
+        newest=$(printf '%s' "$candidates" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+        NDK_HOME="$SDK_HOME/ndk/$newest"
+    fi
+fi
+
+if [ ! -d "$NDK_HOME" ]; then
+    fail "Android NDK not found. Set ANDROID_NDK_ROOT, or install it via the SDK manager."
+    detail "Looked under: ${SDK_HOME:-<no SDK found>}/ndk"
+    exit 1
+fi
+
+NDK_BIN="$NDK_HOME/toolchains/llvm/prebuilt/$NDK_PREBUILT/bin"
+
+# API level from gradle rather than hardcoded. Building below minSdk fails at
+# link time as `ld.lld: error: unable to find library -lvulkan` (Vulkan ships
+# from API 24 up), which reads as a missing dependency rather than a wrong level.
+MIN_SDK=$(awk '/minSdk/ {print $2; exit}' "$QUEST_APP_DIR/android/app/build.gradle" 2>/dev/null || echo 29)
+case "$MIN_SDK" in ''|*[!0-9]*) MIN_SDK=29 ;; esac
+if [ "$MIN_SDK" -lt 24 ]; then MIN_SDK=24; fi
+
+# The toolchain lives here, not in .cargo/config.toml, which deliberately holds
+# no absolute paths any more.
+#
+# It used to pin one developer's macOS NDK, and these exports were believed to
+# override it. They did not: cargo's [env] set the HYPHENATED names
+# (CC_aarch64-linux-android) while these are UNDERSCORED, which are different
+# variables -- a non-forced [env] entry only yields to a real variable of the
+# same name. So cc-rs kept resolving the macOS path on every other machine, and
+# reported it as a missing clang++.exe far downstream. cc-rs accepts either
+# spelling, so with that file cleaned out these are what take effect.
+#
+# Without ANDROID_NDK_ROOT, physx-sys panics with
+# `environment variable "ANDROID_NDK_ROOT" has not been set`.
+export ANDROID_NDK_ROOT="$NDK_HOME"
+export ANDROID_NDK_HOME="$NDK_HOME"
+export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android$MIN_SDK-clang"
+export CXX_aarch64_linux_android="$NDK_BIN/aarch64-linux-android$MIN_SDK-clang++"
+export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
+
+for tool in "$CC_aarch64_linux_android" "$CXX_aarch64_linux_android" "$AR_aarch64_linux_android"; do
+    if [ ! -x "$tool" ]; then
+        fail "NDK tool missing or not executable: $tool"
+        exit 1
+    fi
+done
+detail "NDK: $NDK_HOME ($NDK_PREBUILT, API $MIN_SDK)"
+
+# Emit the discovered toolchain as shell exports, so a plain `cargo build` gets
+# the same values this script would use:  eval "$(./run.sh --print-env)"
+# Discovery has to stay in one place; duplicating these paths into a shell
+# profile is how they go stale and how absolute paths end up committed again.
+if [ "${PRINT_ENV:-0}" = "1" ]; then
+    printf 'export ANDROID_NDK_ROOT=%s
+' "$NDK_HOME"
+    printf 'export ANDROID_NDK_HOME=%s
+' "$NDK_HOME"
+    printf 'export CC_aarch64_linux_android=%s
+' "$CC_aarch64_linux_android"
+    printf 'export CXX_aarch64_linux_android=%s
+' "$CXX_aarch64_linux_android"
+    printf 'export AR_aarch64_linux_android=%s
+' "$AR_aarch64_linux_android"
+    printf 'export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=%s
+' "$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
+    exit 0
+fi
 
 cleanup() {
     tmux kill-session -t "$DASHBOARD_SESSION" 2>/dev/null || true
@@ -46,7 +176,7 @@ trap cleanup EXIT
 WANT_DASHBOARD="${WANT_DASHBOARD:-true}"
 
 if $WANT_DASHBOARD && ! command -v tmux >/dev/null 2>&1; then
-    fail "tmux not found — install it with: brew install tmux"
+    fail "tmux not found — install it with: $PKG_HINT"
     exit 1
 fi
 
@@ -149,7 +279,9 @@ wait_for_tcp_listener() {
     local port="$1"
     local tries=0
     step "Waiting for listener on :$port..."
-    until nc -z 127.0.0.1 "$port" 2>/dev/null; do
+    # bash's own /dev/tcp rather than nc: netcat is absent by default on many
+    # Linux images, and its -z flag differs between the BSD and GNU variants.
+    until (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do
         tries=$((tries + 1))
         if [ "$tries" -ge 30 ]; then
             fail "nothing started listening on :$port after 30s."
@@ -189,7 +321,7 @@ cargo build --target aarch64-linux-android --release
 mkdir -p android/jniLibs/arm64-v8a
 cp target/aarch64-linux-android/release/libquest_app.so android/jniLibs/arm64-v8a/
 
-CXX_SHARED="$NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+CXX_SHARED="$NDK_HOME/toolchains/llvm/prebuilt/$NDK_PREBUILT/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
 if [ -f "$CXX_SHARED" ]; then
     step "Copying libc++_shared.so into jniLibs ..."
     cp "$CXX_SHARED" android/jniLibs/arm64-v8a/libc++_shared.so

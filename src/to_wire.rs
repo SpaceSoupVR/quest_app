@@ -91,14 +91,32 @@ pub fn input_frame_to_wire(input: &InputFrame) -> WireInputFrame {
             .iter()
             .map(|(id, h)| (id.clone(), hand_to_wire(*h)))
             .collect(),
-        button_presses: input
-            .button_presses
-            .iter()
-            .map(|b| space_soup_protocol::WireButtonPress {
-                button: b.button.clone(),
-                object_id: b.object_id.clone(),
-            })
-            .collect(),
+        button_presses: input.button_presses.iter().map(button_press_to_wire).collect(),
+        // Button-up edges travel separately from `released` above, which is GRAB
+        // release and has meant that since before buttons had an up edge at all.
+        button_releases: input.button_releases.iter().map(button_press_to_wire).collect(),
+        axes: space_soup_protocol::WireInputAxes {
+            l_trigger: input.axes.l_trigger,
+            r_trigger: input.axes.r_trigger,
+            l_grip: input.axes.l_grip,
+            r_grip: input.axes.r_grip,
+            l_stick: input.axes.l_stick,
+            r_stick: input.axes.r_stick,
+        },
+        // Blends go up so the server can evaluate blend-threshold triggers. Only
+        // this side can compute them -- a HandPull blend depends on where the hand
+        // is relative to the posed part -- but the actions they fire (spawning a
+        // magazine, handing it to physics) are authoritative world state.
+        part_blends: input.part_blends.clone(),
+        part_transforms: input.part_transforms.clone(),
+    }
+}
+
+fn button_press_to_wire(b: &space_soup_engine::ButtonPress) -> space_soup_protocol::WireButtonPress {
+    space_soup_protocol::WireButtonPress {
+        button: b.button.clone(),
+        object_id: b.object_id.clone(),
+        hand: b.hand.map(hand_to_wire),
     }
 }
 
