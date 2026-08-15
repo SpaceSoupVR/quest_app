@@ -50,6 +50,14 @@ pub(crate) fn update_avatar_bodies(
     world: &Option<WireWorld>,
     cs: &ControllerState,
     bodies: &[(PlayerId, avatar::RemotePlayerState)],
+    // Local player's hands that are mid-pull, already resolved onto the part
+    // they are pulling. [left, right]; None means the hand is drawn as tracked.
+    pull_hands: &[Option<crate::part_pull::PullHandPose>; 2],
+    // Out: the local player's posed wrist-joint world transform per hand [Left, Right],
+    // in render space. A held object attaches to this exact bone (object = wrist *
+    // hand_offset^-1), reproducing the editor's authored pose with no reconstruction --
+    // and inheriting the arm IK's reach clamp for free.
+    local_hand_world: &mut [Option<avatar_ik::Transform>; 2],
 ) {
     avatar_mesh_cache.retain(|id, _| bodies.iter().any(|(bid, _)| *bid == *id));
     avatar_skeleton_cache.retain(|id, _| bodies.iter().any(|(bid, _)| *bid == *id));
@@ -78,7 +86,7 @@ pub(crate) fn update_avatar_bodies(
         let Some(skin) = &mesh.skin else { continue };
         let Some(skeleton) = avatar_skeleton_cache.get(&id) else { continue };
 
-        let mut rig_cfg = *rig_config;
+        let mut rig_cfg = rig_config.clone();
         let up = avatar_ik::detect_up_axis(skeleton);
         rig_cfg.up_axis = up.to_array();
         let raw_bind_head_height = avatar_ik::bind_head_height_along(skeleton, up);
@@ -100,34 +108,67 @@ pub(crate) fn update_avatar_bodies(
             up,
             rig_cfg.forward(),
         );
-        let left_hand = state.left_hand.map(|h| avatar::Transform {
-            position: to_render(h.position),
-            rotation: yaw_inv * h.rotation,
-        });
-        let right_hand = state.right_hand.map(|h| avatar::Transform {
-            position: to_render(h.position),
-            rotation: yaw_inv * h.rotation,
-        });
+
+        // A hand pulling an authored grip is drawn on that grip instead of on the
+        // controller, so it stays wrapped around the handle as the part travels.
+        // Only the local player has pull sessions; remote hands come over the wire
+        // already posed.
+        let posed = |h: avatar::Transform, idx: usize| -> avatar::Transform {
+            match pull_hands[idx].as_ref().filter(|_| id == local_player) {
+                Some(p) => avatar::Transform {
+                    position: to_render(p.position),
+                    rotation: yaw_inv * p.rotation,
+                },
+                None => avatar::Transform {
+                    position: to_render(h.position),
+                    rotation: yaw_inv * h.rotation,
+                },
+            }
+        };
+        let left_hand = state.left_hand.map(|h| posed(h, 0));
+        let right_hand = state.right_hand.map(|h| posed(h, 1));
 
         let (left_curl, right_curl) = if id == local_player {
             let held_l = world.as_ref().and_then(|w| w.left_hand_held.as_ref());
             let held_r = world.as_ref().and_then(|w| w.right_hand_held.as_ref());
-            let l = match held_l {
-                Some(held) => avatar::HandCurl::from_finger_curl(&held.finger_curl, cs.l_squeeze),
-                None => avatar::HandCurl::free_hand(
-                    cs.l_trigger,
-                    cs.l_squeeze,
-                    cs.l_stick_touch,
-                    rig_config.thumb_touch_curl,
+            // The authored pose when the server sent one -- it carries spread and
+            // twist, which a curl map has no axis for. The curl is the fallback
+            // for a server older than that field, and for a hand holding nothing.
+            let max = rig_config.finger_curl_max_deg;
+            let l = match (held_l, pull_hands[0].as_ref()) {
+                (Some(held), _) => held.hand_pose.unwrap_or_else(|| {
+                    avatar::HandPose::from_curl(
+                        avatar::HandCurl::from_finger_curl(&held.finger_curl, cs.l_squeeze),
+                        max,
+                    )
+                }),
+                (None, Some(pull)) => pull.hand_pose,
+                (None, None) => avatar::HandPose::from_curl(
+                    avatar::HandCurl::free_hand(
+                        cs.l_trigger,
+                        cs.l_squeeze,
+                        cs.l_stick_touch,
+                        rig_config.thumb_touch_curl,
+                    ),
+                    max,
                 ),
             };
-            let r = match held_r {
-                Some(held) => avatar::HandCurl::from_finger_curl(&held.finger_curl, cs.r_squeeze),
-                None => avatar::HandCurl::free_hand(
-                    cs.r_trigger,
-                    cs.r_squeeze,
-                    cs.r_stick_touch,
-                    rig_config.thumb_touch_curl,
+            let r = match (held_r, pull_hands[1].as_ref()) {
+                (Some(held), _) => held.hand_pose.unwrap_or_else(|| {
+                    avatar::HandPose::from_curl(
+                        avatar::HandCurl::from_finger_curl(&held.finger_curl, cs.r_squeeze),
+                        max,
+                    )
+                }),
+                (None, Some(pull)) => pull.hand_pose,
+                (None, None) => avatar::HandPose::from_curl(
+                    avatar::HandCurl::free_hand(
+                        cs.r_trigger,
+                        cs.r_squeeze,
+                        cs.r_stick_touch,
+                        rig_config.thumb_touch_curl,
+                    ),
+                    max,
                 ),
             };
             (Some(l), Some(r))
@@ -148,6 +189,22 @@ pub(crate) fn update_avatar_bodies(
             right_curl,
         );
         skin.update_joint_matrices(renderer.queue(), &skinned_mats);
+
+        if id == local_player {
+            // The exact posed wrist a held object attaches to (same solve, render space).
+            *local_hand_world = avatar_ik::posed_hand_worlds(
+                skeleton,
+                &rig_cfg,
+                root.position,
+                root.rotation,
+                head_rot,
+                root_scale,
+                left_hand,
+                right_hand,
+                left_curl,
+                right_curl,
+            );
+        }
 
         if id == local_player {
             let direct = local_direct_mesh.get_or_insert_with(|| {

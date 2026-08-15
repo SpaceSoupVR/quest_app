@@ -1,15 +1,29 @@
-# NDK config for building quest_app to aarch64-linux-android.
+# Android build settings for quest_app.
 #
-# This [env] block keeps getting lost across branches; without it a fresh physx-sys
-# compile panics with `environment variable "ANDROID_NDK_ROOT" has not been set`. The NDK
-# ships only versioned clang wrappers, so CC/CXX/AR must be spelled out. Not `force`d, so
-# run.sh's exported values still win when it sets them. NOTE: these are machine-local
-# absolute paths -- update the NDK version/home if you build on a different machine.
-[target.aarch64-linux-android]
-linker = "/Users/frank/Library/Android/sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android30-clang"
-
-[env]
-ANDROID_NDK_ROOT = "/Users/frank/Library/Android/sdk/ndk/26.3.11579264"
-"CC_aarch64-linux-android" = "/Users/frank/Library/Android/sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android30-clang"
-"CXX_aarch64-linux-android" = "/Users/frank/Library/Android/sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android30-clang++"
-"AR_aarch64-linux-android" = "/Users/frank/Library/Android/sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
+# Deliberately contains NO absolute paths.
+#
+# It used to pin one developer's macOS NDK here -- linker, ANDROID_NDK_ROOT, and
+# CC/CXX/AR all spelled out as `/Users/<name>/Library/Android/sdk/ndk/...`. That
+# broke every other machine, and it broke them in a way that looked like the
+# launcher scripts were at fault: cargo's `[env]` sets the HYPHENATED names
+# (`CC_aarch64-linux-android`), the scripts export the UNDERSCORED ones
+# (`CC_aarch64_linux_android`), and those are different variables. A non-forced
+# `[env]` entry only yields to a real environment variable of the SAME name, so
+# the scripts' values never won and cc-rs kept resolving the macOS path. The
+# failure surfaced far downstream as
+#   cc-rs: failed to find tool ".../darwin-x86_64/bin\clang++.exe"
+# on a Windows machine that had never seen that directory.
+#
+# The toolchain now comes entirely from the environment, discovered per machine:
+#   ./run.sh          (macOS / Linux)
+#   ./run_quest.ps1   (Windows)
+# Both locate the NDK, pick the prebuilt directory matching the host, and export
+# ANDROID_NDK_ROOT plus CC/CXX/AR and the linker in both name spellings.
+#
+# To run cargo directly, source the same values first:
+#   eval "$(./run.sh --print-env)"        # macOS / Linux
+#   . ./run_quest.ps1 -PrintEnv           # Windows
+#
+# Nothing machine-specific belongs in this file. If you find yourself adding an
+# absolute path here, add it to the discovery in those scripts instead -- that is
+# the part that runs on everyone's machine.
