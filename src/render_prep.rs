@@ -83,6 +83,13 @@ pub(crate) fn build_render_lists<'a>(
             Hand::Right => w.right_hand_held.as_ref(),
         });
         let Some(held) = held else { continue };
+        // Both hands can hold one object, but only the primary attachment positions
+        // it. This loop used to write mesh.position/rotation once per hand, so Right
+        // always overwrote Left and the client contradicted the server (which uses
+        // the FIRST grabber). They agreed only when the right hand grabbed first.
+        // A support hand still needs the rest of this block -- it poses its own
+        // fingers onto the object -- so skip only the transform write below.
+        let drives_pose = held.drives_pose;
         let Some((mesh, _)) = mesh_cache.get_mut(&held.object_id) else {
             continue;
         };
@@ -105,8 +112,10 @@ pub(crate) fn build_render_lists<'a>(
         );
         // wrist is already render space, so the object transform is too -- no yaw_inv.
         let (_, rot, pos) = (hand_mat * offset_mat.inverse()).to_scale_rotation_translation();
-        mesh.position = pos;
-        mesh.rotation = rot;
+        if drives_pose {
+            mesh.position = pos;
+            mesh.rotation = rot;
+        }
 
         if let Some(parts) = static_scene.part_animations.get(&held.object_id) {
             if let Some(skin) = &mesh.skin {
