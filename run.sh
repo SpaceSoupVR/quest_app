@@ -104,7 +104,14 @@ if ! $DATA_ONLY; then
 # common install locations, so nobody has to edit this file to build.
 SDK_HOME="${ANDROID_SDK_ROOT:-${ANDROID_SDK_HOME:-${ANDROID_HOME:-}}}"
 if [ -z "$SDK_HOME" ] || [ ! -d "$SDK_HOME" ]; then
-    for candidate in "$DEFAULT_SDK" "$HOME/Library/Android/sdk" "$HOME/Android/Sdk" "/usr/local/lib/android/sdk" "/opt/android-sdk"; do
+    # Homebrew's android-commandlinetools cask is the documented macOS install
+    # path and lands outside every location this used to look in, so a perfectly
+    # good SDK reported as "Android NDK not found". Both prefixes: /opt/homebrew
+    # on Apple Silicon, /usr/local on Intel.
+    for candidate in "$DEFAULT_SDK" "$HOME/Library/Android/sdk" "$HOME/Android/Sdk" \
+                     "/opt/homebrew/share/android-commandlinetools" \
+                     "/usr/local/share/android-commandlinetools" \
+                     "/usr/local/lib/android/sdk" "/opt/android-sdk"; do
         if [ -d "$candidate" ]; then SDK_HOME="$candidate"; break; fi
     done
 fi
