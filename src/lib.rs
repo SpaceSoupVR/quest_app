@@ -33,6 +33,11 @@ mod platform;
 mod render_prep;
 #[cfg(target_os = "android")]
 mod soundmap_client;
+// Deliberately NOT android-gated, unlike its neighbours. The geometry and
+// shading maths here is pure -- glam plus the renderer's vertex struct -- and
+// gating it would mean its tests never compile, let alone run, on any machine a
+// developer actually types on.
+mod terrain_render;
 #[cfg(target_os = "android")]
 mod to_wire;
 
@@ -124,6 +129,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let mut static_scene = grab_detect::StaticScene::load(&dir, &entry_scene);
+    let mut terrain_geometry = load_scene_terrain(&dir, &static_scene.scene_name);
     let mut live_objects = grab_detect::LiveObjects::default();
     let mut client_audio = client_audio::ClientAudio::new();
 
@@ -352,6 +358,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     static_scene.scene_name, w.scene_name
                 );
                 static_scene = grab_detect::StaticScene::load(&dir, &w.scene_name);
+                terrain_geometry = load_scene_terrain(&dir, &w.scene_name);
             }
         }
 
@@ -497,6 +504,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|rl| to_space_soup_beam(rl, offset, yaw_inv))
             .collect();
+        let terrain_arg = terrain_geometry
+            .as_ref()
+            .filter(|t| !t.is_empty())
+            .map(|t| (t.vertices.as_slice(), t.indices.as_slice()));
+
         let proj_views = renderer.render_frame_with_meshes(
             &headset.session,
             &headset.stage,
@@ -507,6 +519,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &lights,
             &particles,
             &beams,
+            terrain_arg,
             mirror_surface,
         )?;
         let proj_layer = openxr::CompositionLayerProjection::new()
@@ -524,4 +537,31 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
     renderer.cleanup();
     Ok(())
+}
+
+
+/// Terrain geometry for a scene, or `None` when it has none.
+///
+/// Reads the scene document straight off the device rather than waiting for the
+/// server to describe it. Terrain is static scene data that run.sh already
+/// pushes with the rest of game/, so sending it per snapshot would spend
+/// bandwidth on something both ends already have -- which matters when the
+/// target is 64 players.
+#[cfg(target_os = "android")]
+fn load_scene_terrain(
+    game_dir: &std::path::Path,
+    scene_name: &str,
+) -> Option<terrain_render::TerrainGeometry> {
+    let path = game_dir.join("scenes").join(format!("{scene_name}.json"));
+    let scene = match space_soup_engine::scene::Scene::load(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("terrain_render: could not read {} for terrain: {e}", path.display());
+            return None;
+        }
+    };
+    let def = scene.terrain.as_ref()?;
+    // Step 1 for now. The LOD knob exists on TerrainSource::patch and is where
+    // distant chunks get cheaper once terrain is big enough to need it.
+    terrain_render::load(def, game_dir, 1)
 }
