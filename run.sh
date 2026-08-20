@@ -39,7 +39,8 @@ case "${1:-}" in
         ;;
 esac
 
-if [ -t 1 ]; then
+# Colour keyed on fd 2, because that is where the log helpers below write.
+if [ -t 2 ]; then
     C_STEP=$'\033[1;36m'
     C_OK=$'\033[1;32m'
     C_WARN=$'\033[1;33m'
@@ -50,11 +51,19 @@ else
     C_STEP=""; C_OK=""; C_WARN=""; C_ERR=""; C_DIM=""; C_RESET=""
 fi
 
-step()  { printf '\n%s==>%s %s%s%s\n'   "$C_STEP" "$C_RESET" "$C_STEP" "$1" "$C_RESET"; }
-ok()    { printf '    %s%s%s\n'         "$C_OK" "$1" "$C_RESET"; }
-warn()  { printf '    %sWARNING:%s %s\n' "$C_WARN" "$C_RESET" "$1"; }
-fail()  { printf '    %sERROR:%s %s\n'  "$C_ERR" "$C_RESET" "$1"; }
-detail(){ printf '    %s%s%s\n'         "$C_DIM" "$1" "$C_RESET"; }
+# All of these write to stderr, so stdout carries only real output.
+#
+# That matters for exactly one caller and it was broken: this script documents
+# `eval "$(./run.sh --print-env)"`, but detail() printed the human-readable
+# "NDK: ..." line to stdout first, so eval got it as a command and died with
+# `number expected`. The documented invocation had never worked. Callers that
+# want the prose still get it -- device_control.py merges stderr into stdout,
+# and a terminal shows both.
+step()  { printf '\n%s==>%s %s%s%s\n'   "$C_STEP" "$C_RESET" "$C_STEP" "$1" "$C_RESET" >&2; }
+ok()    { printf '    %s%s%s\n'         "$C_OK" "$1" "$C_RESET" >&2; }
+warn()  { printf '    %sWARNING:%s %s\n' "$C_WARN" "$C_RESET" "$1" >&2; }
+fail()  { printf '    %sERROR:%s %s\n'  "$C_ERR" "$C_RESET" "$1" >&2; }
+detail(){ printf '    %s%s%s\n'         "$C_DIM" "$1" "$C_RESET" >&2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 XR_DIR="$(dirname "$SCRIPT_DIR")"
@@ -186,6 +195,44 @@ for tool in "$CC_aarch64_linux_android" "$CXX_aarch64_linux_android" "$AR_aarch6
     fi
 done
 detail "NDK: $NDK_HOME ($NDK_PREBUILT, API $MIN_SDK)"
+
+# Gradle needs a JDK, and finding one cannot be left to the caller's shell.
+# zsh only reads ~/.zshrc for INTERACTIVE shells, so an export that works
+# perfectly in a terminal is simply absent when this script is driven from the
+# editor's websocket or any other non-interactive context -- and gradle's
+# failure for that is "Unable to locate a Java Runtime", which names neither
+# the version needed nor how to get it.
+#
+# AGP 8.3.0 + Gradle 9.0 want JDK 17.
+if [ -z "${JAVA_HOME:-}" ] || [ ! -x "${JAVA_HOME:-}/bin/java" ]; then
+    JAVA_HOME=""
+    # macOS ships a resolver that knows about every installed JDK.
+    if [ -x /usr/libexec/java_home ]; then
+        JAVA_HOME="$(/usr/libexec/java_home -v 17 2>/dev/null || true)"
+    fi
+    if [ -z "$JAVA_HOME" ]; then
+        for candidate in \
+            /opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home \
+            /usr/local/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home \
+            /usr/lib/jvm/java-17-openjdk-amd64 \
+            /usr/lib/jvm/java-17-openjdk; do
+            if [ -x "$candidate/bin/java" ]; then JAVA_HOME="$candidate"; break; fi
+        done
+    fi
+fi
+
+if [ -z "$JAVA_HOME" ] || [ ! -x "$JAVA_HOME/bin/java" ]; then
+    fail "No JDK 17 found. Gradle 9 / AGP 8.3 need it, and gradle's own error for"
+    detail "this only says 'Unable to locate a Java Runtime'."
+    case "$(uname -s)" in
+        Darwin) detail "Fix: brew install openjdk@17" ;;
+        *)      detail "Fix: install a JDK 17 package, or set JAVA_HOME to one" ;;
+    esac
+    exit 1
+fi
+export JAVA_HOME
+export PATH="$JAVA_HOME/bin:$PATH"
+detail "JDK: $JAVA_HOME"
 
 fi  # end: not DATA_ONLY (toolchain discovery)
 
