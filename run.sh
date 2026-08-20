@@ -6,11 +6,35 @@ set -e
 # before doing any building or deploying. Lets `cargo` be driven directly
 # without anyone hand-copying paths that then go stale.
 PRINT_ENV=0
+
+# --data-only: push game/ to the headset and relaunch, skipping the native
+# build, the gradle build and the APK install entirely.
+#
+# Scene JSON, models and sounds are DATA. Changing a prop's position does not
+# change a single byte of the APK, but the only path to the headset used to be
+# `cargo build --release` + `gradlew assembleDebug` + `adb install`, so testing
+# a level edit in VR cost minutes of compiling code that had not changed. This
+# is the same push the full run does, without the part that is not needed.
+#
+# Assumes the app is already installed; if it is not, run without the flag once.
+DATA_ONLY=false
+
 case "${1:-}" in
     --print-env) PRINT_ENV=1 ;;
+    --data-only)
+        DATA_ONLY=true
+        # Non-interactive by construction: nothing here needs a decision, and
+        # this path is driven from the editor over a websocket where a `read`
+        # prompt would hang forever.
+        WANT_CLEAN=false
+        WANT_DEPLOY=true
+        WANT_EDITOR=false
+        WANT_DASHBOARD=false
+        ;;
     -h|--help)
-        echo "usage: $0 [--print-env]"
+        echo "usage: $0 [--print-env | --data-only]"
         echo "  --print-env  print the detected Android toolchain as shell exports and exit"
+        echo "  --data-only  push game/ to the headset and relaunch; no build, no install"
         exit 0
         ;;
 esac
@@ -66,6 +90,15 @@ case "$(uname -s)" in
         exit 1 ;;
     *)      NDK_PREBUILT="linux-x86_64";  DEFAULT_SDK="$HOME/Android/Sdk";         PKG_HINT="install tmux with your package manager" ;;
 esac
+
+# Everything from here to the end of the toolchain check exists to compile Rust
+# for Android, and is skipped entirely on a data-only push.
+#
+# Not just a speed saving: this block ends in `exit 1` when the NDK is missing,
+# so without the guard a level designer with adb but no Android toolchain could
+# not push a scene they had just authored -- the script would refuse over a
+# compiler it was never going to invoke.
+if ! $DATA_ONLY; then
 
 # Honour the standard variables first, then the per-OS default, then the other
 # common install locations, so nobody has to edit this file to build.
@@ -147,6 +180,8 @@ for tool in "$CC_aarch64_linux_android" "$CXX_aarch64_linux_android" "$AR_aarch6
 done
 detail "NDK: $NDK_HOME ($NDK_PREBUILT, API $MIN_SDK)"
 
+fi  # end: not DATA_ONLY (toolchain discovery)
+
 # Emit the discovered toolchain as shell exports, so a plain `cargo build` gets
 # the same values this script would use:  eval "$(./run.sh --print-env)"
 # Discovery has to stay in one place; duplicating these paths into a shell
@@ -168,6 +203,11 @@ if [ "${PRINT_ENV:-0}" = "1" ]; then
 fi
 
 cleanup() {
+    # A data-only run started neither of these. `gradlew --stop` in particular
+    # is not free -- it boots a JVM to tell a daemon we never launched to go
+    # away, which is several seconds on a path whose entire point is finishing
+    # in a few.
+    $DATA_ONLY && return 0
     tmux kill-session -t "$DASHBOARD_SESSION" 2>/dev/null || true
     (cd "$QUEST_APP_DIR/android" && ./gradlew --stop >/dev/null 2>&1) || true
 }
@@ -315,6 +355,10 @@ if $WANT_EDITOR; then
     cargo build --target "$HOST_TARGET"
 fi
 
+if $DATA_ONLY; then
+    step "Data-only run — skipping cargo, gradle and APK install."
+else
+
 step "Building quest_app for Android..."
 cd "$QUEST_APP_DIR"
 cargo build --target aarch64-linux-android --release
@@ -332,7 +376,10 @@ fi
 cd android
 ./gradlew assembleDebug
 
+fi  # end: not DATA_ONLY
+
 if $WANT_DEPLOY; then
+    if ! $DATA_ONLY; then
     step "Installing APK..."
     adb install -r app/build/outputs/apk/debug/app-debug.apk
 
@@ -346,6 +393,7 @@ if $WANT_DEPLOY; then
         sleep 1
     done
     ok "Package installed and registered."
+    fi  # end: not DATA_ONLY
 
     cd "$QUEST_APP_DIR"
 
@@ -409,6 +457,12 @@ if $WANT_DEPLOY; then
         ok "Game folder verified on device — all files pushed."
     fi
 
+    # Skipped on a data-only push: it is an SSH round trip to a droplet that a
+    # scene edit cannot possibly have affected, and the whole point of this path
+    # is that it finishes in seconds.
+    if $DATA_ONLY; then
+        detail "Data-only — skipping multiplayer server check and server_url push."
+    else
     step "Verifying multiplayer server is running on $DROPLET_SSH_HOST..."
     if [ -f "$DROPLET_SSH_KEY" ]; then
         if ssh -i "$DROPLET_SSH_KEY" -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
@@ -429,6 +483,7 @@ if $WANT_DEPLOY; then
     else
         warn "server_url.txt may not have written — client could fall back to its default server."
     fi
+    fi  # end: not DATA_ONLY
 
     if $WANT_DASHBOARD; then
         step "Starting dev dashboard (tmux, running in background)..."
@@ -473,7 +528,16 @@ if $WANT_DEPLOY; then
         fi
     fi
 
-    step "Launching quest_app on headset..."
+    if $DATA_ONLY; then
+        # GameRuntime::load reads game/ once at startup, so a running app would
+        # happily carry on showing the scene it loaded before the push. `am
+        # start` alone resumes an existing process; the force-stop is what makes
+        # the pushed data take effect.
+        step "Restarting quest_app so it re-reads the pushed data..."
+        adb shell am force-stop "$PACKAGE" >/dev/null 2>&1 || true
+    else
+        step "Launching quest_app on headset..."
+    fi
     adb shell am start -n "$PACKAGE/android.app.NativeActivity"
 
     tries=0
