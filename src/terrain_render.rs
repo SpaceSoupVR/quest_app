@@ -40,13 +40,26 @@ pub fn load(def: &TerrainDef, game_dir: &std::path::Path, step: u32) -> Option<T
         }
     };
 
-    let patch = source.patch(source.bounds(), step.max(1));
+    let bounds = source.bounds();
+    let patch = source.patch(bounds, step.max(1));
     if patch.positions.is_empty() || patch.indices.is_empty() {
         log::warn!("terrain_render: terrain produced no geometry");
         return None;
     }
 
     let normals = vertex_normals(&patch.positions, &patch.indices);
+
+    // Normalised position over the footprint, for sampling the splat map. Taken
+    // from `bounds` rather than from the TerrainDef's declared size so it stays
+    // correct for any TerrainSource -- the trait is what a future voxel or
+    // chunked representation implements, and the def's shape is not.
+    //
+    // Guarded against a zero-extent axis: a degenerate terrain would otherwise
+    // produce NaN uvs, and a NaN texture coordinate does not error, it just
+    // samples something arbitrary and paints the ground with it.
+    let extent = bounds.max - bounds.min;
+    let inv_x = if extent.x.abs() > 1e-6 { 1.0 / extent.x } else { 0.0 };
+    let inv_z = if extent.z.abs() > 1e-6 { 1.0 / extent.z } else { 0.0 };
     let vertices = patch
         .positions
         .iter()
@@ -55,9 +68,14 @@ pub fn load(def: &TerrainDef, game_dir: &std::path::Path, step: u32) -> Option<T
             position: [p.x, p.y, p.z],
             normal: [n.x, n.y, n.z],
             color: ground_colour(n.y),
-            // No lightmap: terrain is lit dynamically, so the atlas coordinates
-            // the cuboid path uses have nothing to point at.
-            uv2: [0.0, 0.0],
+            // Terrain is lit dynamically and has no lightmap, so the slot the
+            // cuboid path uses for atlas coordinates is free. It carries the
+            // splat uv instead -- one less vertex attribute, and the two can
+            // never both be wanted on the same draw.
+            uv2: [
+                (p.x - bounds.min.x) * inv_x,
+                (p.z - bounds.min.z) * inv_z,
+            ],
             reflectivity: 0.0,
         })
         .collect();
@@ -147,6 +165,52 @@ mod tests {
             for c in ground_colour(y) {
                 assert!((0.0..=1.0).contains(&c), "colour component {c} out of range");
             }
+        }
+    }
+
+    /// The splat uv must span the whole footprint, corner to corner. A uv that
+    /// only ever reaches 0.5 samples a quarter of the map over the whole level
+    /// and looks like a painting mistake rather than a coordinate bug.
+    #[test]
+    fn splat_uvs_span_the_footprint() {
+        use space_soup_engine::terrain::{Heightfield, TerrainSource};
+
+        // 5x5 samples over 40x40 metres, offset so a bug that forgets the
+        // origin cannot pass by accident.
+        let field = Heightfield::new(
+            vec![0u16; 25],
+            [5, 5],
+            [40.0, 40.0],
+            [0.0, 10.0],
+            Vec3::new(100.0, 0.0, -60.0),
+        )
+        .expect("build test heightfield");
+
+        let bounds = field.bounds();
+        let patch = field.patch(bounds, 1);
+        let extent = bounds.max - bounds.min;
+
+        let uvs: Vec<[f32; 2]> = patch
+            .positions
+            .iter()
+            .map(|p| [
+                (p.x - bounds.min.x) / extent.x,
+                (p.z - bounds.min.z) / extent.z,
+            ])
+            .collect();
+
+        let min_u = uvs.iter().map(|c| c[0]).fold(f32::INFINITY, f32::min);
+        let max_u = uvs.iter().map(|c| c[0]).fold(f32::NEG_INFINITY, f32::max);
+        let min_v = uvs.iter().map(|c| c[1]).fold(f32::INFINITY, f32::min);
+        let max_v = uvs.iter().map(|c| c[1]).fold(f32::NEG_INFINITY, f32::max);
+
+        assert!(min_u.abs() < 1e-5, "u should reach 0, got {min_u}");
+        assert!((max_u - 1.0).abs() < 1e-5, "u should reach 1, got {max_u}");
+        assert!(min_v.abs() < 1e-5, "v should reach 0, got {min_v}");
+        assert!((max_v - 1.0).abs() < 1e-5, "v should reach 1, got {max_v}");
+
+        for uv in &uvs {
+            assert!(uv[0].is_finite() && uv[1].is_finite(), "uv must be finite: {uv:?}");
         }
     }
 }
