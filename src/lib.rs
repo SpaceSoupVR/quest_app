@@ -129,7 +129,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let mut static_scene = grab_detect::StaticScene::load(&dir, &entry_scene);
-    let mut terrain_geometry = load_scene_terrain(&dir, &static_scene.scene_name);
+    let mut loaded_terrain = load_scene_terrain(&dir, &static_scene.scene_name);
+    renderer.set_terrain_splat(loaded_terrain.as_ref().and_then(|(_, s)| s.as_ref()));
     let mut live_objects = grab_detect::LiveObjects::default();
     let mut client_audio = client_audio::ClientAudio::new();
 
@@ -358,7 +359,12 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     static_scene.scene_name, w.scene_name
                 );
                 static_scene = grab_detect::StaticScene::load(&dir, &w.scene_name);
-                terrain_geometry = load_scene_terrain(&dir, &w.scene_name);
+                loaded_terrain = load_scene_terrain(&dir, &w.scene_name);
+                // Per scene, alongside the geometry: a splat map left over from
+                // the previous level would paint this one with its materials.
+                renderer.set_terrain_splat(
+                    loaded_terrain.as_ref().and_then(|(_, s)| s.as_ref()),
+                );
             }
         }
 
@@ -504,8 +510,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|rl| to_space_soup_beam(rl, offset, yaw_inv))
             .collect();
-        let terrain_arg = terrain_geometry
+        let terrain_arg = loaded_terrain
             .as_ref()
+            .map(|(g, _)| g)
             .filter(|t| !t.is_empty())
             .map(|t| (t.vertices.as_slice(), t.indices.as_slice()));
 
@@ -551,7 +558,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 fn load_scene_terrain(
     game_dir: &std::path::Path,
     scene_name: &str,
-) -> Option<terrain_render::TerrainGeometry> {
+) -> Option<(
+    terrain_render::TerrainGeometry,
+    Option<space_soup::renderer::terrain_pipeline::TerrainImage>,
+)> {
     let path = game_dir.join("scenes").join(format!("{scene_name}.json"));
     let scene = match space_soup_engine::scene::Scene::load(&path) {
         Ok(s) => s,
@@ -563,5 +573,28 @@ fn load_scene_terrain(
     let def = scene.terrain.as_ref()?;
     // Step 1 for now. The LOD knob exists on TerrainSource::patch and is where
     // distant chunks get cheaper once terrain is big enough to need it.
-    terrain_render::load(def, game_dir, 1)
+    let geometry = terrain_render::load(def, game_dir, 1)?;
+
+    // The splat map is optional and a missing one is not an error: terrain
+    // without authored weights falls back to the slope blend, which is what
+    // every scene looked like before painting existed. A DECLARED map that
+    // cannot be read is worth a warning, though -- that is a broken level
+    // rather than an unpainted one.
+    let splat = match space_soup_engine::terrain::load_splat(def, game_dir) {
+        Ok(Some(map)) => {
+            let [w, h] = map.resolution();
+            log::info!("terrain_render: splat map {w}x{h}");
+            Some(space_soup::renderer::terrain_pipeline::TerrainImage {
+                width: w,
+                height: h,
+                rgba: map.as_bytes().to_vec(),
+            })
+        }
+        Ok(None) => None,
+        Err(e) => {
+            log::warn!("terrain_render: {e}");
+            None
+        }
+    };
+    Some((geometry, splat))
 }
