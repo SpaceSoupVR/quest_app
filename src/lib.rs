@@ -134,9 +134,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     // same four materials -- so they load once here rather than on every scene
     // change. A missing file leaves that layer flat-coloured; see
     // game/textures/terrain/SOURCES.md.
-    renderer.set_terrain_layers(space_soup::renderer::terrain_pipeline::load_terrain_layers(
-        &dir.join("textures").join("terrain"),
-    ));
+    let texture_dir = dir.join("textures").join("terrain");
+    renderer.set_terrain_layers(
+        space_soup::renderer::terrain_pipeline::load_terrain_layers(&texture_dir),
+        space_soup::renderer::terrain_pipeline::load_terrain_normals(&texture_dir),
+    );
     renderer.set_terrain_splat(loaded_terrain.as_ref().and_then(|(_, s)| s.as_ref()));
     let mut live_objects = grab_detect::LiveObjects::default();
     let mut client_audio = client_audio::ClientAudio::new();
