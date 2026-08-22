@@ -139,6 +139,13 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         space_soup::renderer::terrain_pipeline::load_terrain_layers(&texture_dir),
         space_soup::renderer::terrain_pipeline::load_terrain_normals(&texture_dir),
     );
+    // How those layers tile. Per project like the textures, and authored in the
+    // scene editor -- without this the headset renders every terrain at the
+    // engine's built-in tile sizes no matter what the editor previewed, which
+    // is a difference nobody can see until they put the headset on.
+    renderer.set_terrain_settings(
+        space_soup::renderer::terrain_pipeline::load_terrain_settings(&texture_dir),
+    );
     renderer.set_terrain_splat(loaded_terrain.as_ref().and_then(|(_, s)| s.as_ref()));
     let mut live_objects = grab_detect::LiveObjects::default();
     let mut client_audio = client_audio::ClientAudio::new();
