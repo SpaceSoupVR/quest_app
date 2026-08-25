@@ -15,17 +15,26 @@
 //! Built once per scene load. What changes at runtime is only WHICH brushes are
 //! drawn -- a chunk shot out of a wall, a door a script hid -- and that arrives
 //! as a list of ids in the snapshot.
+//!
+//! MATERIALS ARE PER SCENE, AND THEY ARE THE SCENE'S OWN
+//!
+//! Terrain's four layers are one art decision for the whole project. A level's
+//! walls are not: a warehouse and a bunker share nothing. So the material array
+//! is built from exactly the ids the loaded scene's brush faces reference,
+//! which also keeps a level well inside the array's limit without anyone
+//! curating a list.
 
 use std::collections::HashSet;
 
 use glam::{Quat, Vec3};
-use space_soup::renderer::cuboid::SolidVertex;
+use space_soup::renderer::brush_pipeline::{BrushVertex, MAX_BRUSH_MATERIALS};
+use space_soup::renderer::terrain_pipeline::TerrainImage;
 use space_soup_engine::scene::Scene;
 
 /// One brush object's triangles, in world space.
 pub struct BrushObject {
     pub id: String,
-    vertices: Vec<SolidVertex>,
+    vertices: Vec<BrushVertex>,
     indices: Vec<u32>,
 }
 
@@ -34,9 +43,19 @@ pub struct BrushObject {
 pub struct BrushGeometry {
     objects: Vec<BrushObject>,
     /// The last assembly, kept so a frame that changed nothing costs nothing.
-    vertices: Vec<SolidVertex>,
+    vertices: Vec<BrushVertex>,
     indices: Vec<u32>,
     built_for: Option<(Vec3, f32, u64)>,
+    /// Material ids in array-layer order. The renderer's texture array is built
+    /// from this, so index i here is layer i there.
+    materials: Vec<String>,
+}
+
+impl BrushGeometry {
+    /// The material ids this scene's brushes reference, in layer order.
+    pub fn materials(&self) -> &[String] {
+        &self.materials
+    }
 }
 
 impl BrushGeometry {
@@ -54,6 +73,29 @@ impl BrushGeometry {
     /// failing the load: one broken solid in a level is diagnosable from the
     /// log, and a client that refuses to start is not.
     pub fn load(scene: &Scene) -> Self {
+        // Assigned in first-seen order over the scene, which is stable for a
+        // given file -- so a level's layer numbering does not shuffle between
+        // runs, and a screenshot of the wrong texture stays reproducible.
+        let mut materials: Vec<String> = Vec::new();
+        let mut layer_of = |name: &str| -> u32 {
+            if let Some(i) = materials.iter().position(|m| m == name) {
+                return i as u32;
+            }
+            if materials.len() >= MAX_BRUSH_MATERIALS {
+                // Clamped rather than wrapped: wrapping would silently paint
+                // this face with an unrelated material, which looks like an
+                // authoring mistake in a place nobody edited.
+                log::warn!(
+                    "brush_render: more than {MAX_BRUSH_MATERIALS} materials in this scene; \
+                     '{name}' will draw as '{}'",
+                    materials[MAX_BRUSH_MATERIALS - 1]
+                );
+                return (MAX_BRUSH_MATERIALS - 1) as u32;
+            }
+            materials.push(name.to_string());
+            (materials.len() - 1) as u32
+        };
+
         let mut objects = Vec::new();
         for obj in &scene.objects {
             let Some(def) = obj.brush.as_ref() else { continue };
@@ -66,29 +108,31 @@ impl BrushGeometry {
                 obj.cuboid.color.3,
             )
             .to_linear();
-            let reflectivity = obj.cuboid.reflectivity.clamp(0.0, 1.0);
 
-            let mut vertices: Vec<SolidVertex> = Vec::new();
+            let mut vertices: Vec<BrushVertex> = Vec::new();
             let mut indices: Vec<u32> = Vec::new();
             for g in &groups {
+                let material = layer_of(&g.material);
                 let base = vertices.len() as u32;
                 for i in 0..g.positions.len() / 3 {
-                    vertices.push(SolidVertex {
+                    vertices.push(BrushVertex {
                         position: [g.positions[i * 3], g.positions[i * 3 + 1], g.positions[i * 3 + 2]],
                         normal: [g.normals[i * 3], g.normals[i * 3 + 1], g.normals[i * 3 + 2]],
-                        // One colour for the whole object, not one per material.
-                        // The face materials ARE carried through brush_mesh and
-                        // are what a textured brush pipeline will key on; until
-                        // that exists, tinting by material name would invent art
-                        // direction, and the object's own authored colour is
-                        // what these brushes were already being drawn in.
-                        color: colour,
-                        // The face's real texture uv. Nothing samples it yet --
-                        // brushes have no lightmap, so the default white one is
-                        // bound and any coordinate reads white -- but it is the
-                        // coordinate a material pass needs and it is free here.
-                        uv2: [g.uvs[i * 2], g.uvs[i * 2 + 1]],
-                        reflectivity,
+                        tangent: [
+                            g.tangents[i * 4],
+                            g.tangents[i * 4 + 1],
+                            g.tangents[i * 4 + 2],
+                            g.tangents[i * 4 + 3],
+                        ],
+                        // In TILES, straight from the face's own scale, so a
+                        // material tiling every two metres does exactly that.
+                        uv: [g.uvs[i * 2], g.uvs[i * 2 + 1]],
+                        material,
+                        // Multiplied over the texture. For a face whose material
+                        // is missing the array holds white, so this is the whole
+                        // appearance -- which is what keeps an untextured brush
+                        // looking like the colour its object was authored in.
+                        tint: colour,
                     });
                 }
                 indices.extend(g.indices.iter().map(|i| i + base));
@@ -105,7 +149,7 @@ impl BrushGeometry {
         if !objects.is_empty() {
             log::info!("brush_render: {} brushes, {total} triangles", objects.len());
         }
-        Self { objects, ..Default::default() }
+        Self { objects, materials, ..Default::default() }
     }
 
     /// The triangles to draw this frame, in the player's local space.
@@ -125,7 +169,7 @@ impl BrushGeometry {
         offset: Vec3,
         yaw_inv: Quat,
         player_yaw: f32,
-    ) -> Option<(&[SolidVertex], &[u32])> {
+    ) -> Option<(&[BrushVertex], &[u32])> {
         if self.objects.is_empty() {
             return None;
         }
@@ -146,9 +190,17 @@ impl BrushGeometry {
                     // world origin, which looks like broken lighting rather
                     // than like a broken transform.
                     let n = yaw_inv * Vec3::from(v.normal);
-                    self.vertices.push(SolidVertex {
+                    self.vertices.push(BrushVertex {
                         position: p.to_array(),
                         normal: n.to_array(),
+                        // The tangent is a direction in the face, so it turns
+                        // with the wall. Left in world space it would rotate the
+                        // normal map relative to the surface as the player
+                        // turned -- lighting that swims.
+                        tangent: {
+                            let t = yaw_inv * Vec3::new(v.tangent[0], v.tangent[1], v.tangent[2]);
+                            [t.x, t.y, t.z, v.tangent[3]]
+                        },
                         ..*v
                     });
                 }
@@ -161,6 +213,43 @@ impl BrushGeometry {
         }
         Some((&self.vertices, &self.indices))
     }
+}
+
+/// Load a scene's brush materials from the game's material library.
+///
+/// `game/materials/<id>/color.jpg` and `normal.jpg`, which is exactly where the
+/// editor's material library installs them -- one library, both consumers, so
+/// what the author picked in the editor is what the headset binds. `rough.jpg`
+/// and `ao.jpg` may also be there and are not read yet; the shader has no use
+/// for them until it does more than diffuse.
+///
+/// Returns arrays parallel to `materials`, with `None` for anything missing. A
+/// missing colour map is not an error worth failing a level over: it binds
+/// white and the object's authored tint shows through, which is a wall someone
+/// can see and file a bug about rather than a client that will not start.
+pub fn load_materials(
+    game_dir: &std::path::Path,
+    materials: &[String],
+) -> (Vec<TerrainImage>, Vec<Option<TerrainImage>>) {
+    let dir = game_dir.join("materials");
+    let mut colours = Vec::with_capacity(materials.len());
+    let mut normals = Vec::with_capacity(materials.len());
+    for id in materials {
+        // `default` is the engine's name for "no material assigned", not a
+        // directory anyone installs, so it is expected to be absent and is not
+        // worth a warning on every level that has one unpainted face.
+        let colour = TerrainImage::load(&dir.join(id).join("color.jpg"));
+        if colour.is_none() && id != "default" {
+            log::warn!("brush_render: material '{id}' has no colour map; drawing it white");
+        }
+        colours.push(colour.unwrap_or_else(|| TerrainImage {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 255, 255, 255],
+        }));
+        normals.push(TerrainImage::load(&dir.join(id).join("normal.jpg")));
+    }
+    (colours, normals)
 }
 
 /// An order-independent fingerprint of the hidden set.
@@ -247,6 +336,120 @@ mod tests {
         for n in &normals {
             let len = ((n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) as f32).sqrt() / 100.0;
             assert!((len - 1.0).abs() < 0.02, "normals are unit: {n:?}");
+        }
+    }
+
+    /// A wall whose six faces carry three different materials.
+    fn painted_wall(id: &str) -> GameObject {
+        let mut solid = space_soup_engine::brush::block_solid(
+            [-2.0, 0.0, -0.15],
+            [2.0, 2.0, 0.15],
+            "concrete",
+        );
+        solid.faces[0].material = "brick".into();
+        solid.faces[1].material = "brick".into();
+        solid.faces[2].material = "metal".into();
+        GameObject {
+            id: id.into(),
+            brush: Some(space_soup_engine::brush::BrushDef {
+                solids: vec![solid],
+                subtract: Vec::new(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn each_face_carries_the_layer_of_its_own_material() {
+        let g = BrushGeometry::load(&scene_of(vec![painted_wall("wall")]));
+        assert_eq!(g.materials().len(), 3, "three distinct materials: {:?}", g.materials());
+
+        let used: HashSet<u32> = g.objects[0].vertices.iter().map(|v| v.material).collect();
+        assert_eq!(used.len(), 3, "and three distinct layers on the geometry");
+        for i in &used {
+            assert!((*i as usize) < g.materials().len(), "layer {i} is in range");
+        }
+    }
+
+    #[test]
+    fn two_walls_of_the_same_material_share_one_layer() {
+        // The point of one array and a per-vertex index: a level of forty walls
+        // in four materials is four layers and one draw, not forty of either.
+        let g = BrushGeometry::load(&scene_of(vec![painted_wall("a"), painted_wall("b")]));
+        assert_eq!(g.materials().len(), 3, "still three: {:?}", g.materials());
+    }
+
+    #[test]
+    fn a_scene_past_the_material_limit_clamps_rather_than_wrapping() {
+        // Wrapping would paint the overflow with an unrelated material, which
+        // looks like an authoring mistake somewhere nobody edited.
+        let objects: Vec<GameObject> = (0..MAX_BRUSH_MATERIALS + 5)
+            .map(|i| {
+                let mut solid = space_soup_engine::brush::block_solid(
+                    [0.0, 0.0, 0.0],
+                    [1.0, 1.0, 1.0],
+                    &format!("mat{i}"),
+                );
+                for f in &mut solid.faces {
+                    f.material = format!("mat{i}");
+                }
+                GameObject {
+                    id: format!("w{i}"),
+                    brush: Some(space_soup_engine::brush::BrushDef {
+                        solids: vec![solid],
+                        subtract: Vec::new(),
+                    }),
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        let g = BrushGeometry::load(&scene_of(objects));
+        assert_eq!(g.materials().len(), MAX_BRUSH_MATERIALS);
+        for v in g.objects.iter().flat_map(|o| &o.vertices) {
+            assert!(
+                (v.material as usize) < MAX_BRUSH_MATERIALS,
+                "layer {} would read past the end of the array",
+                v.material
+            );
+        }
+    }
+
+    #[test]
+    fn the_uv_is_in_tiles_so_a_wall_repeats_its_material() {
+        // Not 0..1. A 4m wall of a material tiling every 2m must span two
+        // tiles, and normalising it here would make every wall show exactly one
+        // copy of its texture however big it is.
+        let g = BrushGeometry::load(&scene_of(vec![wall_object("wall")]));
+        let us: Vec<f32> = g.objects[0].vertices.iter().map(|v| v.uv[0]).collect();
+        // The SPAN, not the largest value: the wall straddles the origin, so u
+        // runs -1..1 and the biggest single number is 1 while the wall is two
+        // tiles wide.
+        let span = us.iter().fold(f32::MIN, |a, b| a.max(*b))
+            - us.iter().fold(f32::MAX, |a, b| a.min(*b));
+        assert!(
+            (span - 2.0).abs() < 1e-4,
+            "4m of wall at the default 2m tile is two tiles: {span}"
+        );
+    }
+
+    #[test]
+    fn tangents_survive_the_walk_into_the_players_frame() {
+        // A tangent left in world space rotates the normal map relative to the
+        // surface as the player turns, which looks like the lighting swimming.
+        let mut g = BrushGeometry::load(&scene_of(vec![wall_object("wall")]));
+        let yaw = std::f32::consts::FRAC_PI_2;
+        let (verts, _) = g
+            .assemble(&[], Vec3::ZERO, Quat::from_rotation_y(-yaw), yaw)
+            .expect("geometry");
+        for v in verts {
+            let t = Vec3::new(v.tangent[0], v.tangent[1], v.tangent[2]);
+            let n = Vec3::from(v.normal);
+            assert!((t.length() - 1.0).abs() < 1e-3, "tangent stays unit: {t:?}");
+            assert!(
+                t.dot(n).abs() < 1e-3,
+                "and stays in the face it belongs to: t={t:?} n={n:?}"
+            );
         }
     }
 
