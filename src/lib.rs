@@ -37,6 +37,7 @@ mod soundmap_client;
 // shading maths here is pure -- glam plus the renderer's vertex struct -- and
 // gating it would mean its tests never compile, let alone run, on any machine a
 // developer actually types on.
+mod brush_render;
 mod terrain_render;
 #[cfg(target_os = "android")]
 mod to_wire;
@@ -130,6 +131,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut static_scene = grab_detect::StaticScene::load(&dir, &entry_scene);
     let mut loaded_terrain = load_scene_terrain(&dir, &static_scene.scene_name);
+    let mut brushes = load_scene_brushes(&dir, &static_scene.scene_name);
     // Layer textures are per PROJECT, not per scene -- every level shares the
     // same four materials -- so they load once here rather than on every scene
     // change. A missing file leaves that layer flat-coloured; see
@@ -364,6 +366,15 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .map(|w| &w.particle_bursts)
             .unwrap_or(&empty_particle_bursts);
         let lasers_src = world.as_ref().map(|w| &w.lasers).unwrap_or(&empty_lasers);
+        // Empty when there is no snapshot yet, which draws the level whole --
+        // the right failure: a wall that has not been told it was destroyed is
+        // a frame behind, and one that vanishes on a dropped packet is a hole
+        // the level did not authorise.
+        let empty_hidden: Vec<String> = Vec::new();
+        let hidden_brushes = world
+            .as_ref()
+            .map(|w| &w.hidden_brushes)
+            .unwrap_or(&empty_hidden);
 
         if let Some(w) = &world {
             server_player_offset = Some(Vec3::from(w.player_offset));
@@ -376,6 +387,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 static_scene = grab_detect::StaticScene::load(&dir, &w.scene_name);
                 loaded_terrain = load_scene_terrain(&dir, &w.scene_name);
+                // Per scene, like the terrain: the previous level's walls would
+                // otherwise still be standing in this one.
+                brushes = load_scene_brushes(&dir, &w.scene_name);
                 // Per scene, alongside the geometry: a splat map left over from
                 // the previous level would paint this one with its materials.
                 renderer.set_terrain_splat(
@@ -531,6 +545,14 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .map(|(g, _)| g)
             .filter(|t| !t.is_empty())
             .map(|t| (t.vertices.as_slice(), t.indices.as_slice()));
+        // Transformed into the player's frame here rather than at load, and
+        // only when something moved -- see BrushGeometry::assemble.
+        let brush_arg = brushes.assemble(
+            hidden_brushes,
+            offset,
+            yaw_inv,
+            locomotion.player_yaw,
+        );
 
         let proj_views = renderer.render_frame_with_meshes(
             &headset.session,
@@ -543,6 +565,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &particles,
             &beams,
             terrain_arg,
+            brush_arg,
             mirror_surface,
         )?;
         let proj_layer = openxr::CompositionLayerProjection::new()
@@ -570,6 +593,30 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 /// pushes with the rest of game/, so sending it per snapshot would spend
 /// bandwidth on something both ends already have -- which matters when the
 /// target is 64 players.
+/// Mesh a scene's brushes for the renderer.
+///
+/// Beside `load_scene_terrain` and for the same reason: this is static level
+/// data that run.sh already pushed with the rest of game/, so building it here
+/// costs one scene load rather than a share of every snapshot.
+///
+/// An unreadable scene yields no brushes rather than failing: the server is
+/// still authoritative for everything else, and a level missing its walls is
+/// diagnosable from the log in a way that a client which will not start is not.
+#[cfg(target_os = "android")]
+fn load_scene_brushes(
+    game_dir: &std::path::Path,
+    scene_name: &str,
+) -> brush_render::BrushGeometry {
+    let path = game_dir.join("scenes").join(format!("{scene_name}.json"));
+    match space_soup_engine::scene::Scene::load(&path) {
+        Ok(scene) => brush_render::BrushGeometry::load(&scene),
+        Err(e) => {
+            log::warn!("brush_render: could not read {} for brushes: {e}", path.display());
+            brush_render::BrushGeometry::default()
+        }
+    }
+}
+
 #[cfg(target_os = "android")]
 fn load_scene_terrain(
     game_dir: &std::path::Path,
