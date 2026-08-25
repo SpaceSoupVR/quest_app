@@ -132,6 +132,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut static_scene = grab_detect::StaticScene::load(&dir, &entry_scene);
     let mut loaded_terrain = load_scene_terrain(&dir, &static_scene.scene_name);
     let mut brushes = load_scene_brushes(&dir, &static_scene.scene_name);
+    {
+        // Per scene, from the ids its own brush faces reference.
+        let (colours, normals) = brush_render::load_materials(&dir, brushes.materials());
+        renderer.set_brush_materials(&colours, &normals);
+    }
     // Layer textures are per PROJECT, not per scene -- every level shares the
     // same four materials -- so they load once here rather than on every scene
     // change. A missing file leaves that layer flat-coloured; see
@@ -390,6 +395,12 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 // Per scene, like the terrain: the previous level's walls would
                 // otherwise still be standing in this one.
                 brushes = load_scene_brushes(&dir, &w.scene_name);
+                // Alongside the geometry: the previous level's materials would
+                // otherwise be bound against this one's layer numbering, which
+                // paints every wall with an unrelated texture.
+                let (colours, normals) =
+                    brush_render::load_materials(&dir, brushes.materials());
+                renderer.set_brush_materials(&colours, &normals);
                 // Per scene, alongside the geometry: a splat map left over from
                 // the previous level would paint this one with its materials.
                 renderer.set_terrain_splat(
