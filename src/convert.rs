@@ -1,4 +1,9 @@
-#![cfg(target_os = "android")]
+//! Wire types in, renderer types out.
+//!
+//! HOST-COMPILABLE, deliberately. Only the two OpenXR pose helpers below need
+//! Android; everything else here is pure data, and gating the whole module on
+//! the headset meant its tests could never run on a machine anyone develops on
+//! -- which is the same as not having them.
 
 use glam::{Quat, Vec3};
 
@@ -11,10 +16,12 @@ use space_soup_protocol::{
     WireRenderLaser, WireRenderLight,
 };
 
+#[cfg(target_os = "android")]
 pub(crate) fn xr_vec3(p: openxr::Vector3f) -> Vec3 {
     Vec3::new(p.x, p.y, p.z)
 }
 
+#[cfg(target_os = "android")]
 pub(crate) fn xr_quat(o: openxr::Quaternionf) -> Quat {
     Quat::from_xyzw(o.x, o.y, o.z, o.w)
 }
@@ -57,6 +64,7 @@ pub(crate) fn to_space_soup_light(rl: &WireRenderLight, offset: Vec3, yaw_inv: Q
         kind: match rl.kind {
             WireLightKind::Point => SsLightKind::Point,
             WireLightKind::Spot => SsLightKind::Spot,
+            WireLightKind::Directional => SsLightKind::Directional,
         },
         color: ss_color(rl.color),
         intensity: rl.intensity,
@@ -76,4 +84,35 @@ pub(crate) fn to_space_soup_beam(rl: &WireRenderLaser, offset: Vec3, yaw_inv: Qu
 
 pub(crate) fn ss_color(c: WireColor3) -> Color3 {
     Color3(c.0, c.1, c.2, c.3)
+}
+
+#[cfg(test)]
+mod light_kind_tests {
+    use super::*;
+
+    /// The last hop: wire to renderer. Same reasoning as the server's own test
+    /// -- exhaustiveness is free, correctness is not.
+    #[test]
+    fn every_wire_light_kind_reaches_the_renderer_as_itself() {
+        let of = |kind| {
+            to_space_soup_light(
+                &WireRenderLight {
+                    id: "l".into(),
+                    position: [0.0, 0.0, 0.0],
+                    direction: [0.0, -1.0, 0.0],
+                    kind,
+                    color: space_soup_protocol::WireColor3(255, 255, 255, 255),
+                    intensity: 1.0,
+                    range: 5.0,
+                    cone_angle_deg: 45.0,
+                },
+                Vec3::ZERO,
+                Quat::IDENTITY,
+            )
+            .kind
+        };
+        assert_eq!(of(WireLightKind::Point), SsLightKind::Point);
+        assert_eq!(of(WireLightKind::Spot), SsLightKind::Spot);
+        assert_eq!(of(WireLightKind::Directional), SsLightKind::Directional);
+    }
 }

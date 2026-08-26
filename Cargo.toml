@@ -14,6 +14,9 @@ avatar_ik         = { path = "../avatar_ik" }
 space_soup        = { path = "../space_soup", features = ["canvas"] }
 space_soup_engine = { path = "../space_soup_engine" }
 space_soup_hands  = { path = "../space_soup_hands" }
+# Not in the Android block: it is engine-free, platform-free data, and keeping it
+# there is what stopped the wire conversions from being testable off a headset.
+space_soup_protocol = { path = "../space_soup_protocol" }
 openxr            = { version = "0.18", features = ["loaded"] }
 glam              = { version = "0.29", features = ["serde"] }
 log               = "0.4"
@@ -26,7 +29,6 @@ android_logger = "0.14"
 ndk-glue       = { version = "0.7" }
 ndk            = { version = "0.7" }
 
-space_soup_protocol = { path = "../space_soup_protocol" }
 tokio               = { version = "1", features = ["rt", "net", "sync", "time", "macros"] }
 tokio-tungstenite   = "0.29"
 futures-util        = { version = "0.3", default-features = false, features = ["sink", "std"] }
