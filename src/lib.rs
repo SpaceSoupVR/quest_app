@@ -5,7 +5,7 @@ pub mod avatar;
 mod avatar_render;
 #[cfg(target_os = "android")]
 mod client_audio;
-#[cfg(target_os = "android")]
+// Not gated on Android: see the module's own note. Its OpenXR helpers are.
 mod convert;
 #[cfg(target_os = "android")]
 mod debug_packet;
