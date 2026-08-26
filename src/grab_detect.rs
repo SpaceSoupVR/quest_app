@@ -49,15 +49,20 @@ pub struct StaticScene {
     // movement::step_locomotion) -- the same PhysicsWorld type and rebuild() call the
     // server uses, so client and server never disagree about where geometry is.
     pub physics: PhysicsWorld,
+    /// Which sky the scene asked for, if any. The panorama itself lives in the
+    /// shared library under game/skies/, so only the reference travels here.
+    pub sky: Option<space_soup_engine::SkyDef>,
 }
 
 impl StaticScene {
     pub fn load(game_dir: &Path, scene_name: &str) -> Self {
         let path = Manifest::scene_path(game_dir, scene_name);
         let mut physics = PhysicsWorld::new();
+        let mut sky = None;
         let (grip_points, part_animations) = match Scene::load(&path) {
             Ok(scene) => {
                 physics.rebuild(&scene, game_dir);
+                sky = scene.sky.clone();
 
                 let mut grip_points = HashMap::new();
                 let mut part_animations = HashMap::new();
@@ -100,6 +105,7 @@ impl StaticScene {
             grip_points,
             part_animations,
             physics,
+            sky,
         }
     }
 }

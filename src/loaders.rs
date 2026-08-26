@@ -58,3 +58,42 @@ pub(crate) fn spawn_avatar_loader(path: PathBuf, renderer: &XrRenderer) -> Recei
         .expect("failed to spawn avatar_loader");
     rx
 }
+
+/// Load the panorama a scene's sky names, from the shared library.
+///
+/// `None` covers every way this can not happen -- the scene names no sky, the
+/// file is absent, or it does not decode -- because all three end the same way:
+/// the level renders with the flat ambient it had before skies existed, rather
+/// than failing to start. A level missing its sky is a level that looks wrong;
+/// a level that will not load is one nobody can work on.
+pub fn load_scene_sky(
+    game_dir: &std::path::Path,
+    sky: Option<&space_soup_engine::SkyDef>,
+) -> Option<(space_soup::renderer::sky::Panorama, f32, f32)> {
+    let def = sky?;
+    let path = game_dir.join("skies").join(&def.id).join("sky.hdr");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("sky '{}' is not installed ({}): {e}", def.id, path.display());
+            return None;
+        }
+    };
+    match space_soup::renderer::sky::decode_radiance(&bytes) {
+        Ok(pano) => {
+            log::info!(
+                "sky '{}' loaded: {}x{}, rotation {}deg, intensity {}",
+                def.id,
+                pano.width,
+                pano.height,
+                def.rotation_deg,
+                def.intensity,
+            );
+            Some((pano, def.rotation_deg, def.intensity))
+        }
+        Err(e) => {
+            log::warn!("sky '{}' failed to decode: {e:#}", def.id);
+            None
+        }
+    }
+}

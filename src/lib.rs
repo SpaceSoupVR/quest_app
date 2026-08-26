@@ -154,6 +154,17 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         space_soup::renderer::terrain_pipeline::load_terrain_settings(&texture_dir),
     );
     renderer.set_terrain_splat(loaded_terrain.as_ref().and_then(|(_, s)| s.as_ref()));
+    // The sky: the background, and the ambient inside the level. Projecting its
+    // irradiance walks every texel, so it happens here and on a scene change --
+    // never per frame.
+    {
+        let sky = loaders::load_scene_sky(&dir, static_scene.sky.as_ref());
+        renderer.set_sky(
+            sky.as_ref().map(|(p, _, _)| p),
+            sky.as_ref().map_or(0.0, |(_, r, _)| *r),
+            sky.as_ref().map_or(1.0, |(_, _, i)| *i),
+        );
+    }
     let mut live_objects = grab_detect::LiveObjects::default();
     let mut client_audio = client_audio::ClientAudio::new();
 
@@ -395,6 +406,14 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 // Per scene, like the terrain: the previous level's walls would
                 // otherwise still be standing in this one.
                 brushes = load_scene_brushes(&dir, &w.scene_name);
+                {
+                    let sky = loaders::load_scene_sky(&dir, static_scene.sky.as_ref());
+                    renderer.set_sky(
+                        sky.as_ref().map(|(p, _, _)| p),
+                        sky.as_ref().map_or(0.0, |(_, r, _)| *r),
+                        sky.as_ref().map_or(1.0, |(_, _, i)| *i),
+                    );
+                }
                 // Alongside the geometry: the previous level's materials would
                 // otherwise be bound against this one's layer numbering, which
                 // paints every wall with an unrelated texture.
