@@ -173,6 +173,27 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut locomotion = Locomotion::new(LocomotionMode::Smooth);
 
+    // BAKED LIGHTING FROM DISK, BEFORE ANY NETWORKING.
+    //
+    // This is the path a shipped game uses, and until now it did not exist: the
+    // only source of lightmaps was the WebSocket below, which reaches the
+    // editor's server on localhost:8000. On a headset with no server that
+    // silently falls back to a white 1x1 texture, so every light shines through
+    // every wall and the level looks lit but wrong -- there is no error, because
+    // the fallback is deliberate and correct for "not baked yet".
+    //
+    // Loaded first so the WebSocket, when there IS one, overrides it. That
+    // ordering is what keeps lighting edits appearing live while authoring
+    // without making authoring a requirement for shipping.
+    {
+        let maps = space_soup_engine::lightmaps::load_scene_lightmaps(&dir, &static_scene.scene_name);
+        info!("lightmaps: loaded {} baked map(s) from disk", maps.len());
+        for m in maps {
+            renderer.set_cuboid_lightmap(&m.object_id, &m.rgba, m.width, m.height);
+            renderer.set_mesh_lightmap(&m.object_id, &m.rgba, m.width, m.height);
+        }
+    }
+
     let net = network::spawn(network::server_url());
     let lightmap_rx = lightmap_client::spawn(entry_scene.clone());
     let soundmap_rx = soundmap_client::spawn(entry_scene.clone());
