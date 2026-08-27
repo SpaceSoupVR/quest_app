@@ -189,6 +189,12 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         let maps = space_soup_engine::lightmaps::load_scene_lightmaps(&dir, &static_scene.scene_name);
         info!("lightmaps: loaded {} baked map(s) from disk", maps.len());
         for m in maps {
+            // The level's brushes share one atlas under a reserved id, because
+            // they share one draw call. Everything else is per object.
+            if m.target == space_soup_engine::lightmaps::LightmapTarget::Brush {
+                renderer.set_brush_lightmap(&m.rgba, m.width, m.height);
+                continue;
+            }
             renderer.set_cuboid_lightmap(&m.object_id, &m.rgba, m.width, m.height);
             renderer.set_mesh_lightmap(&m.object_id, &m.rgba, m.width, m.height);
         }

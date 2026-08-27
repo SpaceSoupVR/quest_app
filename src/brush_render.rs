@@ -96,10 +96,22 @@ impl BrushGeometry {
             (materials.len() - 1) as u32
         };
 
+        // One lightmap layout for the whole level, built from the brushes in
+        // scene order -- exactly the list the baker walks, so a brush's index
+        // means the same thing on both sides. Built once outside the loop
+        // because it is a property of the level, not of any one brush.
+        let brush_defs: Vec<&space_soup_engine::brush::BrushDef> =
+            scene.objects.iter().filter_map(|o| o.brush.as_ref()).collect();
+        let lm_layout =
+            space_soup_engine::brush_lightmap::scene_brush_lightmap_layout(&brush_defs);
+
         let mut objects = Vec::new();
+        let mut brush_index = 0usize;
         for obj in &scene.objects {
             let Some(def) = obj.brush.as_ref() else { continue };
-            let groups = space_soup_engine::brush::brush_mesh(def);
+            let groups =
+                space_soup_engine::brush::brush_mesh_in_atlas(def, &lm_layout, brush_index);
+            brush_index += 1;
 
             let colour = space_soup::renderer::Color3(
                 obj.cuboid.color.0,
@@ -133,6 +145,8 @@ impl BrushGeometry {
                         // appearance -- which is what keeps an untextured brush
                         // looking like the colour its object was authored in.
                         tint: colour,
+                        // Where this vertex reads the level's baked lighting.
+                        uv2: [g.uv2[i * 2], g.uv2[i * 2 + 1]],
                     });
                 }
                 indices.extend(g.indices.iter().map(|i| i + base));
