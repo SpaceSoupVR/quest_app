@@ -244,10 +244,12 @@ impl BrushGeometry {
 pub fn load_materials(
     game_dir: &std::path::Path,
     materials: &[String],
-) -> (Vec<TerrainImage>, Vec<Option<TerrainImage>>) {
+) -> BrushMaterialMaps {
     let dir = game_dir.join("materials");
     let mut colours = Vec::with_capacity(materials.len());
     let mut normals = Vec::with_capacity(materials.len());
+    let mut roughs = Vec::with_capacity(materials.len());
+    let mut aos = Vec::with_capacity(materials.len());
     for id in materials {
         // `default` is the engine's name for "no material assigned", not a
         // directory anyone installs, so it is expected to be absent and is not
@@ -262,8 +264,26 @@ pub fn load_materials(
             rgba: vec![255, 255, 255, 255],
         }));
         normals.push(TerrainImage::load(&dir.join(id).join("normal.jpg")));
+        // Genuinely optional, and silently so. Plenty of materials ship with
+        // neither, and a missing one means "fully rough, fully unoccluded" --
+        // which is exactly how every brush looked before these were read at
+        // all, so an older material library keeps rendering unchanged.
+        roughs.push(TerrainImage::load(&dir.join(id).join("rough.jpg")));
+        aos.push(TerrainImage::load(&dir.join(id).join("ao.jpg")));
     }
-    (colours, normals)
+    BrushMaterialMaps { colours, normals, roughs, aos }
+}
+
+/// Every map the brush shader reads, one entry per material in order.
+///
+/// A struct rather than a tuple because it grew to four parallel vectors, and
+/// four positional returns is an invitation to pass roughness where ambient
+/// occlusion belongs -- which would light perfectly and look merely wrong.
+pub struct BrushMaterialMaps {
+    pub colours: Vec<TerrainImage>,
+    pub normals: Vec<Option<TerrainImage>>,
+    pub roughs: Vec<Option<TerrainImage>>,
+    pub aos: Vec<Option<TerrainImage>>,
 }
 
 /// An order-independent fingerprint of the hidden set.
