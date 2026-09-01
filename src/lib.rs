@@ -134,8 +134,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut brushes = load_scene_brushes(&dir, &static_scene.scene_name);
     {
         // Per scene, from the ids its own brush faces reference.
-        let (colours, normals) = brush_render::load_materials(&dir, brushes.materials());
-        renderer.set_brush_materials(&colours, &normals);
+        let maps = brush_render::load_materials(&dir, brushes.materials());
+        renderer.set_brush_materials(&maps.colours, &maps.normals, &maps.roughs, &maps.aos);
     }
     // Layer textures are per PROJECT, not per scene -- every level shares the
     // same four materials -- so they load once here rather than on every scene
@@ -444,9 +444,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 // Alongside the geometry: the previous level's materials would
                 // otherwise be bound against this one's layer numbering, which
                 // paints every wall with an unrelated texture.
-                let (colours, normals) =
-                    brush_render::load_materials(&dir, brushes.materials());
-                renderer.set_brush_materials(&colours, &normals);
+                let maps = brush_render::load_materials(&dir, brushes.materials());
+                renderer.set_brush_materials(&maps.colours, &maps.normals, &maps.roughs, &maps.aos);
                 // Per scene, alongside the geometry: a splat map left over from
                 // the previous level would paint this one with its materials.
                 renderer.set_terrain_splat(
