@@ -4,6 +4,8 @@ pub mod avatar;
 #[cfg(target_os = "android")]
 mod avatar_render;
 #[cfg(target_os = "android")]
+mod calibration_menu;
+#[cfg(target_os = "android")]
 mod client_audio;
 #[cfg(target_os = "android")]
 mod convert;
@@ -163,6 +165,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let boy_glb_path = dir.join("models/boy/boy.glb");
     let rig_config = avatar::load_rig_config(&dir.join("avatar_rig.json"));
     let synthetic_hand_config = load_synthetic_hand_config(&dir.join("synthetic_hand.json"));
+    let mut calibration_menu =
+        calibration_menu::CalibrationMenu::new(calibration_menu::load(&dir));
 
     let mut calibrated_heights: HashMap<PlayerId, avatar_ik::HeightCalibrator> = HashMap::new();
     let mut hand_pose_smooth: HashMap<PlayerId, [avatar_ik::HandPose; 2]> = HashMap::new();
@@ -318,6 +322,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
         let cs = &controllers.state;
 
+        calibration_menu.update(cs, dt, &dir);
+        let effective_rig_config = calibration_menu.values.apply_to(&rig_config);
+
         let rig = build_player_rig(&eye_views, &locomotion, cs, &hands, &synthetic_hand_config);
 
         let world = net.latest_world.lock().unwrap().clone();
@@ -441,7 +448,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &avatar_master_mesh,
             &mut local_direct_mesh,
             local_player,
-            &rig_config,
+            &effective_rig_config,
             &mut calibrated_heights,
             &mut hand_pose_smooth,
             offset,
@@ -453,7 +460,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &mut local_hand_world,
         );
 
-        let (cuboids, lights, mesh_instances, mirror_only_mesh_instances, mirror_surface) =
+        let (mut cuboids, lights, mesh_instances, mirror_only_mesh_instances, mirror_surface) =
             render_prep::build_render_lists(
                 cuboids_src,
                 lights_src,
@@ -473,9 +480,14 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 head_pos,
                 sim_time,
                 local_hand_world,
-                rig_config.held_grip_offset(),
+                effective_rig_config.held_grip_offset(),
                 &mut part_transforms,
             );
+        // Anchored to the left wrist -- toggled by the left menu button, driven
+        // by the right hand's stick/trigger. Just cuboids appended onto the same
+        // list the scene renders from; nothing else in the frame needs to know
+        // the menu exists.
+        cuboids.extend(calibration_menu.cuboids(local_hand_world[0]));
 
         let sounds_src = world.as_ref().map(|w| w.sounds.as_slice()).unwrap_or(&[]);
         let occlusion: HashMap<String, f32> = sounds_src
