@@ -165,6 +165,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let synthetic_hand_config = load_synthetic_hand_config(&dir.join("synthetic_hand.json"));
 
     let mut calibrated_heights: HashMap<PlayerId, avatar_ik::HeightCalibrator> = HashMap::new();
+    let mut hand_pose_smooth: HashMap<PlayerId, [avatar_ik::HandPose; 2]> = HashMap::new();
 
     let mut local_direct_mesh: Option<(
         GltfMesh,
@@ -442,6 +443,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             local_player,
             &rig_config,
             &mut calibrated_heights,
+            &mut hand_pose_smooth,
             offset,
             yaw_inv,
             &world,
