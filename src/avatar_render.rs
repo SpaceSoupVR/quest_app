@@ -45,6 +45,10 @@ pub(crate) fn update_avatar_bodies(
     local_player: PlayerId,
     rig_config: &avatar_ik::RigConfig,
     calibrated_heights: &mut HashMap<PlayerId, avatar_ik::HeightCalibrator>,
+    // Last frame's resolved hand pose per hand [left, right], blended toward each
+    // new frame's target instead of snapping straight to it -- smooths grip/curl
+    // changes (and authored grip poses) regardless of which branch produced them.
+    hand_pose_smooth: &mut HashMap<PlayerId, [avatar::HandPose; 2]>,
     offset: Vec3,
     yaw_inv: Quat,
     world: &Option<WireWorld>,
@@ -61,6 +65,7 @@ pub(crate) fn update_avatar_bodies(
 ) {
     avatar_mesh_cache.retain(|id, _| bodies.iter().any(|(bid, _)| *bid == *id));
     avatar_skeleton_cache.retain(|id, _| bodies.iter().any(|(bid, _)| *bid == *id));
+    hand_pose_smooth.retain(|id, _| bodies.iter().any(|(bid, _)| *bid == *id));
 
     for (id, state) in bodies.iter().copied() {
         if !avatar_mesh_cache.contains_key(&id) {
@@ -144,11 +149,12 @@ pub(crate) fn update_avatar_bodies(
                 }),
                 (None, Some(pull)) => pull.hand_pose,
                 (None, None) => avatar::HandPose::from_curl(
-                    avatar::HandCurl::free_hand(
+                    avatar::HandCurl::free_hand_resting(
                         cs.l_trigger,
                         cs.l_squeeze,
-                        cs.l_stick_touch,
+                        cs.l_stick_touch || cs.l_trigger_touch || cs.l_face_touch,
                         rig_config.thumb_touch_curl,
+                        rig_config.rest_curl(),
                     ),
                     max,
                 ),
@@ -162,15 +168,28 @@ pub(crate) fn update_avatar_bodies(
                 }),
                 (None, Some(pull)) => pull.hand_pose,
                 (None, None) => avatar::HandPose::from_curl(
-                    avatar::HandCurl::free_hand(
+                    avatar::HandCurl::free_hand_resting(
                         cs.r_trigger,
                         cs.r_squeeze,
-                        cs.r_stick_touch,
+                        cs.r_stick_touch || cs.r_trigger_touch || cs.r_face_touch,
                         rig_config.thumb_touch_curl,
+                        rig_config.rest_curl(),
                     ),
                     max,
                 ),
             };
+
+            // Blend toward this frame's target instead of snapping to it, so a
+            // grip closing/opening (and an authored grip pose taking over) reads
+            // as a motion instead of a pose swap.
+            let prev = hand_pose_smooth
+                .entry(id)
+                .or_insert_with(|| [avatar::HandPose::default(); 2]);
+            const SMOOTH_RATE: f32 = 0.4;
+            let l = avatar::HandPose::blend(prev[0], l, SMOOTH_RATE);
+            let r = avatar::HandPose::blend(prev[1], r, SMOOTH_RATE);
+            *prev = [l, r];
+
             (Some(l), Some(r))
         } else {
             (None, None)
