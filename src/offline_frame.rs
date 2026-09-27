@@ -607,6 +607,9 @@ mod tests {
             // own lamp (tracker 2.5): the south one, and down the hallway.
             Ok("sconce") => View::headset(Vec3::new(5.4, 1.6, -2.4), Vec3::new(5.0, 1.9, -4.2)),
             Ok("sconce_far") => View::headset(Vec3::new(3.4, 1.6, -3.0), Vec3::new(9.0, 1.4, -3.0)),
+            // The pillar from the front-left, where its floor reflection
+            // seemed to meet only half its width (headset 2026-09-27 19:10).
+            Ok("pillar_oblique") => View::headset(Vec3::new(-1.2, 1.6, -2.5), Vec3::new(0.2, 0.2, -7.0)),
             _ => View::headset(Vec3::new(0.3, 1.6, -3.0), Vec3::new(0.0, 0.9, -7.0)),
         };
         let sources = std::env::var("SOURCES").as_deref() == Ok("1");
