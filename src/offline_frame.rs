@@ -52,11 +52,25 @@ pub struct View {
     pub adapt: bool,
     /// Switch the doorway handover off, to see what it changes.
     pub no_portals: bool,
+    /// The light loop's culling of lamps that cannot reach a pixel -- the
+    /// `light_culling` lever. On as shipped.
+    pub light_culling: bool,
 }
 
 impl View {
     pub fn headset(eye: Vec3, at: Vec3) -> Self {
-        Self { eye, at, fov_y: 104.0, width: EYE_W, height: EYE_H, samples: 4, sources: false, adapt: false, no_portals: false }
+        Self {
+            eye,
+            at,
+            fov_y: 104.0,
+            width: EYE_W,
+            height: EYE_H,
+            samples: 4,
+            sources: false,
+            adapt: false,
+            no_portals: false,
+            light_culling: true,
+        }
     }
 }
 
@@ -104,6 +118,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     lights.extend(sun);
     let lights = space_soup::renderer::lights::rank_for_budget(&lights, space_soup::renderer::lights::MAX_LIGHTS);
     let lights_uniform = LightsUniform::new(&device);
+    lights_uniform.set_culling(view.light_culling);
     lights_uniform.upload_frame(&queue, &lights, &[], sun.is_some());
 
     // Probes, as `set_reflection_probes` binds them.
@@ -421,6 +436,30 @@ mod tests {
     /// photograph along each junction, visible from the back of the hall and
     /// never up close. 139 such pixels in the front junctions of this view
     /// before the fix, none after (2026-09-23).
+    /// THE LIGHT LOOP'S CULLING CHANGES NO PIXEL. It skips a lamp past its
+    /// range, or one its baked mask hides from the pixel, and both of those
+    /// multiply the lamp's whole contribution by exactly zero -- so the frame
+    /// with culling must be the frame without it, byte for byte, in views that
+    /// see lamps in other rooms through doorways and across the hall.
+    #[test]
+    fn light_culling_changes_no_pixel() {
+        for (eye, at) in [
+            // Across the hall toward the hallway door: lamps in all three rooms.
+            (Vec3::new(-2.45, 1.6, 2.0), Vec3::new(0.0, 0.0, -5.9)),
+            // Down the hallway, its sconces and the brick room beyond.
+            (Vec3::new(3.4, 1.6, -3.0), Vec3::new(9.0, 1.4, -3.0)),
+        ] {
+            let v = View::headset(eye, at);
+            let Some(culled) = render_brushes("test_room", v) else {
+                eprintln!("skipping: no GPU or no test_room");
+                return;
+            };
+            let every = render_brushes("test_room", View { light_culling: false, ..v }).unwrap();
+            let differ = culled.rgba.chunks(4).zip(every.rgba.chunks(4)).filter(|(a, b)| a != b).count();
+            assert_eq!(differ, 0, "culling changed {differ} pixel(s) looking from {eye} at {at}");
+        }
+    }
+
     #[test]
     fn no_single_pixel_probe_lines_along_the_room_seams() {
         let Some(msaa) = render_brushes("test_room", View { sources: true, ..back_to_front() }) else {
