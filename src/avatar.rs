@@ -13,6 +13,9 @@ pub fn skeleton_data_from_skin(skin: &GltfSkin) -> avatar_ik::SkeletonData {
         joint_parents: skin.joint_parents.clone(),
         joint_local_bind: skin.joint_local_bind.clone(),
         inv_bind_mats: skin.inv_bind_mats.clone(),
+        // Measured from the mesh at load. Without it a rig with no eye joints
+        // has nothing to place the first-person camera from.
+        bind_stature: skin.bind_stature,
     }
 }
 

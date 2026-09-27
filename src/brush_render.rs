@@ -31,6 +31,40 @@ use space_soup::renderer::brush_pipeline::{BrushVertex, MAX_BRUSH_MATERIALS};
 use space_soup::renderer::terrain_pipeline::TerrainImage;
 use space_soup_engine::scene::Scene;
 
+/// Whether the headset repairs T-junctions in brush geometry.
+///
+/// OFF, because on the headset it made things WORSE. With it on, room edges
+/// showed a sawtooth artefact in both SSR states that was absent before the
+/// repair (user report, 2026-09-10) -- even though the repaired mesh passes
+/// every geometric check: no flipped or zero-area triangles, lightmap UVs in
+/// range, zero T-junctions. The leading suspect is coplanar overlapping faces
+/// from CSG that z-fight once the repair gives them different triangulations.
+/// Kept as a switch so that can be measured and fixed, not deleted.
+pub const REPAIR_T_JUNCTIONS: bool = true;
+// ^ ON, AND NOW IT ACTUALLY REPAIRS (2026-09-23). test_room: 0 T-junctions.
+//
+// What was wrong, in order, so none of it is retried:
+//   - fan from an INVENTED centroid vertex: reached zero, but the vertex
+//     existed in no other representation and shipped a sawtooth (2026-09-10);
+//   - fan from one real corner: dropped the zero-area triangles spanning runs
+//     of collinear inserted points, i.e. the repair itself -- 408 -> 300;
+//   - ear clipping without a chord check: cut a far corner of the ceiling and
+//     ran the new chord straight through both doorway corners on the front
+//     edge -- the very T-junctions under the front seam and the doorway floor.
+//
+// And the repair was only ever half the fix. The CSG emitted faces that ran on
+// inside solid geometry (`brush::exposed_fragments`), so junctions were two
+// surfaces crossing rather than one shared edge, and 408 T-junctions came from
+// that. Trimmed to exposed surface the level has 96; repaired, 0 -- in 180
+// triangles against the original 204.
+//
+// The remaining T-junctions were exactly where the headset showed artefacts:
+// the front ceiling/wall edge and the doorway floor edge, where the doorway
+// splits the front wall into pieces whose corners land mid-edge on the long
+// ceiling and floor polygons. A T-junction leaves pixel gaps along its edge;
+// through them the headset showed the buried faces behind, lit from inside the
+// wall -- the bright specks the magenta-sky test proved were not sky.
+
 /// One brush object's triangles, in world space.
 pub struct BrushObject {
     pub id: String,
@@ -72,7 +106,14 @@ impl BrushGeometry {
     /// A brush that produces no geometry is dropped with a warning rather than
     /// failing the load: one broken solid in a level is diagnosable from the
     /// log, and a client that refuses to start is not.
+    /// Build the headset's brush mesh, with T-junction repair as configured.
     pub fn load(scene: &Scene) -> Self {
+        Self::load_with(scene, REPAIR_T_JUNCTIONS)
+    }
+
+    /// `load`, with the repair chosen explicitly -- so the repair stays tested
+    /// while it is switched off on the headset.
+    pub fn load_with(scene: &Scene, repair_t_junctions: bool) -> Self {
         // Assigned in first-seen order over the scene, which is stable for a
         // given file -- so a level's layer numbering does not shuffle between
         // runs, and a screenshot of the wrong texture stays reproducible.
@@ -105,14 +146,31 @@ impl BrushGeometry {
         let lm_layout =
             space_soup_engine::brush_lightmap::scene_brush_lightmap_layout(&brush_defs);
 
-        let mut objects = Vec::new();
+        // POLYGONS FIRST, from every brush in the level, so T-junctions are
+        // repaired ACROSS objects as well as within one: a room's carve and the
+        // shell it is carved from are one object, but two buildings that touch
+        // are two, and a crack does not care which.
+        let mut per_object: Vec<(&space_soup_engine::scene::GameObject, usize)> = Vec::new();
+        let mut all_polys: Vec<space_soup_engine::brush::BrushPolygon> = Vec::new();
         let mut brush_index = 0usize;
         for obj in &scene.objects {
             let Some(def) = obj.brush.as_ref() else { continue };
-            let groups =
-                space_soup_engine::brush::brush_mesh_in_atlas(def, &lm_layout, brush_index);
+            let polys =
+                space_soup_engine::brush::brush_polygons_in_atlas(def, &lm_layout, brush_index);
             brush_index += 1;
+            per_object.push((obj, polys.len()));
+            all_polys.extend(polys);
+        }
+        let before = space_soup_engine::brush_tjunction::count_t_junctions(&all_polys);
+        let repaired: Vec<(space_soup_engine::brush::BrushPolygon, bool)> = if repair_t_junctions {
+            space_soup_engine::brush_tjunction::fix_t_junctions(&all_polys)
+        } else {
+            all_polys.iter().map(|p| (p.clone(), false)).collect()
+        };
+        let mut repaired = repaired.into_iter();
 
+        let mut objects = Vec::new();
+        for (obj, count) in per_object {
             let colour = space_soup::renderer::Color3(
                 obj.cuboid.color.0,
                 obj.cuboid.color.1,
@@ -123,33 +181,100 @@ impl BrushGeometry {
 
             let mut vertices: Vec<BrushVertex> = Vec::new();
             let mut indices: Vec<u32> = Vec::new();
-            for g in &groups {
-                let material = layer_of(&g.material);
+            for (poly, changed) in repaired.by_ref().take(count) {
+                let material = layer_of(&poly.material);
+                let tri = space_soup_engine::brush_tjunction::triangulate(&poly, changed);
                 let base = vertices.len() as u32;
-                for i in 0..g.positions.len() / 3 {
+                // THE FACE'S OWN CENTRE, shared by every vertex of it.
+                //
+                // It selects the reflection probe. A fragment's interpolated
+                // position cannot: a room's probe box IS its interior, so wall
+                // fragments sit exactly on the box surface where the
+                // containment test is a coin toss, and an MSAA edge pixel is
+                // shaded at a centre that can lie outside the polygon
+                // altogether, EXTRAPOLATING the position past the box. That
+                // was the dotted line along every room seam. A centroid is
+                // deep inside the room and identical for the whole face, so
+                // the face cannot disagree with itself.
+                // THE FACE'S OWN LIGHTMAP FOOTPRINT, so the fragment can clamp
+                // an extrapolated uv2 back into it. Its own bounding box rather
+                // than the chart rect: strictly inside the chart, already in
+                // hand here, and correct however the atlas is packed.
+                let uv2_rect = {
+                    let mut lo = [f32::INFINITY; 2];
+                    let mut hi = [f32::NEG_INFINITY; 2];
+                    for t in &tri.uv2 {
+                        for a in 0..2 {
+                            lo[a] = lo[a].min(t[a]);
+                            hi[a] = hi[a].max(t[a]);
+                        }
+                    }
+                    // A face with no uv2 at all would leave infinities here and
+                    // clamp every sample to nothing; fall back to the whole
+                    // atlas, which is exactly the old unclamped behaviour.
+                    if lo[0].is_finite() && hi[0].is_finite() {
+                        [lo[0], lo[1], hi[0], hi[1]]
+                    } else {
+                        [0.0, 0.0, 1.0, 1.0]
+                    }
+                };
+                let face_centre = {
+                    let n = tri.positions.len().max(1) as f32;
+                    let mut c = [0.0f32; 3];
+                    for pos in &tri.positions {
+                        c[0] += pos[0];
+                        c[1] += pos[1];
+                        c[2] += pos[2];
+                    }
+                    [c[0] / n, c[1] / n, c[2] / n]
+                };
+                // HALF THE FACE'S EXTENT IN ITS OWN BASIS, about `face_centre`.
+                //
+                // The fragment clamps its interpolated position into this
+                // before taking a view direction; see
+                // `BrushVertex::face_half_extent` for why that is what stops
+                // the seam on polished faces.
+                //
+                // Measured in the face's tangent frame rather than as a world
+                // box, so it survives the player-frame rotation untouched --
+                // exactly like `uv2_rect` and unlike `face_centre`, which is a
+                // position and must be transformed.
+                let face_half_extent = {
+                    let n = Vec3::from(poly.normal);
+                    let raw = Vec3::new(poly.tangent[0], poly.tangent[1], poly.tangent[2]);
+                    let t = (raw - n * n.dot(raw)).normalize_or_zero();
+                    let b = n.cross(t) * poly.tangent[3];
+                    let c = Vec3::from(face_centre);
+                    let mut half = [0.0f32; 2];
+                    for pos in &tri.positions {
+                        let d = Vec3::from(*pos) - c;
+                        half[0] = half[0].max(d.dot(t).abs());
+                        half[1] = half[1].max(d.dot(b).abs());
+                    }
+                    // A degenerate tangent leaves zeros, which would clamp every
+                    // fragment onto the face centre. Fall back to something no
+                    // clamp can bite on, which is the old unclamped behaviour.
+                    if t.length_squared() > 0.5 {
+                        half
+                    } else {
+                        [f32::INFINITY; 2]
+                    }
+                };
+                for i in 0..tri.positions.len() {
                     vertices.push(BrushVertex {
-                        position: [g.positions[i * 3], g.positions[i * 3 + 1], g.positions[i * 3 + 2]],
-                        normal: [g.normals[i * 3], g.normals[i * 3 + 1], g.normals[i * 3 + 2]],
-                        tangent: [
-                            g.tangents[i * 4],
-                            g.tangents[i * 4 + 1],
-                            g.tangents[i * 4 + 2],
-                            g.tangents[i * 4 + 3],
-                        ],
-                        // In TILES, straight from the face's own scale, so a
-                        // material tiling every two metres does exactly that.
-                        uv: [g.uvs[i * 2], g.uvs[i * 2 + 1]],
+                        position: tri.positions[i],
+                        normal: poly.normal,
+                        tangent: poly.tangent,
+                        uv: tri.uvs[i],
                         material,
-                        // Multiplied over the texture. For a face whose material
-                        // is missing the array holds white, so this is the whole
-                        // appearance -- which is what keeps an untextured brush
-                        // looking like the colour its object was authored in.
                         tint: colour,
-                        // Where this vertex reads the level's baked lighting.
-                        uv2: [g.uv2[i * 2], g.uv2[i * 2 + 1]],
+                        uv2: tri.uv2[i],
+                        face_centre,
+                        uv2_rect,
+                        face_half_extent,
                     });
                 }
-                indices.extend(g.indices.iter().map(|i| i + base));
+                indices.extend(tri.indices.iter().map(|i| i + base));
             }
 
             if vertices.is_empty() || indices.is_empty() {
@@ -157,6 +282,13 @@ impl BrushGeometry {
                 continue;
             }
             objects.push(BrushObject { id: obj.id.clone(), vertices, indices });
+        }
+        if before > 0 {
+            if repair_t_junctions {
+                log::info!("brush_render: repaired {before} T-junction(s) so walls meet without cracks");
+            } else {
+                log::info!("brush_render: {before} T-junction(s) left unrepaired (REPAIR_T_JUNCTIONS is off)");
+            }
         }
 
         let total: usize = objects.iter().map(|o| o.indices.len() / 3).sum();
@@ -215,6 +347,20 @@ impl BrushGeometry {
                             let t = yaw_inv * Vec3::new(v.tangent[0], v.tangent[1], v.tangent[2]);
                             [t.x, t.y, t.z, v.tangent[3]]
                         },
+                        // A POSITION, so it gets the position transform. Left
+                        // to `..*v` it would stay in world space while
+                        // `position` moved to the player's frame, and the
+                        // probe box test would be comparing two different
+                        // frames -- the exact bug the header of this file
+                        // warns about for static geometry.
+                        face_centre: (yaw_inv * (Vec3::from(v.face_centre) - offset)).to_array(),
+                        // NOT transformed: this is an atlas UV rectangle, not a
+                        // position. `..*v` copying it through is correct here
+                        // and would have been wrong for `face_centre` -- the two
+                        // sit next to each other and mean different things.
+                        // `face_half_extent` rides through on `..*v` for the
+                        // same reason: it is a pair of LENGTHS in the face's own
+                        // basis, and a yaw rotation does not change a length.
                         ..*v
                     });
                 }
@@ -328,6 +474,133 @@ mod tests {
 
     fn scene_of(objects: Vec<GameObject>) -> Scene {
         Scene { objects, ..Default::default() }
+    }
+
+    /// Vertex-on-edge incidences at the TRIANGLE level, across every object --
+    /// what the rasteriser actually sees. Deliberately independent of the
+    /// engine's polygon-level counter, so the two cannot share a blind spot.
+    fn triangle_level_t_junctions(g: &BrushGeometry) -> usize {
+        let mut verts: Vec<[f32; 3]> = Vec::new();
+        let mut edges: Vec<([f32; 3], [f32; 3])> = Vec::new();
+        for o in &g.objects {
+            verts.extend(o.vertices.iter().map(|v| v.position));
+            for t in o.indices.chunks(3) {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    edges.push((o.vertices[a as usize].position, o.vertices[b as usize].position));
+                }
+            }
+        }
+        let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let mut hits = 0;
+        for (a, b) in &edges {
+            let ab = sub(*b, *a);
+            let len2 = dot(ab, ab);
+            if len2 < 1e-10 {
+                continue;
+            }
+            let len = len2.sqrt();
+            for v in &verts {
+                let t = dot(sub(*v, *a), ab) / len2;
+                if t * len <= 1e-4 || (1.0 - t) * len <= 1e-4 {
+                    continue;
+                }
+                let p = [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t];
+                let d = sub(*v, p);
+                if dot(d, d) < 1e-8 {
+                    hits += 1;
+                }
+            }
+        }
+        hits
+    }
+
+    /// Bilinear at mip level L reaches about 2^L base texels past a chart's
+    /// edge, so a level is only safe while that stays inside the gutter --
+    /// past it the filter averages in whatever the atlas packed next door.
+    /// The renderer's mip counts and the engine's gutters live in crates that
+    /// cannot see each other; this is where they are held together.
+    #[test]
+    fn the_lightmap_mip_depth_fits_the_gutter() {
+        let top = space_soup::renderer::mesh::LIGHTMAP_MIP_LEVELS - 1;
+        assert!(1u32 << top <= space_soup_engine::brush_lightmap::GUTTER);
+    }
+
+    #[test]
+    fn the_sun_mask_mip_depth_fits_its_gutter() {
+        use space_soup_engine::brush_lightmap::{GUTTER, SUN_MASK_SCALE};
+        let top = space_soup::renderer::mesh::SUN_MASK_MIP_LEVELS - 1;
+        assert!(1u32 << top <= GUTTER * SUN_MASK_SCALE);
+        // And no shallower than the lightmap's reach at the same distance: the
+        // mask is SUN_MASK_SCALE times finer, so it needs log2 of that more.
+        let lm_top = space_soup::renderer::mesh::LIGHTMAP_MIP_LEVELS - 1;
+        assert!(top >= lm_top + SUN_MASK_SCALE.trailing_zeros());
+    }
+
+    /// DIAGNOSTIC (not an assertion): edges of the shipped mesh that no other
+    /// triangle shares EXACTLY. A closed surface uses every edge twice, once
+    /// each way; an edge used once is a place the rasteriser can leave a gap.
+    #[test]
+    #[ignore]
+    fn diag_unshared_edges_in_the_shipped_level() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../game/scenes/test_room.json");
+        let scene = space_soup_engine::scene::Scene::load(std::path::Path::new(path)).unwrap();
+        let g = BrushGeometry::load_with(&scene, true);
+        let key = |p: [f32; 3]| [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()];
+        let mut count: std::collections::HashMap<([u32; 3], [u32; 3]), i32> = Default::default();
+        let mut all: Vec<([f32; 3], [f32; 3])> = Vec::new();
+        for o in &g.objects {
+            for t in o.indices.chunks(3) {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let (pa, pb) = (o.vertices[a as usize].position, o.vertices[b as usize].position);
+                    let (ka, kb) = (key(pa), key(pb));
+                    let k = if ka < kb { (ka, kb) } else { (kb, ka) };
+                    *count.entry(k).or_default() += 1;
+                    all.push((pa, pb));
+                }
+            }
+        }
+        let mut once = 0;
+        let mut seen = std::collections::HashSet::new();
+        for (pa, pb) in &all {
+            let (ka, kb) = (key(*pa), key(*pb));
+            let k = if ka < kb { (ka, kb) } else { (kb, ka) };
+            if count[&k] == 1 && seen.insert(k) {
+                once += 1;
+                eprintln!("unshared edge {pa:?} -> {pb:?}");
+            }
+        }
+        // Distinct vertices closer than 5 mm: the same corner computed twice.
+        let mut verts: Vec<[f32; 3]> = g.objects.iter().flat_map(|o| o.vertices.iter().map(|v| v.position)).collect();
+        verts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        verts.dedup();
+        let mut near = 0;
+        for i in 0..verts.len() {
+            for j in i + 1..verts.len() {
+                let d = ((verts[i][0] - verts[j][0]).powi(2) + (verts[i][1] - verts[j][1]).powi(2) + (verts[i][2] - verts[j][2]).powi(2)).sqrt();
+                if d > 0.0 && d < 5e-3 {
+                    near += 1;
+                    eprintln!("near-duplicate {:?} {:?} ({d:e} m)", verts[i], verts[j]);
+                }
+            }
+        }
+        eprintln!("{once} unshared edges, {near} near-duplicate vertex pairs, {} triangles", all.len() / 3);
+    }
+
+    /// THE REAL LEVEL, measured the way the rasteriser meets it: repaired, it
+    /// has NO T-junctions. Unrepaired but trimmed to exposed surface it has 96,
+    /// every one of them where a doorway splits a wall into pieces; see the
+    /// note on `REPAIR_T_JUNCTIONS` for the three triangulations that did not
+    /// get here.
+    #[test]
+    fn the_shipped_level_mesh_has_no_t_junctions() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../game/scenes/test_room.json");
+        let scene = space_soup_engine::scene::Scene::load(std::path::Path::new(path))
+            .expect("test_room.json should load");
+        let g = BrushGeometry::load_with(&scene, true);
+        assert!(!g.objects.is_empty(), "the level produced no brush geometry to check");
+        let hits = triangle_level_t_junctions(&g);
+        assert_eq!(hits, 0, "{hits} vertices still sit inside another triangle's edge");
     }
 
     #[test]

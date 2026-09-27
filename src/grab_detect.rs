@@ -52,6 +52,27 @@ pub struct StaticScene {
     /// Which sky the scene asked for, if any. The panorama itself lives in the
     /// shared library under game/skies/, so only the reference travels here.
     pub sky: Option<space_soup_engine::SkyDef>,
+    /// Exposure and tone curve, travelling the same route as the sky: the
+    /// client needs them to grade the frame and the rest of the Scene stays on
+    /// the server. Defaulted, so a scene file written before the field existed
+    /// still gets the standard filmic response.
+    pub post: space_soup_engine::scene::PostDef,
+    /// Standing water, travelling the same route as the sky: the client draws
+    /// it and the rest of the Scene stays on the server. Empty for every scene
+    /// that has none, which is every scene written before it existed.
+    pub water: Vec<space_soup_engine::water::WaterDef>,
+    /// The scene's terrain definition, kept because water's DEPTH is measured
+    /// against the ground and so needs the real heightfield -- not the decimated
+    /// render LOD, whose smoothing would move every shoreline.
+    pub terrain: Option<space_soup_engine::terrain::TerrainDef>,
+    /// Each reflection probe's id and the world box it is corrected against:
+    /// `(id, centre, min, max)`.
+    ///
+    /// Carried here rather than re-read from the scene file, because it is the
+    /// object's OWN cuboid -- the same one the baker captured from -- and
+    /// reading it twice is how the two would eventually disagree about which
+    /// room a probe describes.
+    pub reflection_probes: Vec<(String, glam::Vec3, glam::Vec3, glam::Vec3)>,
 }
 
 impl StaticScene {
@@ -59,10 +80,27 @@ impl StaticScene {
         let path = Manifest::scene_path(game_dir, scene_name);
         let mut physics = PhysicsWorld::new();
         let mut sky = None;
+        let mut post = space_soup_engine::scene::PostDef::default();
+        let mut water = Vec::new();
+        let mut terrain = None;
+        let mut reflection_probes = Vec::new();
         let (grip_points, part_animations) = match Scene::load(&path) {
             Ok(scene) => {
                 physics.rebuild(&scene, game_dir);
                 sky = scene.sky.clone();
+                post = scene.post;
+                water = scene.water.clone();
+                terrain = scene.terrain.clone();
+                reflection_probes = scene
+                    .objects
+                    .iter()
+                    .filter(|o| o.reflection_probe.is_some())
+                    .map(|o| {
+                        let c = o.cuboid.position;
+                        let h = o.cuboid.half_size;
+                        (o.id.clone(), c, c - h, c + h)
+                    })
+                    .collect();
 
                 let mut grip_points = HashMap::new();
                 let mut part_animations = HashMap::new();
@@ -106,6 +144,10 @@ impl StaticScene {
             part_animations,
             physics,
             sky,
+            post,
+            water,
+            terrain,
+            reflection_probes,
         }
     }
 }

@@ -183,6 +183,14 @@ if [ "$MIN_SDK" -lt 24 ]; then MIN_SDK=24; fi
 # `environment variable "ANDROID_NDK_ROOT" has not been set`.
 export ANDROID_NDK_ROOT="$NDK_HOME"
 export ANDROID_NDK_HOME="$NDK_HOME"
+# Gradle does its OWN discovery and does not look where the block above looked,
+# so a machine with a perfectly good SDK -- found here, used by cargo, printed
+# in the banner -- still failed at `assembleDebug` with "SDK location not
+# found". The alternative it suggests is android/local.properties, which is an
+# absolute path in a file that would then be committed. Exporting is the fix
+# that keeps discovery in one place.
+export ANDROID_HOME="$SDK_HOME"
+export ANDROID_SDK_ROOT="$SDK_HOME"
 export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android$MIN_SDK-clang"
 export CXX_aarch64_linux_android="$NDK_BIN/aarch64-linux-android$MIN_SDK-clang++"
 export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
@@ -241,6 +249,10 @@ fi  # end: not DATA_ONLY (toolchain discovery)
 # Discovery has to stay in one place; duplicating these paths into a shell
 # profile is how they go stale and how absolute paths end up committed again.
 if [ "${PRINT_ENV:-0}" = "1" ]; then
+    printf 'export ANDROID_HOME=%s
+' "$SDK_HOME"
+    printf 'export ANDROID_SDK_ROOT=%s
+' "$SDK_HOME"
     printf 'export ANDROID_NDK_ROOT=%s
 ' "$NDK_HOME"
     printf 'export ANDROID_NDK_HOME=%s
@@ -338,9 +350,17 @@ wait_for_app_data_dir() {
 }
 
 # True if the remote file exists and is non-empty. Pure predicate — never exits.
+# NOTE the `< /dev/null` on every adb call in this file's push path.
+#
+# `adb shell` reads standard input, and these run inside `while IFS= read -r -d ''`
+# loops fed by `find -print0`. Without the redirect the first verify swallows the
+# rest of the file list, the loop ends after ONE file, and the push reports
+# success for the one file it managed. That is exactly what was happening: 40
+# model files locally, 1 on the headset, and no error anywhere -- the level
+# loaded, rendered almost nothing, and looked like a renderer problem.
 verify_remote_file() {
     local path="$1" size
-    size=$(adb shell "stat -c %s '$path' 2>/dev/null || echo 0" | tr -d '\r')
+    size=$(adb shell "stat -c %s '$path' 2>/dev/null || echo 0" < /dev/null | tr -d '\r')
     [ "${size:-0}" -ge 1 ] 2>/dev/null
 }
 
@@ -355,8 +375,8 @@ PUSH_FAILURES=()
 push_file() {
     local src="$1" dst="$2" attempt size
     for attempt in 1 2; do
-        if adb push "$src" "$dst" >/dev/null 2>&1 && verify_remote_file "$dst"; then
-            size=$(adb shell "stat -c %s '$dst' 2>/dev/null || echo 0" | tr -d '\r')
+        if adb push "$src" "$dst" >/dev/null 2>&1 < /dev/null && verify_remote_file "$dst"; then
+            size=$(adb shell "stat -c %s '$dst' 2>/dev/null || echo 0" < /dev/null | tr -d '\r')
             ok "OK: ${dst#"$REMOTE_GAME_DIR"/} ($size bytes)"
             return 0
         fi
@@ -467,6 +487,19 @@ if $WANT_DEPLOY; then
     adb shell mkdir -p "$REMOTE_GAME_DIR"
     push_file "$GAME_DIR/manifest.json" "$REMOTE_GAME_DIR/manifest.json"
 
+    # Every other root-level json, by pattern rather than by name. The explicit
+    # list here had already fallen behind the game directory once
+    # (synthetic_hand.json loaded with defaults and nothing said why), and a
+    # name-by-name list silently omits whatever is added next.
+    shopt -s nullglob
+    for f in "$GAME_DIR"/*.json; do
+        case "$(basename "$f")" in
+            manifest.json) continue ;;
+        esac
+        push_file "$f" "$REMOTE_GAME_DIR/$(basename "$f")"
+    done
+    shopt -u nullglob
+
     if [ -f "$GAME_DIR/avatar_rig.json" ]; then
         push_file "$GAME_DIR/avatar_rig.json" "$REMOTE_GAME_DIR/avatar_rig.json"
     fi
@@ -478,12 +511,48 @@ if $WANT_DEPLOY; then
             push_file "$f" "$REMOTE_GAME_DIR/scenes/$(basename "$f")"
         done
         shopt -u nullglob
+
+        # Baked lighting lives in SIBLING directories -- `<scene>.lightmaps/`
+        # for the atlases and `<scene>.probes/` for the reflection cubemaps --
+        # and the *.json glob above steps straight over both. Without these the
+        # headset runs every level with its baked lighting missing, and because
+        # a scene still loads and still renders, the only symptom is that the
+        # lighting is wrong, which reads as a renderer bug.
+        #
+        # The probes were added to this pattern the hard way: they baked, they
+        # loaded, the shader bound them, and nothing reflected -- because the
+        # files never left the host.
+        while IFS= read -r -d '' d; do
+            rel="${d#"$GAME_DIR"/scenes/}"
+            adb shell mkdir -p "$REMOTE_GAME_DIR/scenes/$rel" < /dev/null
+            while IFS= read -r -d '' f; do
+                push_file "$f" "$REMOTE_GAME_DIR/scenes/$rel/$(basename "$f")"
+            done < <(find "$d" -maxdepth 1 -type f -print0)
+        done < <(find "$GAME_DIR/scenes" -maxdepth 1 -type d \( -name '*.lightmaps' -o -name '*.probes' \) -print0)
     fi
+
+    # Materials, skies and terrain textures.
+    #
+    # None of these were pushed before, and nothing said so: the app loads, the
+    # level loads, and it renders black. The sky is the worst of the three
+    # because an HDRI is the BACKGROUND and most of the LIGHT at once, so its
+    # absence is not a missing picture, it is a missing light source.
+    for group in materials skies textures terrain; do
+        [ -d "$GAME_DIR/$group" ] || continue
+        while IFS= read -r -d '' d; do
+            rel="${d#"$GAME_DIR"/"$group"}"
+            adb shell mkdir -p "$REMOTE_GAME_DIR/$group$rel" < /dev/null
+        done < <(find "$GAME_DIR/$group" -type d -print0)
+        while IFS= read -r -d '' f; do
+            rel="${f#"$GAME_DIR"/"$group"/}"
+            push_file "$f" "$REMOTE_GAME_DIR/$group/$rel"
+        done < <(find "$GAME_DIR/$group" -type f -print0)
+    done
 
     if [ -d "$GAME_DIR/models" ]; then
         while IFS= read -r -d '' d; do
             rel="${d#"$GAME_DIR"/models}"
-            adb shell mkdir -p "$REMOTE_GAME_DIR/models$rel"
+            adb shell mkdir -p "$REMOTE_GAME_DIR/models$rel" < /dev/null
         done < <(find "$GAME_DIR/models" -type d -print0)
 
         # -type f pulls in EVERYTHING: .glb meshes AND their sidecar .bin animation

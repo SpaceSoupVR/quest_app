@@ -7,6 +7,7 @@ mod avatar_render;
 mod client_audio;
 // Not gated on Android: see the module's own note. Its OpenXR helpers are.
 mod convert;
+mod npu_probe;
 #[cfg(target_os = "android")]
 mod debug_packet;
 #[cfg(target_os = "android")]
@@ -38,7 +39,12 @@ mod soundmap_client;
 // gating it would mean its tests never compile, let alone run, on any machine a
 // developer actually types on.
 mod brush_render;
+mod offline_frame;
+mod probe_level;
+mod scene_lights;
+mod scene_meshes;
 mod terrain_render;
+mod water_render;
 #[cfg(target_os = "android")]
 mod to_wire;
 
@@ -64,6 +70,24 @@ use space_soup_protocol::{
 };
 #[cfg(target_os = "android")]
 use std::collections::{HashMap, HashSet};
+
+/// The scene's display settings, in the form the renderer wants.
+///
+/// Set beside the sky and for the same reason: both are properties of the level
+/// being shown, and a level change must carry them across or the new scene is
+/// graded with the old one's exposure.
+fn post_upload_for(post: &space_soup_engine::scene::PostDef)
+    -> space_soup::renderer::uniforms::PostUpload
+{
+    use space_soup_engine::scene::ToneMapDef;
+    space_soup::renderer::uniforms::PostUpload {
+        exposure: post.exposure,
+        tonemap: match post.tonemap {
+            ToneMapDef::Aces => space_soup::renderer::tonemap::ToneMapping::Aces,
+            ToneMapDef::None => space_soup::renderer::tonemap::ToneMapping::None,
+        },
+    }
+}
 
 pub fn run() {
     match run_inner() {
@@ -91,8 +115,18 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     std::panic::set_hook(Box::new(|info| {
         error!("PANIC: {info}");
     }));
+    // Before anything slow: startup runs for seconds before the frame loop
+    // pumps input, and Android calls the app "not responding" after five.
+    platform::spawn_input_drain();
+    // NPU Gate 0: does this app reach the Hexagon DSP? Logs only, on its own
+    // thread. See `npu_probe`.
+    #[cfg(target_os = "android")]
+    npu_probe::spawn();
 
-    info!("init: waiting for activity resume");
+    // Wall clock from the first line this process runs, so every STARTUP line
+    // below can be read as "how far into startup" as well as "how long".
+    let t_start = std::time::Instant::now();
+    info!("STARTUP begin: waiting for activity resume");
     'wait_resume: loop {
         while let Some(event) = ndk_glue::poll_events() {
             match event {
@@ -132,6 +166,16 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut static_scene = grab_detect::StaticScene::load(&dir, &entry_scene);
     let mut loaded_terrain = load_scene_terrain(&dir, &static_scene.scene_name);
     let mut brushes = load_scene_brushes(&dir, &static_scene.scene_name);
+    // The standalone lighting path: a game with no multiplayer server still has
+    // to light its levels. See scene_lights.
+    let mut static_lights = scene_lights::load(&dir, &static_scene.scene_name);
+    // The level's Baked lamps, for the characters and the ground. See
+    // `scene_lights::load_baked`.
+    let mut baked_lights = scene_lights::load_baked(&dir, &static_scene.scene_name);
+    // The other half of the standalone path: without this a game with no server
+    // draws its terrain, its brushes and its lighting, and none of the objects
+    // standing in it. See scene_meshes.
+    let mut static_meshes = scene_meshes::load(&dir, &static_scene.scene_name);
     {
         // Per scene, from the ids its own brush faces reference.
         let maps = brush_render::load_materials(&dir, brushes.materials());
@@ -145,6 +189,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     renderer.set_terrain_layers(
         space_soup::renderer::terrain_pipeline::load_terrain_layers(&texture_dir),
         space_soup::renderer::terrain_pipeline::load_terrain_normals(&texture_dir),
+        space_soup::renderer::terrain_pipeline::load_terrain_rough(&texture_dir),
+        space_soup::renderer::terrain_pipeline::load_terrain_ao(&texture_dir),
     );
     // How those layers tile. Per project like the textures, and authored in the
     // scene editor -- without this the headset renders every terrain at the
@@ -154,6 +200,28 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         space_soup::renderer::terrain_pipeline::load_terrain_settings(&texture_dir),
     );
     renderer.set_terrain_splat(loaded_terrain.as_ref().and_then(|(_, s)| s.as_ref()));
+
+    // WATER. Built once here rather than per frame: the surface is static world
+    // geometry whose depth comes from the terrain, so the only thing that
+    // changes at runtime is the frame it is expressed in and the wave clock.
+    //
+    // Loaded through `terrain::load` again rather than reusing the render
+    // geometry: that copy has been decimated to a render LOD and rebased into
+    // the player's frame, and a shoreline measured against it would be wrong by
+    // however much the LOD smoothed the ground.
+    let mut water_bodies = {
+        let source = static_scene
+            .terrain
+            .as_ref()
+            .and_then(|def| space_soup_engine::terrain::load(def, &dir).ok());
+        water_render::build(&static_scene.water, source.as_deref())
+    };
+    renderer.set_water(
+        &water_bodies
+            .iter()
+            .map(|b| (b.world().to_vec(), b.indices.clone(), b.uniform))
+            .collect::<Vec<_>>(),
+    );
     // The sky: the background, and the ambient inside the level. Projecting its
     // irradiance walks every texel, so it happens here and on a scene change --
     // never per frame.
@@ -164,6 +232,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             sky.as_ref().map_or(0.0, |(_, r, _)| *r),
             sky.as_ref().map_or(1.0, |(_, _, i)| *i),
         );
+        renderer.set_post(post_upload_for(&static_scene.post));
     }
     let mut live_objects = grab_detect::LiveObjects::default();
     let mut client_audio = client_audio::ClientAudio::new();
@@ -185,18 +254,121 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     // Loaded first so the WebSocket, when there IS one, overrides it. That
     // ordering is what keeps lighting edits appearing live while authoring
     // without making authoring a requirement for shipping.
+    // BAKED REFLECTION PROBES, before the lightmaps so a probe is bound by the
+    // time the first frame shades anything with it.
+    //
+    // Each probe's parallax box is the OBJECT's own cuboid -- the same one the
+    // baker captured from -- so the two cannot disagree about which room a
+    // probe describes.
     {
+        // STARTUP IS TIMED, phase by phase.
+        //
+        // The app has been throwing "not responding" a few seconds after
+        // launch all day -- input dispatch times out after 5 s and the main
+        // thread is busy loading. Frames once running are 15 ms, so this is
+        // not a rendering cost, and guessing which phase it is has been wrong
+        // twice already. Each phase says how long it took, so the next log
+        // names the culprit instead of narrowing it down.
+        info!("STARTUP at probes: {} ms since process start", t_start.elapsed().as_millis());
+        let t_probe = std::time::Instant::now();
+        // DESCRIBED FROM THE INDEX, PIXELS FROM DISK ON DEMAND. The box and
+        // capture point come from the bake -- one authored volume subdivides
+        // into cells no scene object describes -- and each probe's file is
+        // read when the renderer's pool needs it, so a large level never holds
+        // every probe at once. See `space_soup::renderer::probe_stream`.
+        if let Some(level) = probe_level::ProbeLevel::load(&dir, &static_scene.scene_name) {
+            info!(
+                "STARTUP probes: indexed {} probe(s), {} doorway(s) in {} ms",
+                level.descs.len(),
+                level.portals.len(),
+                t_probe.elapsed().as_millis(),
+            );
+            let t_upload = std::time::Instant::now();
+            let source = level.source();
+            let depth = level.depth_source();
+            // What stands in the rooms, for the reflection trace; the rooms'
+            // own boxes are its walls. See `probe_level::ProbeLevel::proxies`.
+            let proxies = level.scene_proxies(&dir, &static_scene.scene_name);
+            info!("STARTUP probes: {} reflection prox(ies)", proxies.len());
+            renderer.set_reflection_probes_with_depth(level.descs, level.resolution, level.portals, source, Some(depth));
+            renderer.set_reflection_proxies(proxies);
+            info!(
+                "STARTUP probes: metered, built mip chains and uploaded in {} ms",
+                t_upload.elapsed().as_millis(),
+            );
+        }
+    }
+
+    {
+        info!("STARTUP at lightmaps: {} ms since process start", t_start.elapsed().as_millis());
+        let t_lm = std::time::Instant::now();
         let maps = space_soup_engine::lightmaps::load_scene_lightmaps(&dir, &static_scene.scene_name);
-        info!("lightmaps: loaded {} baked map(s) from disk", maps.len());
-        for m in maps {
+        info!(
+            "STARTUP lightmaps: loaded {} baked map(s) from disk in {} ms",
+            maps.len(),
+            t_lm.elapsed().as_millis(),
+        );
+        // The brush bounce DIRECTION rides under its own reserved id while
+        // carrying the same `Brush` target as the atlas it accompanies, so it
+        // has to be picked out by id BEFORE the loop -- matching on target
+        // alone would hand a map of unit vectors to `set_brush_lightmap` and
+        // let whichever arrived last win.
+        let brush_dir = maps
+            .iter()
+            .find(|m| m.object_id == space_soup_engine::lightmaps::SCENE_BRUSH_DIRECTION_ID)
+            .map(|m| (m.rgba.clone(), m.width, m.height));
+        if brush_dir.is_some() {
+            info!("lightmaps: brush bounce direction map present");
+        }
+        // The sky sun's visibility mask, picked out by id for the same reason.
+        let brush_sun = maps
+            .iter()
+            .find(|m| m.object_id == space_soup_engine::lightmaps::SCENE_BRUSH_SUN_MASK_ID)
+            .map(|m| (m.rgba.clone(), m.width, m.height));
+        match &brush_sun {
+            Some((_, w, h)) => info!("lightmaps: brush sun mask {w}x{h} present"),
+            None => info!("lightmaps: no brush sun mask; brushes take the sun's static map"),
+        }
+        for m in &maps {
+            if m.object_id == space_soup_engine::lightmaps::SCENE_BRUSH_DIRECTION_ID
+                || m.object_id == space_soup_engine::lightmaps::SCENE_BRUSH_SUN_MASK_ID
+            {
+                continue;
+            }
             // The level's brushes share one atlas under a reserved id, because
             // they share one draw call. Everything else is per object.
             if m.target == space_soup_engine::lightmaps::LightmapTarget::Brush {
-                renderer.set_brush_lightmap(&m.rgba, m.width, m.height);
+                renderer.set_brush_lightmap(
+                    lightmap_light(m),
+                    m.width,
+                    m.height,
+                    brush_dir.as_ref().map(|(d, w, h)| (d.as_slice(), *w, *h)),
+                    brush_sun.as_ref().map(|(d, w, h)| (d.as_slice(), *w, *h)),
+                );
                 continue;
             }
-            renderer.set_cuboid_lightmap(&m.object_id, &m.rgba, m.width, m.height);
-            renderer.set_mesh_lightmap(&m.object_id, &m.rgba, m.width, m.height);
+            // The ground's sky-visibility map: one image for the level, sampled
+            // by footprint position rather than belonging to any object.
+            if m.target == space_soup_engine::lightmaps::LightmapTarget::Terrain {
+                renderer.set_terrain_sky_occlusion(Some(
+                    &space_soup::renderer::terrain_pipeline::TerrainImage {
+                        width: m.width,
+                        height: m.height,
+                        rgba: m.rgba.clone(),
+                    },
+                ));
+                // The footprint the map spans, without which a world position
+                // cannot be turned back into a texel. Set together with the
+                // image because either alone is useless.
+                if let Some((t, _)) = loaded_terrain.as_ref() {
+                    let b = t.world_bounds();
+                    renderer.set_terrain_footprint(b.0, b.1);
+                }
+                info!("terrain sky occlusion: {}x{} loaded", m.width, m.height);
+                continue;
+            }
+            renderer.set_cuboid_lightmap(&m.object_id, lightmap_light(m), m.width, m.height);
+            renderer.set_mesh_lightmap(&m.object_id, lightmap_light(m), m.width, m.height);
         }
     }
 
@@ -266,7 +438,17 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut prev_btn_b = false;
     let mut prev_btn_x = false;
     let mut prev_btn_y = false;
+    // For the SSR A/B toggle below. The stick clicks are bound to nothing
+    // else; A/B/X/Y belong to part_pull.
+    let mut prev_r_stick_click = false;
+    // For the brush debug-view cycle below.
+    let mut prev_l_stick_click = false;
+    let mut prev_btn_menu = false;
 
+    // RUNTIME LEVERS: switch renderer features on the headset without a
+    // build. Polled about once a second; see `space_soup::renderer::levers`.
+    let mut lever_file = space_soup::renderer::levers::LeverFile::new(platform::levers_path());
+    let mut lever_tick: u32 = 0;
     'main: loop {
         pump_android_events(&mut exit);
         if exit {
@@ -331,8 +513,12 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         for update in lightmap_rx.try_iter() {
-            renderer.set_cuboid_lightmap(&update.object_id, &update.rgba, update.width, update.height);
-            renderer.set_mesh_lightmap(&update.object_id, &update.rgba, update.width, update.height);
+            let light = match &update.linear {
+                Some(l) => space_soup::renderer::mesh::LightmapLight::Linear(l),
+                None => space_soup::renderer::mesh::LightmapLight::Srgb8(&update.rgba),
+            };
+            renderer.set_cuboid_lightmap(&update.object_id, light, update.width, update.height);
+            renderer.set_mesh_lightmap(&update.object_id, light, update.width, update.height);
         }
         for update in soundmap_rx.try_iter() {
             soundmap_grids.insert(update.object_id, update.grid);
@@ -382,8 +568,85 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(1.0 / 90.0);
         last_time = Some(now);
         sim_time += dt;
+        // The wave clock. Driven from sim_time rather than the frame counter so
+        // the water moves at the same speed whatever the frame rate -- a wave
+        // that sped up when the scene got simpler would be very noticeable.
+        if renderer.water_body_count() > 0 {
+            renderer.set_water_time(sim_time);
+        }
 
         let cs = &controllers.state;
+
+        // DEBUG A/B: the right stick click CYCLES THREE STATES, on the press
+        // rather than while held, so one click is one step.
+        //
+        //   off -> inline -> buffered -> off
+        //
+        // `inline` marches and blends in the forward pass, which is what has
+        // always shipped. `buffered` marches into a reflection buffer, filters
+        // it across neighbouring pixels and composites the result -- the only
+        // place the hit/miss cliff can be removed, and therefore the comb.
+        //
+        // One button rather than two because the comparison that matters is
+        // between the two reflection paths FROM ONE VIEWPOINT, and reaching for
+        // a second control moves your head.
+        if cs.r_stick_click && !prev_r_stick_click {
+            let (on, buffered) =
+                match (renderer.screen_space_reflections(), renderer.buffered_reflections()) {
+                    (false, _) => (true, false),
+                    (true, false) => (true, true),
+                    (true, true) => (false, false),
+                };
+            renderer.set_screen_space_reflections(on);
+            renderer.set_buffered_reflections(buffered);
+            info!(
+                "SSR -> {} by right stick click",
+                match (on, buffered) {
+                    (false, _) => "OFF",
+                    (true, false) => "ON (inline march)",
+                    (true, true) => "ON (buffered: trace + resolve + composite)",
+                },
+            );
+            // BACK TO THE NORMAL PICTURE. A debug view left on from the left
+            // stick is invisible while SSR is off (the SSR view only draws in
+            // the reflection pass), so switching SSR on appeared to switch the
+            // false-colour view on instead of reflections (headset, 2026-09-17).
+            if renderer.debug_view() != space_soup::renderer::brush_pipeline::DebugView::Off {
+                renderer.set_debug_view(space_soup::renderer::brush_pipeline::DebugView::Off);
+                info!("debug view -> Off (reset by the SSR toggle)");
+            }
+        }
+        prev_r_stick_click = cs.r_stick_click;
+        // DIAGNOSTIC: the left stick click cycles what brushes are drawn with --
+        // off, lighting sources (red direct, green baked, blue probe), then SSR
+        // (blue too rough, red left frame, green out of steps, magenta facing
+        // the viewer, grey a hit). The SSR view only shows while SSR is on.
+        if cs.l_stick_click && !prev_l_stick_click {
+            let view = renderer.debug_view().next();
+            renderer.set_debug_view(view);
+            info!("debug view -> {:?} by left stick click", view);
+        }
+        prev_l_stick_click = cs.l_stick_click;
+        // MULTIVIEW A/B: the menu button flips the stereo scene pass, which
+        // draws both eyes in one go instead of once each. Its own control
+        // rather than a state in the SSR cycle, because the comparison that
+        // matters is the SCENE pass and it must be switchable without touching
+        // reflections.
+        //
+        // `set_multiview_scene` returns whether it TOOK: on a device without
+        // MULTIVIEW or MULTISAMPLE_ARRAY the stereo pipelines were never built
+        // and it stays off. Logging the request rather than the answer would
+        // describe a frame that is still drawing one eye at a time.
+        if cs.btn_menu && !prev_btn_menu {
+            let want = !renderer.multiview_scene();
+            let got = renderer.set_multiview_scene(want);
+            info!(
+                "multiview scene pass -> {} by menu button{}",
+                if got { "ON (both eyes in one pass)" } else { "OFF (one pass per eye)" },
+                if want && !got { " -- REFUSED: this device has no stereo pipelines" } else { "" },
+            );
+        }
+        prev_btn_menu = cs.btn_menu;
 
         let rig = build_player_rig(&eye_views, &locomotion, cs, &hands, &synthetic_hand_config);
 
@@ -397,8 +660,27 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         let empty_particle_bursts: Vec<space_soup_protocol::WireRenderParticleBurst> = Vec::new();
         let empty_lasers: Vec<WireRenderLaser> = Vec::new();
         let cuboids_src = world.as_ref().map(|w| &w.cuboids).unwrap_or(&empty_cuboids);
-        let meshes_src = world.as_ref().map(|w| &w.meshes).unwrap_or(&empty_meshes);
-        let lights_src = world.as_ref().map(|w| &w.lights).unwrap_or(&empty_lights);
+        // Cloned for the same reason as the lights: a scene change reassigns
+        // this later in the loop, and a borrow held across that will not build.
+        let fallback_meshes = static_meshes.clone();
+        let meshes_src = match world.as_ref() {
+            Some(w) if !w.meshes.is_empty() => &w.meshes,
+            _ => &fallback_meshes,
+        };
+        let _ = &empty_meshes;
+        // A connected server runs the same collection over the same scene and
+        // sends the same lights, so taking both would light the level twice.
+        // The disk copy is the FALLBACK, not an addition.
+        // Cloned rather than borrowed: a scene change reassigns `static_lights`
+        // later in the same loop, and a borrow held across that is a compile
+        // error. A handful of lights per frame is nothing next to the copy the
+        // networked path already makes.
+        let fallback_lights = static_lights.clone();
+        let lights_src = match world.as_ref() {
+            Some(w) if !w.lights.is_empty() => &w.lights,
+            _ => &fallback_lights,
+        };
+        let _ = &empty_lights;
         let object_bounds_src = world.as_ref().map(|w| &w.object_bounds).unwrap_or(&empty_bounds);
         let particle_emitters_src = world
             .as_ref()
@@ -433,6 +715,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 // Per scene, like the terrain: the previous level's walls would
                 // otherwise still be standing in this one.
                 brushes = load_scene_brushes(&dir, &w.scene_name);
+                static_lights = scene_lights::load(&dir, &w.scene_name);
+                baked_lights = scene_lights::load_baked(&dir, &w.scene_name);
+                static_meshes = scene_meshes::load(&dir, &w.scene_name);
                 {
                     let sky = loaders::load_scene_sky(&dir, static_scene.sky.as_ref());
                     renderer.set_sky(
@@ -440,6 +725,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                         sky.as_ref().map_or(0.0, |(_, r, _)| *r),
                         sky.as_ref().map_or(1.0, |(_, _, i)| *i),
                     );
+                    renderer.set_post(post_upload_for(&static_scene.post));
                 }
                 // Alongside the geometry: the previous level's materials would
                 // otherwise be bound against this one's layer numbering, which
@@ -550,6 +836,22 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &mut local_hand_world,
         );
 
+        lever_tick = lever_tick.wrapping_add(1);
+        if lever_tick % 72 == 0 {
+            match lever_file.poll() {
+                Some(Ok(levers)) => {
+                    info!("LEVERS: {} (from {})", levers.summary(), lever_file.path().display());
+                    renderer.set_levers(levers);
+                }
+                Some(Err(e)) => log::warn!("LEVERS: {} ignored, previous levers kept: {e}", lever_file.path().display()),
+                None => {}
+            }
+        }
+
+        // In the player's frame, like the live lights `build_render_lists` makes.
+        renderer.set_baked_lights(
+            baked_lights.iter().map(|l| convert::to_space_soup_light(l, offset, yaw_inv)).collect(),
+        );
         let (cuboids, lights, mesh_instances, mirror_only_mesh_instances, mirror_surface) =
             render_prep::build_render_lists(
                 cuboids_src,
@@ -596,11 +898,40 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|rl| to_space_soup_beam(rl, offset, yaw_inv))
             .collect();
-        let terrain_arg = loaded_terrain
+        // The renderer needs to know where the player is, so geometry that must
+        // stay pinned to the world -- terrain's texture projection -- can undo
+        // the player-frame transform. Without it the ground's texture travels
+        // with the player and walking looks like standing still.
+        renderer.set_player_frame(offset, locomotion.player_yaw);
+
+        // Into the player's frame, exactly like brushes below. Passing the raw
+        // world-space vertices left the ground glued to the player: walking
+        // moved every other object past you while the terrain came along, which
+        // reads as "the room is sliding around" rather than as a terrain bug.
+        // Water follows the player's frame exactly as brushes and terrain do,
+        // and is re-uploaded ONLY when that frame actually changed.
+        for (i, body) in water_bodies.iter_mut().enumerate() {
+            if let Some(posed) = body.assemble(offset, yaw_inv, locomotion.player_yaw) {
+                renderer.update_water_surface(i, posed);
+            }
+        }
+
+        // Assembled once for its side effect, so the chunk bounds are rebuilt
+        // into the player's frame, then read as an OWNED list before the slices
+        // are taken -- `assemble` borrows mutably and `caster_chunks` borrows
+        // shared, and the two cannot overlap. The second `assemble` is the
+        // cached path and costs a comparison.
+        if let Some((t, _)) = loaded_terrain.as_mut() {
+            t.assemble(offset, yaw_inv, locomotion.player_yaw);
+        }
+        let terrain_chunks: Vec<space_soup::renderer::shadow::CasterChunk> = loaded_terrain
             .as_ref()
+            .map(|(t, _)| t.caster_chunks())
+            .unwrap_or_default();
+        let terrain_arg = loaded_terrain
+            .as_mut()
             .map(|(g, _)| g)
-            .filter(|t| !t.is_empty())
-            .map(|t| (t.vertices.as_slice(), t.indices.as_slice()));
+            .and_then(|t| t.assemble(offset, yaw_inv, locomotion.player_yaw));
         // Transformed into the player's frame here rather than at load, and
         // only when something moved -- see BrushGeometry::assemble.
         let brush_arg = brushes.assemble(
@@ -621,15 +952,64 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &particles,
             &beams,
             terrain_arg,
+            &terrain_chunks,
             brush_arg,
             mirror_surface,
         )?;
-        let proj_layer = openxr::CompositionLayerProjection::new()
-            .space(&headset.stage)
-            .views(&proj_views);
-        headset
-            .frame_stream
-            .end(time, openxr::EnvironmentBlendMode::OPAQUE, &[&proj_layer])?;
+        // NO VIEWS MEANS THE FRAME WAS NOT LOCATED. The renderer skipped it
+        // rather than drawing from poses that mean nothing; end the frame with
+        // no layers, which OpenXR allows and the compositor covers with the
+        // previous frame. Submitting an EMPTY projection layer instead is what
+        // `XR_ERROR_POSE_INVALID` is, and it used to kill the app on a cold
+        // start before tracking had settled.
+        if proj_views.is_empty() {
+            headset
+                .frame_stream
+                .end(time, openxr::EnvironmentBlendMode::OPAQUE, &[])?;
+        } else {
+            // MQSR -- compositor-side sharpening, asked for through
+            // `XR_FB_composition_layer_settings`. See
+            // `space_soup::renderer::layer_settings` for what it costs and why
+            // it is worth having while RENDER_SCALE is below 1.0.
+            //
+            // The safe `CompositionLayerProjection` builder exposes no `next`,
+            // so the settings struct is chained onto the RAW layer and wrapped
+            // straight back up. `settings` is a local of this block and is
+            // never moved, so it outlives the `end` call that follows the
+            // pointer -- that, plus `proj_views` outliving the same call, is
+            // the whole of what `from_raw` is unsafe about.
+            use space_soup::renderer::layer_settings::{Sharpening, XR_SHARPENING};
+
+            let settings = openxr::sys::CompositionLayerSettingsFB {
+                ty: openxr::sys::CompositionLayerSettingsFB::TYPE,
+                next: std::ptr::null(),
+                layer_flags: match XR_SHARPENING {
+                    Sharpening::Quality => {
+                        openxr::sys::CompositionLayerSettingsFlagsFB::QUALITY_SHARPENING
+                    }
+                    Sharpening::Normal => {
+                        openxr::sys::CompositionLayerSettingsFlagsFB::NORMAL_SHARPENING
+                    }
+                    // Never chained -- `has_layer_settings` is false when the
+                    // policy is Off, so this value is never read by anyone.
+                    Sharpening::Off => openxr::sys::CompositionLayerSettingsFlagsFB::EMPTY,
+                },
+            };
+
+            let mut raw = openxr::CompositionLayerProjection::new()
+                .space(&headset.stage)
+                .views(&proj_views)
+                .into_raw();
+            if xr.has_layer_settings {
+                raw.next = &settings as *const _ as *const std::ffi::c_void;
+            }
+            let proj_layer =
+                unsafe { openxr::CompositionLayerProjection::<openxr::Vulkan>::from_raw(raw) };
+
+            headset
+                .frame_stream
+                .end(time, openxr::EnvironmentBlendMode::OPAQUE, &[&proj_layer])?;
+        }
 
         frame_count += 1;
         if frame_count % 500 == 0 {
@@ -692,7 +1072,11 @@ fn load_scene_terrain(
     let def = scene.terrain.as_ref()?;
     // Step 1 for now. The LOD knob exists on TerrainSource::patch and is where
     // distant chunks get cheaper once terrain is big enough to need it.
-    let geometry = terrain_render::load(def, game_dir, 1)?;
+    // Every brush in the level, so terrain buried under a structure's floor is
+    // hidden or lowered in the drawn copy. See `terrain_render::bury_under_structures`.
+    let structures: Vec<&space_soup_engine::brush::BrushDef> =
+        scene.objects.iter().filter_map(|o| o.brush.as_ref()).collect();
+    let geometry = terrain_render::load(def, game_dir, 1, &structures)?;
 
     // The splat map is optional and a missing one is not an error: terrain
     // without authored weights falls back to the slope blend, which is what
@@ -716,4 +1100,13 @@ fn load_scene_terrain(
         }
     };
     Some((geometry, splat))
+}
+
+/// A loaded lightmap's light in the form the renderer takes: the half floats
+/// where the bake stored them, the 8-bit sRGB bytes for an older bake.
+fn lightmap_light(m: &space_soup_engine::lightmaps::LoadedLightmap) -> space_soup::renderer::mesh::LightmapLight<'_> {
+    match &m.linear {
+        Some(l) => space_soup::renderer::mesh::LightmapLight::Linear(l),
+        None => space_soup::renderer::mesh::LightmapLight::Srgb8(&m.rgba),
+    }
 }
