@@ -33,17 +33,44 @@ use space_soup_protocol::{WireColor3, WireLightKind, WireRenderLight};
 /// a `Light`, and the standalone path cannot drift away from the multiplayer
 /// one without the drift being visible in both.
 pub(crate) fn load(game_dir: &std::path::Path, scene_name: &str) -> Vec<WireRenderLight> {
-    load_mode(game_dir, scene_name, LightMode::Realtime)
+    // LIVE: realtime and stationary lamps both shade their direct light every
+    // frame; a stationary one only takes its shadows from the bake.
+    load_matching(game_dir, scene_name, "live", LightMode::is_live)
 }
 
 /// Every BAKED light in a scene, in the same shape. Their light is in the
 /// lightmaps; the renderer shades them only on what has no lightmap -- the
 /// characters and the ground. See `XrRenderer::set_baked_lights`.
 pub(crate) fn load_baked(game_dir: &std::path::Path, scene_name: &str) -> Vec<WireRenderLight> {
-    load_mode(game_dir, scene_name, LightMode::Baked)
+    load_matching(game_dir, scene_name, "baked", |m| m == LightMode::Baked)
 }
 
-fn load_mode(game_dir: &std::path::Path, scene_name: &str, mode: LightMode) -> Vec<WireRenderLight> {
+/// WHICH MASK CHANNEL each stationary lamp's baked shadows are in, by render
+/// light id (`object#index`). Computed from the scene exactly as the baker
+/// computed it -- see `space_soup_engine::stationary` -- so nothing has to
+/// carry it. A lamp that found no channel is absent, and shades unshadowed.
+pub(crate) fn stationary_channels(game_dir: &std::path::Path, scene_name: &str) -> std::collections::HashMap<String, u8> {
+    let path = Manifest::scene_path(game_dir, scene_name);
+    let Ok(mut scene) = Scene::load(&path) else {
+        return Default::default();
+    };
+    scene.resolve_world_transforms();
+    let assigned = space_soup_engine::stationary::scene_stationary_channels(&scene.objects);
+    for (lamp, channel) in &assigned {
+        match channel {
+            Some(c) => log::info!("stationary: '{}' shadows from mask channel {c}", lamp.id()),
+            None => log::warn!("stationary: '{}' has no mask channel; it shades unshadowed", lamp.id()),
+        }
+    }
+    assigned.into_iter().filter_map(|(lamp, c)| Some((lamp.id(), c?))).collect()
+}
+
+fn load_matching(
+    game_dir: &std::path::Path,
+    scene_name: &str,
+    what: &str,
+    keep: impl Fn(LightMode) -> bool,
+) -> Vec<WireRenderLight> {
     let path = Manifest::scene_path(game_dir, scene_name);
     let scene = match Scene::load(&path) {
         Ok(s) => s,
@@ -59,7 +86,7 @@ fn load_mode(game_dir: &std::path::Path, scene_name: &str, mode: LightMode) -> V
         // change when a sibling is switched to baked -- the same rule
         // `collect_render_lights` follows.
         for (i, l) in o.lights.iter().enumerate() {
-            if l.mode != mode {
+            if !keep(l.mode) {
                 continue;
             }
             // A lamp that is switched off contributes nothing, and is skipped
@@ -95,7 +122,7 @@ fn load_mode(game_dir: &std::path::Path, scene_name: &str, mode: LightMode) -> V
         }
     }
     log::info!(
-        "scene lights: {} {mode:?} light(s) loaded from disk for '{scene_name}'",
+        "scene lights: {} {what} light(s) loaded from disk for '{scene_name}'",
         out.len()
     );
     out
@@ -116,10 +143,10 @@ mod tests {
         all
     }
 
-    /// test_room's lamps are BAKED (since 2026-09-26): their light is in the
-    /// lightmaps, and they reach the renderer through `load_baked` for the
-    /// characters and the ground. The two loaders must split the scene
-    /// cleanly, and a lamp must never come through both.
+    /// test_room's lamps are STATIONARY (since 2026-09-27): shaded live, their
+    /// shadows from the baked masks, so they come through `load` with the
+    /// live lights. The two loaders must still split the scene cleanly -- a
+    /// lamp through both would be lit twice.
     #[test]
     fn the_two_loaders_split_the_scene_without_overlap() {
         let live = load(&game_dir(), "test_room");
@@ -128,10 +155,23 @@ mod tests {
             eprintln!("skipping: test_room not present");
             return;
         }
-        assert!(!baked.is_empty(), "test_room's lamps are authored Baked and must load as such");
+        assert!(live.len() >= 7, "test_room's stationary lamps must load as live: {}", live.len());
         for b in &baked {
             assert!(live.iter().all(|l| l.id != b.id), "{} loaded as both live and baked", b.id);
         }
+    }
+
+    /// Every stationary lamp in test_room found a shadow channel, so none of
+    /// them shades unshadowed through the walls.
+    #[test]
+    fn every_test_room_stationary_lamp_has_a_mask_channel() {
+        let channels = stationary_channels(&game_dir(), "test_room");
+        if channels.is_empty() {
+            eprintln!("skipping: test_room not present");
+            return;
+        }
+        assert_eq!(channels.len(), 7, "{channels:?}");
+        assert!(channels.values().all(|&c| (c as usize) < space_soup_engine::stationary::MAX_STATIONARY_CHANNELS));
     }
 
     #[test]
