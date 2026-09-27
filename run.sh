@@ -435,7 +435,13 @@ else
 
 step "Building quest_app for Android..."
 cd "$QUEST_APP_DIR"
-cargo build --target aarch64-linux-android --release
+# A failed cargo build leaves the PREVIOUS libquest_app.so in target/, and
+# without this the copy below packages it and the run ends in "BUILD
+# SUCCESSFUL" -- yesterday's code on the headset under a success banner.
+if ! cargo build --target aarch64-linux-android --release; then
+    fail "cargo build for Android failed -- not packaging the previous libquest_app.so."
+    exit 1
+fi
 mkdir -p android/jniLibs/arm64-v8a
 cp target/aarch64-linux-android/release/libquest_app.so android/jniLibs/arm64-v8a/
 
