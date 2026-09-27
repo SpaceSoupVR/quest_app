@@ -65,6 +65,25 @@ pub(crate) fn stationary_channels(game_dir: &std::path::Path, scene_name: &str) 
     assigned.into_iter().filter_map(|(lamp, c)| Some((lamp.id(), c?))).collect()
 }
 
+/// The stationary masks a bake wrote, if they are the ones this scene's lamps
+/// read: as many layers as their channels need. A bake written for other
+/// lamps -- or in the older format, one byte and four lamps a layer -- would
+/// hand each lamp another lamp's shadow, so it is dropped with a warning and
+/// the stationary lamps shade unshadowed until the level is re-baked.
+pub(crate) fn usable_stationary_masks<T>(baked: Vec<T>, channels: &std::collections::HashMap<String, u8>) -> Vec<T> {
+    let needed = space_soup_engine::stationary::mask_layers(&channels.values().map(|&c| Some(c)).collect::<Vec<_>>());
+    if baked.len() == needed {
+        return baked;
+    }
+    log::warn!(
+        "lightmaps: the bake has {} stationary mask layer(s) and this scene's lamps need {needed}: it was baked \
+         for other lamps, or before masks took two bytes a lamp -- stationary lamps shade unshadowed until the \
+         level is re-baked",
+        baked.len()
+    );
+    Vec::new()
+}
+
 fn load_matching(
     game_dir: &std::path::Path,
     scene_name: &str,
@@ -172,6 +191,20 @@ mod tests {
         }
         assert_eq!(channels.len(), 7, "{channels:?}");
         assert!(channels.values().all(|&c| (c as usize) < space_soup_engine::stationary::MAX_STATIONARY_CHANNELS));
+    }
+
+    /// Masks are read only when the bake wrote as many layers as the lamps'
+    /// channels need. Three channels take two layers at two lamps a layer; a
+    /// one-layer bake is the older four-lamp format (or other lamps) and would
+    /// hand channel 1 the penumbra of channel 0.
+    #[test]
+    fn a_bake_for_other_lamps_or_the_old_format_is_not_read() {
+        let channels: std::collections::HashMap<String, u8> =
+            [("a#0", 0u8), ("b#0", 1), ("c#0", 2)].into_iter().map(|(k, c)| (k.to_string(), c)).collect();
+        assert_eq!(usable_stationary_masks(vec!["layer0", "layer1"], &channels), vec!["layer0", "layer1"]);
+        assert!(usable_stationary_masks(vec!["layer0"], &channels).is_empty(), "a one-layer bake was read");
+        assert!(usable_stationary_masks(vec!["l0", "l1", "l2"], &channels).is_empty(), "a bake for more lamps was read");
+        assert!(usable_stationary_masks(Vec::<&str>::new(), &Default::default()).is_empty());
     }
 
     #[test]
