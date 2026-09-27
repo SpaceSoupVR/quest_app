@@ -332,14 +332,14 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             Some((_, w, h)) => info!("lightmaps: brush sun mask {w}x{h} present"),
             None => info!("lightmaps: no brush sun mask; brushes take the sun's static map"),
         }
-        // The stationary lamps' shadow masks, one image per four lamps, in
+        // The stationary lamps' shadow masks, one image per two lamps, in
         // layer order. See `space_soup_engine::stationary`.
         let stationary_ids: Vec<String> =
-            (0..space_soup_engine::stationary::MAX_STATIONARY_CHANNELS / 4).map(space_soup_engine::lightmaps::scene_brush_stationary_id).collect();
-        let stationary_maps: Vec<&space_soup_engine::lightmaps::LoadedLightmap> = stationary_ids
-            .iter()
-            .map_while(|id| maps.iter().find(|m| &m.object_id == id))
-            .collect();
+            (0..space_soup_engine::stationary::MAX_STATIONARY_LAYERS).map(space_soup_engine::lightmaps::scene_brush_stationary_id).collect();
+        let stationary_maps: Vec<&space_soup_engine::lightmaps::LoadedLightmap> = scene_lights::usable_stationary_masks(
+            stationary_ids.iter().map_while(|id| maps.iter().find(|m| &m.object_id == id)).collect(),
+            &stationary_channels,
+        );
         if let Some(first) = stationary_maps.first() {
             info!("lightmaps: {} stationary mask layer(s) {}x{}", stationary_maps.len(), first.width, first.height);
         }
