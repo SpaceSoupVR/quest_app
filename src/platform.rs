@@ -2,6 +2,7 @@
 
 use log::{error, info, warn};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use space_soup::renderer::xr_renderer::XrRenderer;
 use space_soup::{Controllers, HandTrackers, Headset, VkContext, XrContext};
@@ -29,16 +30,75 @@ pub(crate) fn pump_android_events(exit: &mut bool) {
                 None => break,
             },
             ANDROID_LOOPER_ID_INPUT => {
-                let Some(queue) = ndk_glue::input_queue() else {
+                // The drain thread usually got there first; nothing left means
+                // stop, or a readable queue with no events would spin this loop.
+                if drain_input_queue() == 0 {
                     break;
-                };
-                match queue.get_event() {
-                    Ok(Some(event)) => queue.finish_event(event, false),
-                    _ => break,
                 }
             }
             _ => break,
         }
+    }
+}
+
+/// Input events finished so far, for the log.
+static INPUT_EVENTS_FINISHED: AtomicU64 = AtomicU64::new(0);
+
+/// Finish every Android input event waiting in the queue. Returns how many.
+///
+/// Finished UNHANDLED: nothing in the app reads these -- controllers and hands
+/// arrive through OpenXR -- but Android waits for each one to be finished, and
+/// raises "not responding" when one sits for five seconds.
+pub(crate) fn drain_input_queue() -> usize {
+    let Some(queue) = ndk_glue::input_queue() else {
+        return 0;
+    };
+    let mut taken = 0;
+    loop {
+        match queue.get_event() {
+            Ok(Some(event)) => {
+                taken += 1;
+                let kind = match &event {
+                    ndk::event::InputEvent::KeyEvent(_) => "key",
+                    ndk::event::InputEvent::MotionEvent(_) => "motion",
+                };
+                // A key event is offered to the IME first. If it takes it,
+                // Android finishes it and it must not be finished twice.
+                if let Some(event) = queue.pre_dispatch(event) {
+                    queue.finish_event(event, false);
+                }
+                let n = INPUT_EVENTS_FINISHED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 20 || n % 200 == 0 {
+                    info!("input: finished event #{n} ({kind})");
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                warn!("input: could not read the input queue: {e}");
+                break;
+            }
+        }
+    }
+    taken
+}
+
+/// Keeps Android's input queue empty for the life of the process.
+///
+/// A thread, because the frame loop is not always there to do it. Startup ran
+/// 7.2 s before the loop pumped anything (measured 2026-09-10: begin 23:08:52.7,
+/// probes 23:08:59.9), and a key event in that window timed out at 23:08:58 --
+/// "Input dispatching timed out ... Waited 5001ms for KeyEvent" -- after which
+/// Android kept re-raising the dialog every few seconds. Any later stall in the
+/// loop, a scene switch or a pipeline build, would do the same.
+pub(crate) fn spawn_input_drain() {
+    let spawned = std::thread::Builder::new()
+        .name("input-drain".into())
+        .spawn(|| loop {
+            drain_input_queue();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+    if let Err(e) = spawned {
+        warn!("input: could not start the input drain thread: {e}");
     }
 }
 
@@ -60,6 +120,12 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
 
 pub(crate) fn game_dir() -> PathBuf {
     PathBuf::from("/sdcard/Android/data/com.example.questapp/files/game")
+}
+
+/// The headset's lever file, beside the game folder so pushing a new game
+/// never wipes it. See `space_soup::renderer::levers`.
+pub(crate) fn levers_path() -> PathBuf {
+    PathBuf::from("/sdcard/Android/data/com.example.questapp/files/levers.json")
 }
 
 pub(crate) struct XrSetup {
@@ -102,7 +168,7 @@ pub(crate) fn init_xr() -> Result<XrSetup, Box<dyn std::error::Error>> {
     let renderer = XrRenderer::new(&vk, &xr, &headset.session)?;
     info!("init: all subsystems ready");
 
-    renderer.device().on_uncaptured_error(Box::new(|error| {
+    renderer.device().on_uncaptured_error(std::sync::Arc::new(|error| {
         error!("=== WGPU UNCAPTURED ERROR ===\n{error}\n=============================");
     }));
 

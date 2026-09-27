@@ -23,7 +23,32 @@ pub(crate) fn spawn_mesh_loader(
         .spawn(move || {
             for (path, ids) in req_rx {
                 let full_path = gdir.join(&path);
-                match GltfMesh::load(&device, &queue, &layout, &full_path) {
+                // The lightmap UV set, derived here rather than by the
+                // renderer: the BAKER derives the same layout from the same
+                // geometry, and both of them live on this side of the
+                // renderer's crate boundary. Reading the geometry a second time
+                // is cheap -- it skips the images, which is where a mesh's load
+                // time actually goes.
+                //
+                // `None` for a mesh that is skinned, animated or too dense for
+                // a chart per triangle. Those keep their original vertices and
+                // the flat lightmap the baker still writes for them.
+                let lightmap_uv = space_soup_engine::mesh_lightmap::lightmap_uv_for_asset(
+                    &full_path,
+                )
+                .map(|entries| space_soup::renderer::MeshLightmapUv {
+                    per_primitive: entries.into_iter().collect(),
+                });
+                if lightmap_uv.is_some() {
+                    info!("Mesh '{path}': per-texel lightmap UVs generated");
+                }
+                match GltfMesh::load_with_lightmap_uv(
+                    &device,
+                    &queue,
+                    &layout,
+                    &full_path,
+                    lightmap_uv.as_ref(),
+                ) {
                     Ok(mesh) => {
                         info!("Mesh loaded: '{path}' ({} object(s))", ids.len());
                         for id in &ids {

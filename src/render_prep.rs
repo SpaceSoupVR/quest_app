@@ -211,27 +211,53 @@ pub(crate) fn build_render_lists<'a>(
         .filter(|rm| Vec3::from(rm.position).distance(head_pos) < MAX_RENDER_DIST)
         .filter_map(|rm| {
             if let Some((_, mesh, model)) = hidden_cache.get(&rm.id) {
-                return Some(MeshInstance { mesh, model, lightmap_key: Some(rm.id.as_str()) });
+                return Some(MeshInstance {
+                    mesh,
+                    model,
+                    lightmap_key: Some(rm.id.as_str()),
+                    emissive_drive: rm.emissive_drive,
+                });
             }
             let (mesh, model) = mesh_cache.get(&rm.id)?;
-            Some(MeshInstance { mesh, model, lightmap_key: Some(rm.id.as_str()) })
+            Some(MeshInstance {
+                mesh,
+                model,
+                lightmap_key: Some(rm.id.as_str()),
+                emissive_drive: rm.emissive_drive,
+            })
         })
         .chain(
             avatar_mesh_cache
                 .iter()
                 .filter(|(&id, _)| id != local_player)
-                .map(|(_, (mesh, model))| MeshInstance { mesh, model, lightmap_key: None }),
+                .map(|(_, (mesh, model))| MeshInstance {
+                    mesh,
+                    model,
+                    lightmap_key: None,
+                    // An avatar is not a fixture.
+                    emissive_drive: 0.0,
+                }),
         )
         .chain(
             local_direct_mesh
                 .iter()
-                .map(|(mesh, model)| MeshInstance { mesh, model, lightmap_key: None }),
+                .map(|(mesh, model)| MeshInstance {
+                    mesh,
+                    model,
+                    lightmap_key: None,
+                    emissive_drive: 0.0,
+                }),
         )
         .collect();
 
     let mirror_only_mesh_instances: Vec<MeshInstance> = avatar_mesh_cache
         .get(&local_player)
-        .map(|(mesh, model)| MeshInstance { mesh, model, lightmap_key: None })
+        .map(|(mesh, model)| MeshInstance {
+            mesh,
+            model,
+            lightmap_key: None,
+            emissive_drive: 0.0,
+        })
         .into_iter()
         .collect();
 

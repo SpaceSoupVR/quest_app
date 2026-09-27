@@ -44,9 +44,13 @@ pub(crate) fn step_locomotion(
     // the server runs (Locomotion::apply_collision, in space_soup_engine), built from
     // the same local scene JSON already loaded into `physics` -- so the client doesn't
     // need the server for collision either, and never disagrees with it about geometry.
-    let prev_xz = (locomotion.player_offset.x, locomotion.player_offset.z);
+    // Taken before `update`, from the rig this frame was built with: collision
+    // stops the floor point under the HEAD, not the rig origin. See
+    // `Locomotion::apply_collision`.
+    let collision_start =
+        locomotion.collision_start(rig.get(space_soup_engine::JointId::Head).map(|h| h.position));
     locomotion.update(dt, &locomotion_input, rig, teleport_target);
-    locomotion.apply_collision(physics, prev_xz);
+    locomotion.apply_collision(physics, collision_start);
 
     if frame_count % 30 == 0
         && (cs.l_stick.x.abs() > 0.1 || cs.l_stick.y.abs() > 0.1 || cs.r_stick.x.abs() > 0.1)

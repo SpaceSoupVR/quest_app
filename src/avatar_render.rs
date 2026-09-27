@@ -90,18 +90,69 @@ pub(crate) fn update_avatar_bodies(
         let up = avatar_ik::detect_up_axis(skeleton);
         rig_cfg.up_axis = up.to_array();
         let raw_bind_head_height = avatar_ik::bind_head_height_along(skeleton, up);
+        // The headset reports where the EYES are, not where the rig's Head
+        // joint is, and on a humanoid those are 5-10 cm apart -- the Head joint
+        // sits at the base of the skull, below and behind the eyes. Calibrating
+        // against the head height divided an eye height by a head height, which
+        // scaled every avatar slightly too tall; anchoring the Head joint at
+        // the headset pose then lifted the whole body until the wearer's own
+        // torso rose into their view.
+        let raw_bind_eye_height = avatar_ik::bind_eye_height_along(skeleton, up);
         let calibrated_height = calibrated_heights
             .entry(id)
             .or_default()
             .observe(state.head.position.y);
-        let root_scale = avatar::height_calibrated_scale(calibrated_height, raw_bind_head_height);
+        let root_scale = avatar::height_calibrated_scale(calibrated_height, raw_bind_eye_height);
 
         let to_render = |p: Vec3| yaw_inv * (p - offset);
+        // Still the HEAD height: the drop runs from the head joint to the
+        // floor, and pairing it with the eye-derived scale is what puts the
+        // eyes at the headset while leaving the feet on the ground.
         let floor_drop = raw_bind_head_height * root_scale;
         let head_rot = yaw_inv * state.head.rotation;
+        // Place the head joint one scaled offset BEHIND and BELOW the eyes.
+        //
+        // Through `world_eye_offset` rather than by rotating the raw offset:
+        // that offset is in MODEL space, and boy.glb is Z-up, so multiplying it
+        // by a world-space head rotation sent the correction sideways instead
+        // of down. It still moved the avatar, which is why it read as a fix
+        // that had not gone far enough rather than as one aimed the wrong way.
+        // One-shot diagnostic. Three attempts at this have been wrong because
+        // each rested on a guess about the rig; these are the numbers the code
+        // actually computes, logged once so the log is readable.
+        if id == local_player {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                let raw = avatar_ik::eye_to_head_offset(skeleton);
+                log::info!(
+                    "AVATARDIAG up={up:?} bind_head={raw_bind_head_height:.3} \
+                     bind_eye={raw_bind_eye_height:.3} eye_to_head={raw:?} \
+                     calibrated_h={calibrated_height:.3} root_scale={root_scale:.5} \
+                     stature={:.3} headset_y={:.3}",
+                    skeleton.bind_stature,
+                    state.head.position.y,
+                );
+            }
+        }
+
+        let eye_offset = avatar_ik::world_eye_offset(
+            skeleton, up, rig_cfg.forward(), head_rot, Vec3::Y,
+        );
+        let head_pos = to_render(state.head.position) - eye_offset * root_scale;
+        if id == local_player {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED2: AtomicBool = AtomicBool::new(false);
+            if !LOGGED2.swap(true, Ordering::Relaxed) {
+                log::info!(
+                    "AVATARDIAG eye_offset={eye_offset:?} head_pos={head_pos:?} \
+                     floor_drop={floor_drop:.3}",
+                );
+            }
+        }
         let root = avatar_ik::body_root_transform_basis(
             avatar::Transform {
-                position: to_render(state.head.position),
+                position: head_pos,
                 rotation: head_rot,
             },
             floor_drop,
@@ -209,10 +260,23 @@ pub(crate) fn update_avatar_bodies(
         if id == local_player {
             let direct = local_direct_mesh.get_or_insert_with(|| {
                 let hidden_joints = avatar_ik::head_and_descendant_joints(skeleton);
-                let mut direct_mesh = mesh.clone_with_independent_skin_excluding_joints(
+                // Joints AND a height. Hiding Head, its descendants and Neck
+                // still leaves the top of the neck behind, because those
+                // vertices are weighted to Chest -- which has to stay, since it
+                // is the torso the wearer looks down at. The cutoff removes the
+                // open tube of throat that was left sitting at eye level.
+                let cutoff = avatar_ik::first_person_cutoff_height(skeleton, up);
+                let mut direct_mesh = mesh.clone_with_independent_skin_excluding(
                     renderer.device(),
                     &hidden_joints,
+                    up,
+                    cutoff,
                 );
+                if id == local_player {
+                    log::info!(
+                        "AVATARDIAG first-person cutoff along {up:?} = {cutoff:?} (neck joint)",
+                    );
+                }
                 direct_mesh.create_skin_bind_group(renderer.device(), renderer.skin_joint_layout());
                 (direct_mesh, renderer.create_skinned_model_uniform())
             });

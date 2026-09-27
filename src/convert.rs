@@ -70,6 +70,7 @@ pub(crate) fn to_space_soup_light(rl: &WireRenderLight, offset: Vec3, yaw_inv: Q
         intensity: rl.intensity,
         range: rl.range,
         cone_angle_deg: rl.cone_angle_deg,
+        inner_cone_angle_deg: rl.inner_cone_angle_deg,
     }
 }
 
@@ -97,14 +98,14 @@ mod light_kind_tests {
         let of = |kind| {
             to_space_soup_light(
                 &WireRenderLight {
-                    id: "l".into(),
                     position: [0.0, 0.0, 0.0],
                     direction: [0.0, -1.0, 0.0],
-                    kind,
                     color: space_soup_protocol::WireColor3(255, 255, 255, 255),
                     intensity: 1.0,
                     range: 5.0,
                     cone_angle_deg: 45.0,
+                    inner_cone_angle_deg: 0.0,
+                    ..WireRenderLight::new("l", kind)
                 },
                 Vec3::ZERO,
                 Quat::IDENTITY,
