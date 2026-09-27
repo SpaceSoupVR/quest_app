@@ -89,9 +89,16 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         space_soup::renderer::sky::SkyIrradiance::flat(space_soup::renderer::sky::AMBIENT),
         None,
     ));
+    // Stationary lamps with their mask channel, exactly as the headset pairs
+    // them. See `scene_lights::stationary_channels`.
+    let channels = crate::scene_lights::stationary_channels(&game, scene_name);
     let mut lights: Vec<Light> = crate::scene_lights::load(&game, scene_name)
         .iter()
-        .map(|l| crate::convert::to_space_soup_light(l, offset, yaw_inv))
+        .map(|l| {
+            let mut light = crate::convert::to_space_soup_light(l, offset, yaw_inv);
+            light.mask_channel = channels.get(&l.id).copied();
+            light
+        })
         .collect();
     let sun = space_soup::renderer::lights::sky_sun_light(sky_sun.as_ref(), &lights, yaw_inv.inverse());
     lights.extend(sun);
@@ -226,14 +233,21 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
 
     let lm = space_soup_engine::lightmaps::load_scene_lightmaps(&game, scene_name);
     let pick = |id: &str| lm.iter().find(|m| m.object_id == id);
+    let stationary_ids: Vec<String> = (0..space_soup_engine::stationary::MAX_STATIONARY_CHANNELS / 4)
+        .map(space_soup_engine::lightmaps::scene_brush_stationary_id)
+        .collect();
     let base = lm.iter().find(|m| {
         m.target == space_soup_engine::lightmaps::LightmapTarget::Brush
             && m.object_id != space_soup_engine::lightmaps::SCENE_BRUSH_DIRECTION_ID
             && m.object_id != space_soup_engine::lightmaps::SCENE_BRUSH_SUN_MASK_ID
+            && !stationary_ids.contains(&m.object_id)
     })?;
+    let stationary: Vec<&space_soup_engine::lightmaps::LoadedLightmap> =
+        stationary_ids.iter().map_while(|id| pick(id)).collect();
     let dir = pick(space_soup_engine::lightmaps::SCENE_BRUSH_DIRECTION_ID);
     let sun_mask = pick(space_soup_engine::lightmaps::SCENE_BRUSH_SUN_MASK_ID);
-    let lightmap = space_soup::renderer::mesh::create_lightmap_texture_with_sun(
+    let stationary_layers: Vec<&[u8]> = stationary.iter().map(|m| m.rgba.as_slice()).collect();
+    let lightmap = space_soup::renderer::mesh::create_lightmap_texture_full(
         &device,
         &queue,
         &pipeline.lightmap_layout,
@@ -245,6 +259,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         base.height,
         dir.map(|d| (d.rgba.as_slice(), d.width, d.height)),
         sun_mask.map(|d| (d.rgba.as_slice(), d.width, d.height)),
+        stationary.first().map(|m| (stationary_layers.as_slice(), m.width, m.height)),
     );
 
     let (verts, idx) = geometry.assemble(&[], offset, yaw_inv, 0.0)?;
@@ -543,6 +558,10 @@ mod tests {
             // that reflects the outdoors through it (headset 01:48:36): the
             // reflection must carry the terrain and the sky, not go black.
             Ok("toward_front") => View::headset(Vec3::new(0.2, 1.6, -2.0), Vec3::new(0.0, 0.2, 3.7)),
+            // The back corner spot's pool on the right wall (headset 01:48,
+            // "reading like crosses, very blocky"), and the floor reflecting it.
+            Ok("corner_pool") => View::headset(Vec3::new(-1.2, 1.6, -11.8), Vec3::new(2.7, 1.7, -14.2)),
+            Ok("corner_pool_floor") => View::headset(Vec3::new(-1.0, 1.6, -10.0), Vec3::new(2.0, 0.0, -13.2)),
             _ => View::headset(Vec3::new(0.3, 1.6, -3.0), Vec3::new(0.0, 0.9, -7.0)),
         };
         let Some(shot) = render_brushes("test_room", View { adapt: true, ..v }) else {

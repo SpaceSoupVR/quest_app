@@ -172,6 +172,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     // The level's Baked lamps, for the characters and the ground. See
     // `scene_lights::load_baked`.
     let mut baked_lights = scene_lights::load_baked(&dir, &static_scene.scene_name);
+    // Each stationary lamp's channel of the baked shadow masks. See
+    // `scene_lights::stationary_channels`.
+    let mut stationary_channels = scene_lights::stationary_channels(&dir, &static_scene.scene_name);
     // The other half of the standalone path: without this a game with no server
     // draws its terrain, its brushes and its lighting, and none of the objects
     // standing in it. See scene_meshes.
@@ -329,9 +332,21 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             Some((_, w, h)) => info!("lightmaps: brush sun mask {w}x{h} present"),
             None => info!("lightmaps: no brush sun mask; brushes take the sun's static map"),
         }
+        // The stationary lamps' shadow masks, one image per four lamps, in
+        // layer order. See `space_soup_engine::stationary`.
+        let stationary_ids: Vec<String> =
+            (0..space_soup_engine::stationary::MAX_STATIONARY_CHANNELS / 4).map(space_soup_engine::lightmaps::scene_brush_stationary_id).collect();
+        let stationary_maps: Vec<&space_soup_engine::lightmaps::LoadedLightmap> = stationary_ids
+            .iter()
+            .map_while(|id| maps.iter().find(|m| &m.object_id == id))
+            .collect();
+        if let Some(first) = stationary_maps.first() {
+            info!("lightmaps: {} stationary mask layer(s) {}x{}", stationary_maps.len(), first.width, first.height);
+        }
         for m in &maps {
             if m.object_id == space_soup_engine::lightmaps::SCENE_BRUSH_DIRECTION_ID
                 || m.object_id == space_soup_engine::lightmaps::SCENE_BRUSH_SUN_MASK_ID
+                || stationary_ids.contains(&m.object_id)
             {
                 continue;
             }
@@ -344,6 +359,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     m.height,
                     brush_dir.as_ref().map(|(d, w, h)| (d.as_slice(), *w, *h)),
                     brush_sun.as_ref().map(|(d, w, h)| (d.as_slice(), *w, *h)),
+                    &stationary_maps.iter().map(|m| m.rgba.as_slice()).collect::<Vec<_>>(),
+                    stationary_maps.first().map_or((1, 1), |m| (m.width, m.height)),
                 );
                 continue;
             }
@@ -717,6 +734,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 brushes = load_scene_brushes(&dir, &w.scene_name);
                 static_lights = scene_lights::load(&dir, &w.scene_name);
                 baked_lights = scene_lights::load_baked(&dir, &w.scene_name);
+                stationary_channels = scene_lights::stationary_channels(&dir, &w.scene_name);
                 static_meshes = scene_meshes::load(&dir, &w.scene_name);
                 {
                     let sky = loaders::load_scene_sky(&dir, static_scene.sky.as_ref());
@@ -875,6 +893,16 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 rig_config.held_grip_offset(),
                 &mut part_transforms,
             );
+        // STATIONARY lamps take their shadows from their mask channel; the
+        // list is `lights_src` converted in order, so each pairs with its id.
+        let lights: Vec<space_soup::renderer::Light> = lights
+            .into_iter()
+            .zip(lights_src.iter())
+            .map(|(mut l, src)| {
+                l.mask_channel = stationary_channels.get(&src.id).copied();
+                l
+            })
+            .collect();
 
         let sounds_src = world.as_ref().map(|w| w.sounds.as_slice()).unwrap_or(&[]);
         let occlusion: HashMap<String, f32> = sounds_src
