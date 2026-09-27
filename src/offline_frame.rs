@@ -609,7 +609,8 @@ mod tests {
             Ok("sconce_far") => View::headset(Vec3::new(3.4, 1.6, -3.0), Vec3::new(9.0, 1.4, -3.0)),
             _ => View::headset(Vec3::new(0.3, 1.6, -3.0), Vec3::new(0.0, 0.9, -7.0)),
         };
-        let Some(shot) = render_brushes("test_room", View { adapt: true, ..v }) else {
+        let sources = std::env::var("SOURCES").as_deref() == Ok("1");
+        let Some(shot) = render_brushes("test_room", View { adapt: !sources, sources, ..v }) else {
             eprintln!("skipping: no GPU or no test_room");
             return;
         };
