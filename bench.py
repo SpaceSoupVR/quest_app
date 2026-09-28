@@ -62,6 +62,9 @@ ADB = "adb"
 # override whatever the app asks for, and do not survive a reboot.
 CPU_LEVEL_PROP = "debug.oculus.cpuLevel"
 GPU_LEVEL_PROP = "debug.oculus.gpuLevel"
+# Pauses the boundary, so a headset lying still on a desk is not interrupted
+# by it. Like the levels, it does not survive a reboot.
+GUARDIAN_PAUSE_PROP = "debug.oculus.guardian_pause"
 
 
 class BenchError(Exception):
@@ -214,11 +217,14 @@ def stall_diagnosis(name: str, records: list, waited: float) -> str:
 
 
 # What the GPU's own counters are asked for: whether the frame waits on
-# arithmetic, on textures or on memory. Names as `ovrgpuprofiler -m` prints
-# them; anything matching is taken, up to the tool's limit of 30.
+# arithmetic, on textures or on memory, and how much hidden surface the
+# hardware's low-resolution depth (LRZ) throws away before shading. Names as
+# `ovrgpuprofiler -m` prints them; the tool reads at most 30, so when more
+# match, the earlier keywords win.
 PROFILER_KEYWORDS = (
-    "clocks / second", "frequency", "shaders busy", "alu", "stall", "texture l1 miss",
-    "texture l2 miss", "bus busy", "utilization", "fragment", "fragments", "read total", "write total",
+    "clocks / second", "frequency", "shaders busy", "alu", "texture fetch stall", "stall",
+    "texture l1 miss", "texture l2 miss", "lrz", "fragment", "bus busy", "utilization",
+    "read total", "write total",
 )
 PROFILER_LIMIT = 30
 
@@ -235,8 +241,24 @@ def profiler_metrics(dev: Device) -> tuple:
 
 
 def pick_metrics(metrics: list) -> list:
-    chosen = [(i, n) for i, n in metrics if any(k in n.lower() for k in PROFILER_KEYWORDS)]
-    return (chosen or metrics)[:PROFILER_LIMIT]
+    """Up to 30 counters: every keyword gets its first few before any keyword
+    gets more, so one family with many counters cannot crowd out the rest."""
+    per_keyword: list = [[] for _ in PROFILER_KEYWORDS]
+    for i, name in metrics:
+        lower = name.lower()
+        k = next((k for k, word in enumerate(PROFILER_KEYWORDS) if word in lower), None)
+        if k is not None:
+            per_keyword[k].append((i, name))
+    if not any(per_keyword):
+        return metrics[:PROFILER_LIMIT]
+    chosen: list = []
+    depth = 0
+    while len(chosen) < PROFILER_LIMIT and any(len(group) > depth for group in per_keyword):
+        for group in per_keyword:
+            if len(group) > depth and len(chosen) < PROFILER_LIMIT:
+                chosen.append(group[depth])
+        depth += 1
+    return chosen
 
 
 def profile(dev: Device, ids: list, seconds: int) -> tuple:
@@ -461,17 +483,22 @@ def main(argv: list | None = None) -> int:
         dev.shell("am broadcast -a com.oculus.vrpowermanager.prox_close")
         changed.append(("give the proximity sensor back",
                         lambda: dev.shell("am broadcast -a com.oculus.vrpowermanager.automation_disable")))
+        props = [(GUARDIAN_PAUSE_PROP, 1)]
         if not args.no_lock:
-            for prop, level in ((CPU_LEVEL_PROP, args.cpu_level), (GPU_LEVEL_PROP, args.gpu_level)):
-                before = dev.shell("getprop " + prop).strip()
-                dev.shell("setprop %s %d" % (prop, level))
-                changed.append(("restore %s to %r" % (prop, before),
-                                lambda prop=prop, before=before: dev.shell("setprop %s '%s'" % (prop, before))))
+            props += [(CPU_LEVEL_PROP, args.cpu_level), (GPU_LEVEL_PROP, args.gpu_level)]
+        for prop, value in props:
+            before = dev.shell("getprop " + prop).strip()
+            dev.shell("setprop %s %d" % (prop, value))
+            changed.append(("restore %s to %r" % (prop, before),
+                            lambda prop=prop, before=before: dev.shell("setprop %s '%s'" % (prop, before))))
         dev.run("logcat", "-G", "16M", check=False)
         dev.shell("rm -f " + PERF)
-        if not dev.shell("pidof " + PACKAGE, check=False).strip():
-            print("starting the app", flush=True)
-            dev.shell("am start -n " + ACTIVITY)
+        # Brought to the front whether or not it is running: a process in the
+        # background renders nothing. `am start` resumes a running one rather
+        # than restarting it.
+        running = bool(dev.shell("pidof " + PACKAGE, check=False).strip())
+        print("%s the app" % ("resuming" if running else "starting"), flush=True)
+        dev.shell("am start -n " + ACTIVITY)
         capture_file = open(vrapi_path, "wb")
         capture = subprocess.Popen([ADB, "-s", dev.serial, "logcat", "-v", "time", "-T", "1", "VrApi:I", "*:S"],
                                    stdout=capture_file, stderr=subprocess.DEVNULL)
