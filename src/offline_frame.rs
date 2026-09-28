@@ -87,7 +87,16 @@ impl View {
 fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
-    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    // `OFFLINE_F16=1`: render with half-precision arithmetic where the shaders
+    // use it, as the headset does (see `space_soup::renderer::shader_precision`),
+    // to compare against the default f32 renders. Apple GPUs have f16.
+    let f16 = std::env::var("OFFLINE_F16").is_ok_and(|v| v == "1")
+        && adapter.features().contains(wgpu::Features::SHADER_F16);
+    let desc = wgpu::DeviceDescriptor {
+        required_features: if f16 { wgpu::Features::SHADER_F16 } else { wgpu::Features::empty() },
+        ..Default::default()
+    };
+    pollster::block_on(adapter.request_device(&desc)).ok()
 }
 
 /// Render `scene_name` from `view`. `None` when no GPU is available.
