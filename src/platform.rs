@@ -128,6 +128,12 @@ pub(crate) fn levers_path() -> PathBuf {
     PathBuf::from("/sdcard/Android/data/com.example.questapp/files/levers.json")
 }
 
+/// Where every `PERF` window is also written, one JSON line apiece, for
+/// `bench.py` to pull. Beside the lever file. See `space_soup::perf_record`.
+pub(crate) fn perf_log_path() -> PathBuf {
+    PathBuf::from("/sdcard/Android/data/com.example.questapp/files/perf.jsonl")
+}
+
 pub(crate) struct XrSetup {
     pub(crate) xr: XrContext,
     pub(crate) headset: Headset,

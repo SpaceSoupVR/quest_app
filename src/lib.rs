@@ -466,6 +466,13 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     // build. Polled about once a second; see `space_soup::renderer::levers`.
     let mut lever_file = space_soup::renderer::levers::LeverFile::new(platform::levers_path());
     let mut lever_tick: u32 = 0;
+    renderer.set_perf_log(platform::perf_log_path());
+    // A BENCHMARK VIEWPOINT from the lever file: the rig is moved onto it and
+    // the tracked head pinned, so the frame is measured from a named place
+    // with nobody wearing the headset. See `space_soup::renderer::bench`.
+    // `bench_return` is where the player stood before, to go back to.
+    let mut bench: Option<space_soup::renderer::bench::BenchRig> = None;
+    let mut bench_return: Option<(Vec3, f32)> = None;
     'main: loop {
         pump_android_events(&mut exit);
         if exit {
@@ -573,11 +580,36 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let (_, eye_views) = headset.session.locate_views(
+        let (view_flags, mut eye_views) = headset.session.locate_views(
             openxr::ViewConfigurationType::PRIMARY_STEREO,
             time,
             &headset.stage,
         )?;
+        // PINNED: the rig stands where the view says, and the head is the
+        // pinned one for everything this frame -- the rig, the lights chosen,
+        // the audio -- exactly as the renderer will pin it. Released, the
+        // player goes back to where they stood. Taken once, here: the lever
+        // file is read later in the frame, and a pin that changed halfway
+        // would draw the new head against geometry placed for the old rig.
+        let frame_bench = bench;
+        match &frame_bench {
+            Some(rig) => {
+                let located = view_flags.contains(openxr::ViewStateFlags::ORIENTATION_VALID)
+                    && view_flags.contains(openxr::ViewStateFlags::POSITION_VALID);
+                space_soup::renderer::bench::pin_xr_views(&mut eye_views, located, rig);
+                if bench_return.is_none() {
+                    bench_return = Some((locomotion.player_offset, locomotion.player_yaw));
+                }
+                locomotion.player_offset = rig.offset;
+                locomotion.player_yaw = rig.yaw;
+            }
+            None => {
+                if let Some((offset, yaw)) = bench_return.take() {
+                    locomotion.player_offset = offset;
+                    locomotion.player_yaw = yaw;
+                }
+            }
+        }
 
         let now = std::time::Instant::now();
         let dt = last_time
@@ -783,20 +815,24 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &part_transforms,
         );
 
-        movement::step_locomotion(
-            cs,
-            dt,
-            &rig,
-            frame_count,
-            server_player_offset,
-            server_player_yaw,
-            world.is_some(),
-            &mut locomotion,
-            &static_scene.physics,
-            prev_r_trigger,
-            &input,
-            &net,
-        );
+        // Held still while pinned: a stick knocked on the desk must not walk
+        // the benchmark out of its viewpoint.
+        if frame_bench.is_none() {
+            movement::step_locomotion(
+                cs,
+                dt,
+                &rig,
+                frame_count,
+                server_player_offset,
+                server_player_yaw,
+                world.is_some(),
+                &mut locomotion,
+                &static_scene.physics,
+                prev_r_trigger,
+                &input,
+                &net,
+            );
+        }
 
         frame_log::send_local_pose(&net, &rig);
         frame_log::log_frame_status(
@@ -859,6 +895,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             match lever_file.poll() {
                 Some(Ok(levers)) => {
                     info!("LEVERS: {} (from {})", levers.summary(), lever_file.path().display());
+                    bench = levers.bench.as_ref().map(space_soup::renderer::bench::BenchRig::for_pose);
                     renderer.set_levers(levers);
                 }
                 Some(Err(e)) => log::warn!("LEVERS: {} ignored, previous levers kept: {e}", lever_file.path().display()),
@@ -931,6 +968,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         // the player-frame transform. Without it the ground's texture travels
         // with the player and walking looks like standing still.
         renderer.set_player_frame(offset, locomotion.player_yaw);
+        renderer.set_pinned_head(frame_bench.map(|r| (r.head_position, r.head_rotation)));
 
         // Into the player's frame, exactly like brushes below. Passing the raw
         // world-space vertices left the ground glued to the player: walking
