@@ -42,6 +42,7 @@ import json
 import os
 import re
 import statistics
+import signal
 import subprocess
 import sys
 import tempfile
@@ -312,11 +313,11 @@ def profile(dev: Device, ids: list, seconds: int) -> tuple:
 #   Surface 1 | 1216x1344 | color 32bit, depth 24bit, stencil 0 bit, MSAA 4,
 #   Mode: 1 (HwBinning) | 60 128x224 bins ( 60 rendered) | 5.08 ms | 130 stages
 #   : Binning : 0.623ms Render : 1.877ms StoreColor : 0.309ms Preempt : 1.286ms
-# (Meta, "ovrgpuprofiler"). Read loosely -- the fields are searched for rather
+# (Meta, "ovrgpuprofiler"); the tool pads sizes as `588 x616`. Read loosely -- the fields are searched for rather
 # than split by position -- because the only sample of the format is the
 # documentation's, and the raw trace is kept beside the report either way.
 TRACE_SURFACE = re.compile(r"^\s*Surface\s+\d+\s*\|")
-TRACE_SIZE = re.compile(r"\|\s*(\d+)x(\d+)\s*\|")
+TRACE_SIZE = re.compile(r"\|\s*(\d+)\s*x\s*(\d+)\s*\|")
 TRACE_MSAA = re.compile(r"MSAA\s*(\d+)")
 TRACE_MODE = re.compile(r"Mode:\s*\d*\s*\(?([A-Za-z]+)")
 TRACE_BINS = re.compile(r"(\d+)\s+(\d+)x(\d+)\s+bins(?:\s*\(\s*(\d+)\s+rendered\))?")
@@ -368,6 +369,58 @@ def trace(dev: Device, seconds: int) -> tuple:
     and the raw output. Needs the app started in detailed profiling mode."""
     text = dev.shell("ovrgpuprofiler -t%d" % seconds, check=False, timeout=seconds + 90)
     return summarize_trace(text, seconds), text
+
+
+# One draw call in a per-draw trace (`ovrgpuprofiler -t -x=...`), e.g.
+#   Frame 1   : Draw 1   Label 0xffffffff
+#       LRZ State: TestEnabled, WriteEnabled <0x03>
+#       Clocks                                     :       58912.000
+# Meta documents the numbers as comparable between draws of one trace only.
+DRAW_HEAD = re.compile(r"Frame\s+(\d+)\s*:\s*Draw\s+(\d+)")
+DRAW_METRIC = re.compile(r"^\s*([A-Za-z%/()][^:]*?)\s*:\s*(-?[\d.]+(?:[eE][-+]?\d+)?)\s*$")
+
+
+def summarize_draws(text: str, limit: int = 40) -> list:
+    """Each draw call of a per-draw trace, by its position -- `cb.draw`, the
+    command buffer and the draw within it -- with every metric averaged over
+    the frames that drew it; heaviest (Clocks) first. A draw's position is
+    what identifies it: the tool has no names."""
+    draws: dict = {}
+    current = None
+    # Draws are numbered within a command buffer, and the numbering starts
+    # again at 1 in the next: `cb.draw` names one.
+    cb, last = 0, None
+    for line in text.splitlines():
+        head = DRAW_HEAD.search(line)
+        if head:
+            n = int(head.group(2))
+            if last is not None and n <= last:
+                cb += 1
+            last = n
+            key = "%d.%d" % (cb, n)
+            current = draws.setdefault(key, {"draw": key, "frames": 0, "sums": {}})
+            current["frames"] += 1
+            continue
+        if current is None:
+            continue
+        m = DRAW_METRIC.match(line)
+        if m:
+            current["sums"][m.group(1)] = current["sums"].get(m.group(1), 0.0) + float(m.group(2))
+    out = [{"draw": d["draw"], "frames": d["frames"],
+            "metrics": {k: v / d["frames"] for k, v in d["sums"].items()}} for d in draws.values()]
+    out.sort(key=lambda d: -d["metrics"].get("Clocks", 0.0))
+    return out[:limit]
+
+
+def trace_draws(dev: Device, seconds: int, metrics: str) -> tuple:
+    """A per-draw trace (`ovrgpuprofiler -t -x=`) of `seconds` with the given
+    metric ids: the summary and the raw output. Detailed mode, like `trace`."""
+    # The ids ATTACH to `-x`, with no `=` and no space: `-x1,14,18`. Tried on
+    # the Quest, 2026-09-28: `-x=ids` traces Clocks only, `-x ids` and
+    # `-x -s=ids` track nothing ("-s ignored in drawcall mode"), and
+    # `--drawcall=ids` captures no draws. A trace under 2 s may catch none.
+    text = dev.shell("ovrgpuprofiler -t%d -x%s" % (max(seconds, 2), metrics), check=False, timeout=seconds + 120)
+    return summarize_draws(text), text
 
 
 def list_screenshots(dev: Device) -> list:
@@ -530,6 +583,18 @@ def render_report(run: dict, views: dict, compare: dict | None) -> str:
                 lines.append("| %s | %s | %s | %s |" % (
                     k["surface"], fmt(k["per_second"], 1), fmt(k["mean_ms"], 3),
                     ", ".join("%s %s" % (s, fmt(ms, 3)) for s, ms in k["stages_ms"].items())))
+        if v.get("draws"):
+            names = []
+            for d in v["draws"]:
+                names += [k for k in d["metrics"] if k not in names]
+            lines.append("")
+            lines.append("Draw calls (per-draw trace, heaviest first; numbers compare draws of one trace only):")
+            lines.append("")
+            lines.append("| draw | frames | " + " | ".join(names) + " |")
+            lines.append("|---|---|" + "---|" * len(names))
+            for d in v["draws"]:
+                lines.append("| %s | %d | %s |" % (d["draw"], d["frames"], " | ".join(
+                    fmt(d["metrics"].get(k), 1) for k in names)))
         if v.get("gpu_counters"):
             lines.append("")
             lines.append("GPU counters (shipped renderer, ovrgpuprofiler, mean over the capture):")
@@ -582,12 +647,24 @@ def main(argv: list | None = None) -> int:
                     help="capture a render-stage trace this long at each view (ovrgpuprofiler -t): each pass's "
                          "bins and binning, rendering, store and pre-emption times. Restarts the app in the "
                          "driver's detailed profiling mode and back out of it afterwards; skips the counters")
+    ap.add_argument("--draws", metavar="IDS",
+                    help="with --trace, also a per-draw trace of these metric ids (ovrgpuprofiler -x -m lists "
+                         "them), e.g. 1,14,18,19,28,36 -- clocks, ALU use, wave occupancy, instruction cache "
+                         "misses, fragments and ALU a fragment for every draw call. Some sets come back Clocks "
+                         "only; that one is known to work")
     ap.add_argument("--out", help="output folder (default ../docs/bench/<date_time>)")
     ap.add_argument("--compare", help="an earlier run's folder, to compare baselines against")
     ap.add_argument("--stall-seconds", type=float, default=120.0, help="give up on a view after this long with no new window")
     ap.add_argument("--poll-seconds", type=float, default=3.0, help=argparse.SUPPRESS)
     ap.add_argument("--print-levers", metavar="VIEW", help="print the lever file for VIEW and exit (no device)")
     args = ap.parse_args(argv)
+    # A run stopped from outside -- a task runner's SIGTERM -- must put the
+    # headset back like Ctrl-C does. Python's default SIGTERM ends the process
+    # WITHOUT running `finally`, and one such stop left the Quest in detailed
+    # profiling mode with its clocks locked (2026-09-28).
+    def terminated(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, terminated)
 
     try:
         extra = json.loads(args.levers) if args.levers else {}
@@ -597,6 +674,8 @@ def main(argv: list | None = None) -> int:
             # Detailed profiling mode is on for the whole run, and its overhead
             # would sit inside every A/B number.
             raise BenchError("--trace runs in the driver's detailed profiling mode; run --ab separately")
+        if args.draws and (not args.trace or not re.fullmatch(r"\d+(,\d+)*", args.draws)):
+            raise BenchError("--draws takes comma-separated metric ids, with --trace")
     except json.JSONDecodeError as e:
         print("bench: --levers is not JSON: %s" % e, file=sys.stderr)
         return 2
@@ -715,7 +794,24 @@ def main(argv: list | None = None) -> int:
                 counters, raw = profile(dev, counter_ids, args.profile_seconds)
                 (out / ("profiler_%s.txt" % name)).write_text(raw)
             passes: list = []
+            draws: list = []
             if args.trace:
+                # Per-draw traces are FLAKY on the Quest (2026-09-28): one can
+                # capture no draws at all, and the counters come back only for
+                # some metric sets -- 1,14,18,19,28,36 returned every one where
+                # 1,14,18,28,36 returned Clocks alone, in the same session. So
+                # a trace that came back empty or Clocks-only is taken again.
+                if args.draws:
+                    for attempt in range(2):
+                        draws, raw = trace_draws(dev, args.trace, args.draws)
+                        (out / ("draws_%s.txt" % name)).write_text(raw)
+                        if any(len(d["metrics"]) > 1 for d in draws):
+                            break
+                    if not draws:
+                        warnings.append("the per-draw trace at %s held no draws (see draws_%s.txt)" % (name, name))
+                    elif not any(len(d["metrics"]) > 1 for d in draws):
+                        warnings.append("the per-draw trace at %s returned Clocks only, twice: try another metric "
+                                        "set (1,14,18,19,28,36 is known to work)" % name)
                 passes, raw = trace(dev, args.trace)
                 (out / ("trace_%s.txt" % name)).write_text(raw)
                 if not passes:
@@ -729,7 +825,8 @@ def main(argv: list | None = None) -> int:
                 f.seek(mark)
                 vrapi = summarize_vrapi(f.read().decode(errors="replace"))
             collected[name] = {"phases": summarize_view(records), "vrapi": vrapi, "gpu_counters": counters,
-                               "trace": passes, "records": len(records), "screenshot": shot.name if shot else None}
+                               "trace": passes, "draws": draws, "records": len(records),
+                               "screenshot": shot.name if shot else None}
     except BenchError as e:
         failure = str(e)
     except KeyboardInterrupt:

@@ -12,11 +12,13 @@ script's decisions; it does not prove the headset measures anything.
 
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -92,6 +94,15 @@ FAKE_ADB = textwrap.dedent('''\
             print("1       Clocks / Second\\n2       GPU %% Bus Busy\\n3       %% Vertex Fetch Stall\\n"
                   "4       %% Texture Fetch Stall\\n5       Preemptions / second")
             sys.exit(0)
+        if words[0] == "ovrgpuprofiler" and words[1].startswith("-t") and any(w.startswith("-x") for w in words):
+            # Per-draw mode, in the documented format: two frames of three draws.
+            for frame in (1, 2):
+                for draw, clocks in ((1, 1000.0), (2, 9000.0 + frame * 1000.0), (3, 500.0)):
+                    print("Frame %%d   : Draw %%d   Label 0xffffffff" %% (frame, draw))
+                    print("    LRZ State: TestEnabled, WriteEnabled <0x03>")
+                    print("    Clocks                                     :       %%.3f" %% clocks)
+                    print("    %%%% Wave Context Occupancy                  :          %%.3f" %% (40.0 + draw))
+            sys.exit(0)
         if words[0] == "ovrgpuprofiler" and words[1].startswith("-t"):
             # Two frames of an eye pass and one half-resolution pass, in the
             # documented format.
@@ -99,7 +110,7 @@ FAKE_ADB = textwrap.dedent('''\
                    "| 24 256x256 bins ( 24 rendered) | %%.2f ms | 60 stages : Binning : 0.400ms Render : %%.3fms "
                    "StoreColor : 0.300ms Preempt : 0.400ms")
             print(eye %% (1, 6.1, 5.0))
-            print("Surface 2 | 588x616 | color 64bit, depth 32bit, stencil 0 bit, MSAA 1, Mode: 1 (HwBinning) "
+            print("Surface 2    | 588 x616  | color 64bit, depth 32bit, stencil 0 bit, MSAA 1, Mode: 1 (HwBinning) "
                   "| 4 320x320 bins ( 4 rendered) | 3.00 ms | 10 stages : Binning : 0.100ms Render : 2.800ms "
                   "StoreColor : 0.100ms")
             print(eye %% (3, 6.3, 5.2))
@@ -287,6 +298,32 @@ class BenchScript(unittest.TestCase):
         self.assertTrue(any("automation_disable" in c for c in self.shell_calls()))
         self.assertTrue(any(c.startswith("rm -f") and c.endswith("levers.json") for c in self.shell_calls()))
 
+    def test_a_terminated_run_still_puts_the_headset_back(self):
+        # Stopped from outside mid-run, as a task runner stops it: SIGTERM,
+        # which by default skips every `finally`. Once, that left the Quest in
+        # detailed profiling mode with its clocks locked (2026-09-28).
+        (self.state / "mode").write_text("silent")
+        out = self.state / "out"
+        p = subprocess.Popen([sys.executable, str(HERE / "bench.py"), "--out", str(out), "--poll-seconds", "0.05",
+                              "--views", "pillar", "--stall-seconds", "60", "--no-profile"],
+                             env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + 30
+        locked = False
+        while time.monotonic() < deadline and not locked:
+            try:
+                locked = json.loads((self.state / "props.json").read_text()).get("debug.oculus.gpuLevel") == "5"
+            except ValueError:
+                pass  # read while the fake adb was writing it
+            time.sleep(0.05)
+        self.assertTrue(locked, "the run never locked the clocks")
+        time.sleep(0.5)
+        p.send_signal(signal.SIGTERM)
+        p.communicate(timeout=60)
+        self.assertEqual(json.loads((self.state / "props.json").read_text()), self.props)
+        self.assertTrue(any("automation_disable" in c for c in self.shell_calls()))
+        self.assertTrue(any(c.startswith("rm -f") and c.endswith("levers.json") for c in self.shell_calls()))
+        self.assertEqual(json.loads((out / "report.json").read_text())["failure"], "interrupted")
+
     def test_a_launch_the_quest_blocked_is_named(self):
         # The first real run (2026-09-27): no controller-required declaration,
         # controllers asleep on the desk, and the app never started.
@@ -322,6 +359,24 @@ class BenchScript(unittest.TestCase):
         self.assertAlmostEqual(passes[0]["stages_ms"]["Preempt"], 0.4)
         self.assertIn("| 1176x1232 msaa4 HwBinning 24 bins of 256x256 | 1.0 | 6.200 | Render 5.100",
                       (out / "report.md").read_text())
+
+    def test_a_per_draw_trace_ranks_the_draws(self):
+        p, out = self.bench("--trace", "2", "--draws", "1,18", "--views", "hall_back", "--no-screenshots")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertTrue(any(c == "ovrgpuprofiler -t2 -x1,18" for c in self.shell_calls()), self.shell_calls())
+        draws = json.loads((out / "report.json").read_text())["views"]["hall_back"]["draws"]
+        # Two command buffers (the second frame's numbering restarts at 1).
+        self.assertEqual([d["draw"] for d in draws][:3], ["1.2", "0.2", "0.1"], "heaviest first")
+        self.assertEqual(draws[0]["frames"], 1)
+        self.assertAlmostEqual(draws[0]["metrics"]["Clocks"], 11000.0)
+        self.assertAlmostEqual(draws[0]["metrics"]["% Wave Context Occupancy"], 42.0)
+        self.assertIn("| 1.2 | 1 | 11000.0 | 42.0 |", (out / "report.md").read_text())
+
+    def test_draws_need_a_trace_and_plain_ids(self):
+        for bad in (["--draws", "1,18"], ["--trace", "2", "--draws", "1;rm -rf /"]):
+            p, _ = self.bench(*bad, "--views", "pillar")
+            self.assertEqual(p.returncode, 2, bad)
+        self.assertEqual([c for c in self.calls() if c[:1] == ["-s"]], [])
 
     def test_a_trace_is_not_mixed_into_an_ab_run(self):
         p, _ = self.bench("--trace", "2", "--ab", "--views", "pillar")
