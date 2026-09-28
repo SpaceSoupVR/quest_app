@@ -293,8 +293,13 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             // own boxes are its walls. See `probe_level::ProbeLevel::proxies`.
             let proxies = level.scene_proxies(&dir, &static_scene.scene_name);
             info!("STARTUP probes: {} reflection prox(ies)", proxies.len());
+            let closed_rooms = level.closed_rooms.clone();
             renderer.set_reflection_probes_with_depth(level.descs, level.resolution, level.portals, source, Some(depth));
             renderer.set_reflection_proxies(proxies);
+            // Which rooms are walled all round but their doorways, so the
+            // terrain outside is drawn only where a doorway shows it. After
+            // the probes, whose room boxes it uses. See `portal_cull`.
+            renderer.set_closed_rooms(&closed_rooms);
             info!(
                 "STARTUP probes: metered, built mip chains and uploaded in {} ms",
                 t_upload.elapsed().as_millis(),

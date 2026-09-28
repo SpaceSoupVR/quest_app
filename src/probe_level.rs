@@ -17,8 +17,45 @@ pub struct ProbeLevel {
     pub resolution: u32,
     pub descs: Vec<ProbeDesc>,
     pub portals: Vec<ProbePortal>,
+    /// The rooms (by the numbers `descs` and `portals` use) that are CLOSED:
+    /// walled all round but their baked doorways, so nothing outside the
+    /// building can be seen from inside one except through a doorway. See
+    /// `space_soup_engine::room_graph::closed_room_boxes` and the renderer's
+    /// `portal_cull`.
+    pub closed_rooms: Vec<u32>,
     /// The index entries, in `descs` order, for the source.
     pub entries: Arc<Vec<ProbeEntry>>,
+}
+
+/// The probe rooms that are closed: those whose box is one of the level's
+/// closed room carves (`room_graph::closed_room_boxes`), matched to within
+/// 5 cm. A room none of whose photographs has depth is the outdoor volume,
+/// never closed; a room box that matches no carve -- authored by hand, or
+/// from a stale bake -- is left open, which only costs drawing more.
+fn closed_probe_rooms(
+    objects: &[GameObject],
+    descs: &[ProbeDesc],
+    entries: &[ProbeEntry],
+    portals: &[ProbePortal],
+) -> Vec<u32> {
+    let brushes: Vec<(&str, &space_soup_engine::brush::BrushDef)> =
+        objects.iter().filter_map(|o| o.brush.as_ref().map(|b| (o.id.as_str(), b))).collect();
+    let doorways: Vec<(Vec3, Vec3)> = portals.iter().map(|p| (p.min, p.max)).collect();
+    let closed_boxes = space_soup_engine::room_graph::closed_room_boxes(&brushes, &doorways);
+    let mut closed: Vec<u32> = descs
+        .iter()
+        .zip(entries)
+        .filter(|(d, e)| {
+            e.depth.is_some()
+                && closed_boxes.iter().any(|(lo, hi)| {
+                    lo.abs_diff_eq(d.min, 0.05) && hi.abs_diff_eq(d.max, 0.05)
+                })
+        })
+        .map(|(d, _)| d.volume)
+        .collect();
+    closed.sort_unstable();
+    closed.dedup();
+    closed
 }
 
 impl ProbeLevel {
@@ -79,13 +116,15 @@ impl ProbeLevel {
         // How deep each doorway's jambs are, from the walls it is cut through.
         // See `portal_wall_extent`: the carve alone overstates it.
         let mut portals = portals;
+        let mut closed_rooms = Vec::new();
         if let Ok(mut scene) = space_soup_engine::scene::Scene::load(&space_soup_engine::Manifest::scene_path(game_dir, scene)) {
             scene.resolve_world_transforms();
             for p in &mut portals {
                 p.wall = space_soup_engine::reflection_proxy::portal_wall_extent(&scene.objects, p.min, p.max, p.axis as usize);
             }
+            closed_rooms = closed_probe_rooms(&scene.objects, &descs, &entries, &portals);
         }
-        Some(Self { resolution, descs, portals, entries: Arc::new(entries) })
+        Some(Self { resolution, descs, portals, closed_rooms, entries: Arc::new(entries) })
     }
 
     /// WHAT STANDS INSIDE THE ROOMS -- a pillar, a lamp -- for the reflection
@@ -184,5 +223,35 @@ mod tests {
             assert!(lamp.centre.y + lamp.half_size.y <= 3.2, "the lamp reaches through the ceiling: {lamp:?}");
             assert!(lamp.half_size.y > 0.15, "the lamp's box is the editor handle, not the model: {lamp:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod closed_room_tests {
+    use super::*;
+
+    /// test_room's hall, hallway and brick hall are shells walled all round
+    /// but their doorways; the outdoor volume is not a room at all.
+    #[test]
+    fn test_rooms_indoor_rooms_are_closed_and_the_outdoors_is_not() {
+        let game = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game");
+        let Some(level) = ProbeLevel::load(&game, "test_room") else {
+            eprintln!("skipping: test_room has no probes here");
+            return;
+        };
+        let named = |room: u32| {
+            level
+                .descs
+                .iter()
+                .zip(level.entries.iter())
+                .find(|(d, _)| d.volume == room)
+                .map(|(_, e)| e.volume.clone())
+                .unwrap()
+        };
+        let closed: Vec<String> = level.closed_rooms.iter().map(|&r| named(r)).collect();
+        for room in ["hall_probe", "hallway#0", "brick_probe"] {
+            assert!(closed.iter().any(|c| c == room), "{room} should be closed: {closed:?}");
+        }
+        assert!(!closed.iter().any(|c| c == "outdoors"), "{closed:?}");
     }
 }
