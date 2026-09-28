@@ -266,11 +266,20 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     let prepass = view
         .depth_prepass
         .then(|| BrushPipeline::new_depth_prepass(&device, format, &uniforms.layout, view.samples, ViewMode::Mono));
+    // As it ships: the secondary lookups deferred to `probe_fixup`.
+    // `PROBE_INLINE=1` renders with them made in the pass, to compare.
+    let inline_lookups = std::env::var("PROBE_INLINE").is_ok_and(|v| v == "1");
     let probe_pass = half_res.then(|| {
-        (
-            BrushPipeline::new_probe_pass(&device, &uniforms.layout, ViewMode::Mono),
-            space_soup::renderer::brush_pipeline::probe_pass::Target::new(&device, &probe_layout, view.width, view.height, 1),
-        )
+        let target =
+            space_soup::renderer::brush_pipeline::probe_pass::Target::new(&device, &probe_layout, view.width, view.height, 1);
+        if inline_lookups {
+            (BrushPipeline::new_probe_pass(&device, &uniforms.layout, ViewMode::Mono), target, None)
+        } else {
+            let fixups = space_soup::renderer::probe_fixup::ProbeFixups::new(&device, &uniforms.layout, target.width * target.height);
+            let pipeline = BrushPipeline::new_probe_pass_deferred(&device, &uniforms.layout, &fixups);
+            let target_bg = fixups.target_bind_group(&device, &target);
+            (pipeline, target, Some((fixups, target_bg)))
+        }
     });
 
     let mut geometry = BrushGeometry::load_with(&scene, true);
@@ -348,7 +357,10 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         depth.create_view(&Default::default()),
     );
     let mut encoder = device.create_command_encoder(&Default::default());
-    if let Some((probe_pipeline, target)) = &probe_pass {
+    if let Some((probe_pipeline, target, fixups)) = &probe_pass {
+        if let Some((fixups, _)) = fixups {
+            fixups.clear(&mut encoder);
+        }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("offline_probe_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -368,9 +380,16 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         pass.set_bind_group(0, &uniforms.bind_group, &[]);
         pass.set_bind_group(1, &materials.bind_group, &[]);
         pass.set_bind_group(2, &lightmap.bind_group, &[]);
+        if let Some((fixups, _)) = fixups {
+            pass.set_bind_group(3, fixups.pass_bind_group(), &[]);
+        }
         pass.set_vertex_buffer(0, vb.slice(..));
         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
+        drop(pass);
+        if let Some((fixups, target_bg)) = fixups {
+            fixups.dispatch(&mut encoder, &uniforms.bind_group, target_bg);
+        }
     }
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -405,7 +424,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         pass.set_bind_group(0, &uniforms.bind_group, &[]);
         pass.set_bind_group(1, &materials.bind_group, &[]);
         pass.set_bind_group(2, &lightmap.bind_group, &[]);
-        if let Some((_, target)) = &probe_pass {
+        if let Some((_, target, _)) = &probe_pass {
             pass.set_bind_group(3, &target.bind_group, &[]);
         }
         pass.set_vertex_buffer(0, vb.slice(..));
