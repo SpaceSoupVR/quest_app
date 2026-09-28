@@ -340,6 +340,7 @@ def summarize_view(records: list) -> dict:
     for phase, rs in phases.items():
         xr_gpu = [r.get("xr", {}).get("app/gpu_frametime") for r in rs]
         xr_vals = [v for v in xr_gpu if v is not None]
+        waits = [r.get("gpu_avg") for r in rs if r.get("gpu_avg") is not None]
         passes = {}
         for label in sorted({k for r in rs for k in r.get("pass", {})}):
             passes[label] = median([r.get("pass", {}).get(label) for r in rs])
@@ -349,6 +350,7 @@ def summarize_view(records: list) -> dict:
             "app_gpu_ms": median(xr_gpu),
             "app_gpu_spread_ms": (max(xr_vals) - min(xr_vals)) if len(xr_vals) > 1 else 0.0,
             "gpu_wait_ms": median([r.get("gpu_avg") for r in rs]),
+            "gpu_wait_spread_ms": (max(waits) - min(waits)) if len(waits) > 1 else 0.0,
             "cpu_ms": median([r.get("cpu_avg") for r in rs]),
             "frame_ms": median([r.get("frame_ms") for r in rs]),
             "fps": median([r.get("fps") for r in rs]),
@@ -396,12 +398,13 @@ def render_report(run: dict, views: dict, compare: dict | None) -> str:
         run["extra_levers"] or "{}", run["cpu_level"], run["gpu_level"],
         "A/B schedule, %d pass(es)" % run["passes"] if run["ab"] else "%d window(s) a view" % run["windows"]))
     lines.append("")
-    lines.append("`app GPU` is the runtime's own GPU time for the app's frame (XR_META_performance_metrics), "
-                 "averaged over each window and the median over passes; `cost` is what switching the "
-                 "feature off saves against the baseline -- negative for an optimisation, whose lever "
-                 "switches it off. `shipped` is the renderer with no schedule running, and should agree "
-                 "with `baseline`. `spread` is the range over passes. `wait` is the render thread's wait "
-                 "for the GPU.")
+    lines.append("`GPU ms` is the render thread's wait for the GPU to finish each frame, averaged over a "
+                 "window and the median over passes; `cost` is what switching the feature off saves "
+                 "against the baseline -- negative for an optimisation, whose lever switches it off. "
+                 "`shipped` is the renderer with no schedule running, and should agree with `baseline`. "
+                 "`spread` is the range over passes. `app GPU` is the runtime's own counter "
+                 "(XR_META_performance_metrics); it LAGS -- smoothed over about a second -- so a window "
+                 "right after a slow phase reads high, and it is shown for reference only.")
     for name, v in views.items():
         phases = v["phases"]
         lines += ["", "## %s" % name, ""]
@@ -418,15 +421,15 @@ def render_report(run: dict, views: dict, compare: dict | None) -> str:
         if v.get("screenshot"):
             lines.append("![%s](%s)" % (name, v["screenshot"]))
             lines.append("")
-        lines.append("| phase | app GPU ms | cost ms | spread | wait ms | frame ms | fps | CPU ms |")
+        lines.append("| phase | GPU ms | cost ms | spread | app GPU ms | frame ms | fps | CPU ms |")
         lines.append("|---|---|---|---|---|---|---|---|")
         for phase, p in phases.items():
             cost = None
-            if base and p is not base and base["app_gpu_ms"] is not None and p["app_gpu_ms"] is not None:
-                cost = base["app_gpu_ms"] - p["app_gpu_ms"]
+            if base and p is not base and base["gpu_wait_ms"] is not None and p["gpu_wait_ms"] is not None:
+                cost = base["gpu_wait_ms"] - p["gpu_wait_ms"]
             lines.append("| %s | %s | %s | %s | %s | %s | %s | %s |" % (
-                "shipped" if phase == "-" else phase, fmt(p["app_gpu_ms"]), fmt(cost), fmt(p["app_gpu_spread_ms"]), fmt(p["gpu_wait_ms"]),
-                fmt(p["frame_ms"]), fmt(p["fps"], 1), fmt(p["cpu_ms"])))
+                "shipped" if phase == "-" else phase, fmt(p["gpu_wait_ms"]), fmt(cost), fmt(p["gpu_wait_spread_ms"]),
+                fmt(p["app_gpu_ms"]), fmt(p["frame_ms"]), fmt(p["fps"], 1), fmt(p["cpu_ms"])))
         if base and base["passes_ms"]:
             lines.append("")
             lines.append("Passes (baseline, one frame each): " + ", ".join(
@@ -442,11 +445,11 @@ def render_report(run: dict, views: dict, compare: dict | None) -> str:
         if compare and name in compare.get("views", {}):
             old = compare["views"][name]["phases"]
             old_base = old.get("baseline") or old.get("-")
-            if old_base and base and old_base.get("app_gpu_ms") is not None and base["app_gpu_ms"] is not None:
-                d = base["app_gpu_ms"] - old_base["app_gpu_ms"]
+            if old_base and base and old_base.get("gpu_wait_ms") is not None and base["gpu_wait_ms"] is not None:
+                d = base["gpu_wait_ms"] - old_base["gpu_wait_ms"]
                 lines.append("")
-                lines.append("Against %s: app GPU %s -> %s ms (%+.2f ms, %s)." % (
-                    compare["run"]["started"], fmt(old_base["app_gpu_ms"]), fmt(base["app_gpu_ms"]), d,
+                lines.append("Against %s: GPU %s -> %s ms (%+.2f ms, %s)." % (
+                    compare["run"]["started"], fmt(old_base["gpu_wait_ms"]), fmt(base["gpu_wait_ms"]), d,
                     "slower" if d > 0 else "faster"))
     return "\n".join(lines) + "\n"
 

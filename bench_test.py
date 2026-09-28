@@ -218,8 +218,9 @@ class BenchScript(unittest.TestCase):
             for phase in PHASES:
                 self.assertEqual(phases[phase]["windows"], 2, phase)
                 self.assertAlmostEqual(phases["baseline"]["app_gpu_ms"] - phases[phase]["app_gpu_ms"], COST[phase])
+                self.assertAlmostEqual(phases["baseline"]["gpu_wait_ms"] - phases[phase]["gpu_wait_ms"], COST[phase])
             self.assertEqual(report["views"][view]["vrapi"]["gpu_mhz"], [599])
-        self.assertIn("| no_portals | 36.50 | 3.50 |", (out / "report.md").read_text())
+        self.assertIn("| no_portals | 37.50 | 3.50 |", (out / "report.md").read_text())
         self.assertTrue((out / "perf.jsonl").exists())
         # The shipped renderer's own windows, apart from the schedule's, and
         # the GPU's counters read while it drew them: the first second is
