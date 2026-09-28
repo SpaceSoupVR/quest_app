@@ -334,6 +334,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
         // The stationary lamps' shadow masks, one image per two lamps, in
         // layer order. See `space_soup_engine::stationary`.
+        // And the same lamps' masks on the ground, in the same layers. See
+        // `space_soup_engine::lightmaps::scene_terrain_stationary_id`.
+        let terrain_stationary_ids: Vec<String> = (0..space_soup_engine::stationary::MAX_STATIONARY_LAYERS)
+            .map(space_soup_engine::lightmaps::scene_terrain_stationary_id)
+            .collect();
         let stationary_ids: Vec<String> =
             (0..space_soup_engine::stationary::MAX_STATIONARY_LAYERS).map(space_soup_engine::lightmaps::scene_brush_stationary_id).collect();
         let stationary_maps: Vec<&space_soup_engine::lightmaps::LoadedLightmap> = scene_lights::usable_stationary_masks(
@@ -364,6 +369,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 continue;
             }
+            // The stationary lamps' masks on the ground travel as terrain maps
+            // too; they are installed together below, after this loop.
+            if terrain_stationary_ids.contains(&m.object_id) {
+                continue;
+            }
             // The ground's sky-visibility map: one image for the level, sampled
             // by footprint position rather than belonging to any object.
             if m.target == space_soup_engine::lightmaps::LightmapTarget::Terrain {
@@ -386,6 +396,28 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
             renderer.set_cuboid_lightmap(&m.object_id, lightmap_light(m), m.width, m.height);
             renderer.set_mesh_lightmap(&m.object_id, lightmap_light(m), m.width, m.height);
+        }
+        // THE STATIONARY LAMPS' SHADOWS ON THE GROUND, layer by layer as on
+        // the brushes, and only a set baked for these lamps. Without them the
+        // lamps light the grass straight through the walls.
+        // A bake from before the ground had masks simply has none, which is
+        // not the stale-bake warning `usable_stationary_masks` gives.
+        let found: Vec<&space_soup_engine::lightmaps::LoadedLightmap> =
+            terrain_stationary_ids.iter().map_while(|id| maps.iter().find(|m| &m.object_id == id)).collect();
+        let ground_masks =
+            if found.is_empty() { Vec::new() } else { scene_lights::usable_stationary_masks(found, &stationary_channels) };
+        if !ground_masks.is_empty() {
+            info!("lightmaps: {} stationary mask layer(s) on the ground", ground_masks.len());
+            renderer.set_terrain_stationary_masks(
+                ground_masks
+                    .iter()
+                    .map(|m| space_soup::renderer::terrain_pipeline::TerrainImage {
+                        width: m.width,
+                        height: m.height,
+                        rgba: m.rgba.clone(),
+                    })
+                    .collect(),
+            );
         }
     }
 
