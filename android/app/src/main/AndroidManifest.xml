@@ -6,6 +6,15 @@
     <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
     <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
     <uses-feature android:name="android.hardware.vr.headtracking" android:required="true" />
+    <!-- CONTROLLERS AND HANDS. Without these the Quest refuses to launch the
+         app while no controller is active: a "Switch to Controllers" system
+         dialog blocks entry until one is picked up. That stopped the
+         unattended benchmark (bench.py) with the headset lying on a desk
+         (2026-09-27). required="false": hands are supported and controllers
+         still work; the app's XR_EXT_hand_tracking path now receives tracked
+         hands when the controllers are put down. -->
+    <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
+    <uses-feature android:name="oculus.software.handtracking" android:required="false" />
 
     <application
         android:label="QuestApp"

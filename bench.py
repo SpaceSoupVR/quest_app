@@ -18,7 +18,8 @@ In order, it:
      the clock governor; enlarges the logcat buffer;
   3. starts the app if it is not running;
   4. for each view, writes the lever file with the camera pinned there,
-     takes the shipped renderer's windows and the GPU's own counters
+     takes the shipped renderer's windows, a screenshot of what the headset
+     shows (the system's own screenshot service), and the GPU's own counters
      (ovrgpuprofiler: busy, stalls, cache misses), then -- with --ab -- runs
      the A/B schedule there, waiting each time until the app's results file
      holds the windows it needs;
@@ -65,6 +66,8 @@ GPU_LEVEL_PROP = "debug.oculus.gpuLevel"
 # Pauses the boundary, so a headset lying still on a desk is not interrupted
 # by it. Like the levels, it does not survive a reboot.
 GUARDIAN_PAUSE_PROP = "debug.oculus.guardian_pause"
+# Where the system's screenshot service (MetaCam) writes.
+SCREENSHOT_DIR = "/sdcard/Oculus/Screenshots"
 
 
 class BenchError(Exception):
@@ -195,8 +198,23 @@ def wait_for_view(dev: Device, name: str, ab: bool, passes: int, windows: int,
             last_change = time.monotonic()
             print("  %s: %d measured window(s)%s" % (name, len(measured), " of %d" % need if need else ""), flush=True)
         if time.monotonic() - last_change > stall_seconds:
-            raise BenchError(stall_diagnosis(name, records, stall_seconds))
+            message = stall_diagnosis(name, records, stall_seconds)
+            blocked = launch_block(dev) if not records else None
+            if blocked:
+                message += " The Quest blocked the app's launch: " + blocked
+            raise BenchError(message)
         time.sleep(poll_seconds)
+
+
+def launch_block(dev: Device) -> str | None:
+    """A system dialog in the way of the app's launch, from the recent log --
+    e.g. "Switch to Controllers" for an app that declares no hand tracking,
+    with the controllers asleep on the desk."""
+    text = dev.run("logcat", "-d", "-t", "4000", check=False, timeout=60)
+    for line in reversed(text.splitlines()):
+        if PACKAGE in line and ("launch_blocked" in line or "Launch is blocked" in line):
+            return line.strip()
+    return None
 
 
 def stall_diagnosis(name: str, records: list, waited: float) -> str:
@@ -273,6 +291,39 @@ def profile(dev: Device, ids: list, seconds: int) -> tuple:
             samples.setdefault(m.group(1), []).append(float(m.group(2)))
     means = {k: statistics.mean(v[1:] if len(v) > 2 else v) for k, v in samples.items()}
     return means, text
+
+
+def list_screenshots(dev: Device) -> list:
+    text = dev.shell("ls -1 %s 2>/dev/null" % SCREENSHOT_DIR, check=False)
+    return sorted(line.strip() for line in text.splitlines() if line.strip())
+
+
+def screenshot(dev: Device, dest_stem: Path, timeout: float = 20.0, poll: float = 1.0) -> Path | None:
+    """What the headset shows now, through the system's own screenshot
+    service, pulled to `dest_stem` plus the device file's extension. `None`
+    when no new file appeared."""
+    before = set(list_screenshots(dev))
+    dev.shell("am startservice -n com.oculus.metacam/.capture.CaptureService -a TAKE_SCREENSHOT", check=False)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(poll)
+        new = [f for f in list_screenshots(dev) if f not in before]
+        if not new:
+            continue
+        remote = "%s/%s" % (SCREENSHOT_DIR, new[-1])
+        # Pulled once the file has stopped growing: the service writes it
+        # after announcing it.
+        size = None
+        while time.monotonic() < deadline:
+            now = dev.shell("stat -c %%s %s" % remote, check=False).strip()
+            if now and now == size:
+                break
+            size = now
+            time.sleep(poll)
+        local = dest_stem.with_suffix(Path(new[-1]).suffix or ".jpg")
+        dev.run("pull", remote, str(local), check=False)
+        return local if local.exists() else None
+    return None
 
 
 def median(values: list) -> float | None:
@@ -364,6 +415,9 @@ def render_report(run: dict, views: dict, compare: dict | None) -> str:
                 lines.append("**The GPU clock changed during this view: its numbers are not comparable.**")
             lines.append("")
         base = phases.get("baseline") or phases.get("-")
+        if v.get("screenshot"):
+            lines.append("![%s](%s)" % (name, v["screenshot"]))
+            lines.append("")
         lines.append("| phase | app GPU ms | cost ms | spread | wait ms | frame ms | fps | CPU ms |")
         lines.append("|---|---|---|---|---|---|---|---|")
         for phase, p in phases.items():
@@ -418,6 +472,7 @@ def main(argv: list | None = None) -> int:
     ap.add_argument("--gpu-level", type=int, default=5, help="lock the GPU level (Quest 3: 0-5; default 5)")
     ap.add_argument("--no-lock", action="store_true", help="leave the clock levels to the governor")
     ap.add_argument("--no-profile", action="store_true", help="skip the GPU counters (ovrgpuprofiler)")
+    ap.add_argument("--no-screenshots", action="store_true", help="skip the screenshot from each view")
     ap.add_argument("--profile-seconds", type=int, default=10, help="how long to read the GPU counters a view (default 10)")
     ap.add_argument("--out", help="output folder (default ../docs/bench/<date_time>)")
     ap.add_argument("--compare", help="an earlier run's folder, to compare baselines against")
@@ -519,6 +574,12 @@ def main(argv: list | None = None) -> int:
             if not any(what == "remove the lever file" for what, _ in changed):
                 changed.append(("remove the lever file", lambda: dev.shell("rm -f " + LEVERS)))
             records = wait_for_view(dev, name, False, args.passes, args.windows, args.stall_seconds, args.poll_seconds)
+            # What the view looks like, from the headset itself.
+            shot = None
+            if not args.no_screenshots:
+                shot = screenshot(dev, out / name)
+                if shot is None:
+                    warnings.append("no screenshot came back for %s" % name)
             counters: dict = {}
             if counter_ids:
                 counters, raw = profile(dev, counter_ids, args.profile_seconds)
@@ -532,7 +593,7 @@ def main(argv: list | None = None) -> int:
                 f.seek(mark)
                 vrapi = summarize_vrapi(f.read().decode(errors="replace"))
             collected[name] = {"phases": summarize_view(records), "vrapi": vrapi, "gpu_counters": counters,
-                               "records": len(records)}
+                               "records": len(records), "screenshot": shot.name if shot else None}
     except BenchError as e:
         failure = str(e)
     except KeyboardInterrupt:

@@ -54,7 +54,7 @@ FAKE_ADB = textwrap.dedent('''\
 
     def play_the_app():
         """Write a few more results windows for whatever the lever file says."""
-        if open(os.path.join(state, "mode")).read().strip() == "silent":
+        if open(os.path.join(state, "mode")).read().strip() in ("silent", "blocked"):
             return
         app_path = os.path.join(state, "app.json")
         app = json.load(open(app_path)) if os.path.exists(app_path) else {"levers": None, "window": 0, "pos": 0, "warm": True}
@@ -86,6 +86,7 @@ FAKE_ADB = textwrap.dedent('''\
 
     if args[0] == "shell":
         words = shlex.split(args[1])
+        mode = open(os.path.join(state, "mode")).read().strip()
         if words[:2] == ["ovrgpuprofiler", "-m"]:
             print("1       Clocks / Second\\n2       GPU %% Bus Busy\\n3       %% Vertex Fetch Stall\\n"
                   "4       %% Texture Fetch Stall\\n5       Preemptions / second")
@@ -108,6 +109,19 @@ FAKE_ADB = textwrap.dedent('''\
             os.replace(local(words[1]), local(words[2]))
         elif words[0] == "pidof":
             print("4242")
+        elif words[:2] == ["am", "startservice"] and "TAKE_SCREENSHOT" in words:
+            n = len([f for f in os.listdir(fs) if f.startswith("_sdcard_Oculus_Screenshots_")])
+            with open(local("/sdcard/Oculus/Screenshots/com.example.questapp-%%d.jpg" %% n), "wb") as f:
+                f.write(b"fake jpeg")
+        elif words[0] == "ls":
+            prefix = next(w for w in words if w.startswith("/")).replace("/", "_") + "_"
+            for f in sorted(os.listdir(fs)):
+                if f.startswith(prefix):
+                    print(f[len(prefix):])
+        elif words[:2] == ["stat", "-c"]:
+            p = local(words[-1])
+            if os.path.exists(p):
+                print(os.path.getsize(p))
         elif words[0] == "cat":
             if words[1].endswith("perf.jsonl"):
                 play_the_app()
@@ -126,6 +140,12 @@ FAKE_ADB = textwrap.dedent('''\
         sys.exit(0)
     if args[0] == "logcat":
         if "-G" in args:
+            sys.exit(0)
+        if "-d" in args:
+            if open(os.path.join(state, "mode")).read().strip() == "blocked":
+                print("09-27 23:10:10.712  3168  7537 D CaseDialogAnalytics: logDialogShown: "
+                      "dialogId=common_system_dialog_app_launch_blocked_controller_required, "
+                      "packageName=com.example.questapp")
             sys.exit(0)
         # Once a second on the headset; faster here, so every view gets some.
         for _ in range(3000):
@@ -207,6 +227,11 @@ class BenchScript(unittest.TestCase):
         for view in ("hall_back", "hallway"):
             self.assertEqual(report["views"][view]["phases"]["-"]["windows"], 3)
             self.assertEqual(report["views"][view]["gpu_counters"]["% Texture Fetch Stall"], 3.5)
+        # One screenshot a view, pulled beside the report and shown in it.
+        for view in ("hall_back", "hallway"):
+            self.assertTrue((out / (view + ".jpg")).exists(), view)
+            self.assertEqual(report["views"][view]["screenshot"], view + ".jpg")
+        self.assertIn("![hallway](hallway.jpg)", (out / "report.md").read_text())
         profiled = [c for c in self.shell_calls() if c.startswith("timeout")]
         self.assertEqual(len(profiled), 2)
         asked = profiled[0].split('-r"')[1].split('"')[0].split(",")
@@ -244,6 +269,17 @@ class BenchScript(unittest.TestCase):
         self.assertEqual(json.loads((self.state / "props.json").read_text()), self.props)
         self.assertTrue(any("automation_disable" in c for c in self.shell_calls()))
         self.assertTrue(any(c.startswith("rm -f") and c.endswith("levers.json") for c in self.shell_calls()))
+
+    def test_a_launch_the_quest_blocked_is_named(self):
+        # The first real run (2026-09-27): no controller-required declaration,
+        # controllers asleep on the desk, and the app never started.
+        (self.state / "mode").write_text("blocked")
+        p, out = self.bench("--views", "pillar", "--stall-seconds", "0.5", "--no-profile")
+        self.assertEqual(p.returncode, 1)
+        failure = json.loads((out / "report.json").read_text())["failure"]
+        self.assertIn("blocked the app's launch", failure)
+        self.assertIn("controller_required", failure)
+        self.assertEqual(json.loads((self.state / "props.json").read_text()), self.props)
 
     def test_the_lever_file_is_what_the_renderer_parses(self):
         p = subprocess.run([sys.executable, str(HERE / "bench.py"), "--print-levers", "hall_back", "--ab"],
