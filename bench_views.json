@@ -4,39 +4,115 @@
   "views": [
     {
       "name": "hall_back",
-      "eye": [-1.3, 1.6, -14.5],
-      "at": [0.4, 2.4, 3.7],
+      "eye": [
+        -1.3,
+        1.6,
+        -14.5
+      ],
+      "at": [
+        0.4,
+        2.4,
+        3.7
+      ],
       "note": "Back of the marble hall toward the front wall: the whole hall, the pillar, the most reflective floor on screen."
     },
     {
       "name": "hall_front",
-      "eye": [0.0, 1.6, 2.5],
-      "at": [0.2, 0.0, -6.0],
+      "eye": [
+        0.0,
+        1.6,
+        2.5
+      ],
+      "at": [
+        0.2,
+        0.0,
+        -6.0
+      ],
       "note": "From the front door down the hall at the pillar's base."
     },
     {
       "name": "pillar",
-      "eye": [0.3, 1.6, -3.0],
-      "at": [0.0, 0.9, -7.0],
+      "eye": [
+        0.3,
+        1.6,
+        -3.0
+      ],
+      "at": [
+        0.0,
+        0.9,
+        -7.0
+      ],
       "note": "Close on the pillar and its floor reflection."
     },
     {
       "name": "toward_door",
-      "eye": [0.2, 1.6, -2.0],
-      "at": [0.0, 0.2, 3.7],
+      "eye": [
+        0.2,
+        1.6,
+        -2.0
+      ],
+      "at": [
+        0.0,
+        0.2,
+        3.7
+      ],
       "note": "Facing the front door: the floor reflects the terrain and the sky through it."
     },
     {
       "name": "hallway",
-      "eye": [3.4, 1.6, -3.0],
-      "at": [9.0, 1.4, -3.0],
+      "eye": [
+        3.4,
+        1.6,
+        -3.0
+      ],
+      "at": [
+        9.0,
+        1.4,
+        -3.0
+      ],
       "note": "Down the stone hallway past the wall sconces."
     },
     {
       "name": "corner_pool",
-      "eye": [-1.2, 1.6, -11.8],
-      "at": [2.7, 1.7, -14.2],
+      "eye": [
+        -1.2,
+        1.6,
+        -11.8
+      ],
+      "at": [
+        2.7,
+        1.7,
+        -14.2
+      ],
       "note": "The back corner spot's pool on the right wall."
+    },
+    {
+      "name": "outdoors_front",
+      "eye": [
+        0.0,
+        1.6,
+        10.0
+      ],
+      "at": [
+        0.0,
+        1.8,
+        3.7
+      ],
+      "note": "Outside, facing the building's front across the ground: terrain, facade and sky."
+    },
+    {
+      "name": "outdoors_field",
+      "eye": [
+        0.0,
+        1.6,
+        6.0
+      ],
+      "at": [
+        6.0,
+        0.8,
+        14.0
+      ],
+      "note": "Outside, looking away from the building over the terrain: the ground shader across most of the screen."
     }
   ]
 }
