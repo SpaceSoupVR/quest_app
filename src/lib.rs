@@ -947,7 +947,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 &mut mesh_cache,
                 &mut hidden_part_meshes,
                 &avatar_mesh_cache,
-                &local_direct_mesh,
+                // Not while pinned: the controllers on the desk would carry the
+                // player's hands into the benchmark's view (and its cost).
+                if frame_bench.is_some() { &None } else { &local_direct_mesh },
                 local_player,
                 &world,
                 &static_scene,
