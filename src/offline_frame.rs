@@ -55,6 +55,10 @@ pub struct View {
     /// The light loop's culling of lamps that cannot reach a pixel -- the
     /// `light_culling` lever. On as shipped.
     pub light_culling: bool,
+    /// Reflections from the half-resolution probe pass rather than traced per
+    /// pixel -- the `half_res_reflections` lever. Not for the sources view,
+    /// which only the per-pixel shader paints.
+    pub half_res_reflections: bool,
 }
 
 impl View {
@@ -70,6 +74,7 @@ impl View {
             adapt: false,
             no_portals: false,
             light_culling: true,
+            half_res_reflections: true,
         }
     }
 }
@@ -233,11 +238,23 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         Some(&probes),
     );
 
+    // THE HALF-RESOLUTION PROBE PASS, as the headset runs it. See
+    // `space_soup::renderer::brush_pipeline::probe_pass`.
+    let probe_layout = space_soup::renderer::brush_pipeline::probe_pass::bind_group_layout(&device);
+    let half_res = view.half_res_reflections && !view.sources;
     let pipeline = if view.sources {
         BrushPipeline::new_multisampled_sources(&device, format, &uniforms.layout, view.samples)
+    } else if half_res {
+        BrushPipeline::new_multisampled_probe_reader(&device, format, &uniforms.layout, view.samples, &probe_layout)
     } else {
         BrushPipeline::new_multisampled(&device, format, &uniforms.layout, view.samples)
     };
+    let probe_pass = half_res.then(|| {
+        (
+            BrushPipeline::new_probe_pass(&device, &uniforms.layout),
+            space_soup::renderer::brush_pipeline::probe_pass::Target::new(&device, &probe_layout, view.width, view.height),
+        )
+    });
 
     let mut geometry = BrushGeometry::load_with(&scene, true);
     let maps = load_materials(&game, geometry.materials());
@@ -314,6 +331,30 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         depth.create_view(&Default::default()),
     );
     let mut encoder = device.create_command_encoder(&Default::default());
+    if let Some((probe_pipeline, target)) = &probe_pass {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("offline_probe_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &target.depth_view,
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        pass.set_pipeline(&probe_pipeline.pipeline);
+        pass.set_bind_group(0, &uniforms.bind_group, &[]);
+        pass.set_bind_group(1, &materials.bind_group, &[]);
+        pass.set_bind_group(2, &lightmap.bind_group, &[]);
+        pass.set_vertex_buffer(0, vb.slice(..));
+        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
+    }
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("offline_brush_pass"),
@@ -338,6 +379,9 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         pass.set_bind_group(0, &uniforms.bind_group, &[]);
         pass.set_bind_group(1, &materials.bind_group, &[]);
         pass.set_bind_group(2, &lightmap.bind_group, &[]);
+        if let Some((_, target)) = &probe_pass {
+            pass.set_bind_group(3, &target.bind_group, &[]);
+        }
         pass.set_vertex_buffer(0, vb.slice(..));
         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
@@ -457,6 +501,40 @@ mod tests {
             let every = render_brushes("test_room", View { light_culling: false, ..v }).unwrap();
             let differ = culled.rgba.chunks(4).zip(every.rgba.chunks(4)).filter(|(a, b)| a != b).count();
             assert_eq!(differ, 0, "culling changed {differ} pixel(s) looking from {eye} at {at}");
+        }
+    }
+
+    /// REFLECTIONS FROM THE HALF-RESOLUTION PASS ARE THE PER-PIXEL ONES. A
+    /// probe texel spans several screen pixels, so computing the reflection at
+    /// a quarter of the pixels -- and reading it back four texels at a time,
+    /// by depth -- should change almost nothing. Measured when it was built
+    /// (2026-09-27): a mean difference of 0.02-0.13 levels in four views, with
+    /// only single-pixel edges inside the reflected image moving. This keeps
+    /// it there: a broken upsample bleeds across every silhouette, and a
+    /// broken normalisation shifts whole surfaces.
+    #[test]
+    fn half_res_reflections_match_per_pixel_ones() {
+        for (eye, at) in [
+            (Vec3::new(-0.6, 1.6, -13.5), Vec3::new(0.0, 0.2, -7.0)),
+            (Vec3::new(0.2, 1.6, -2.0), Vec3::new(0.0, 0.2, 3.7)),
+        ] {
+            let v = View::headset(eye, at);
+            let Some(half) = render_brushes("test_room", v) else {
+                eprintln!("skipping: no GPU or no test_room");
+                return;
+            };
+            let full = render_brushes("test_room", View { half_res_reflections: false, ..v }).unwrap();
+            let (mut total, mut large) = (0u64, 0usize);
+            for (a, b) in half.rgba.chunks(4).zip(full.rgba.chunks(4)) {
+                let d = (0..3).map(|c| (a[c] as i32 - b[c] as i32).unsigned_abs()).max().unwrap();
+                total += d as u64;
+                large += usize::from(d > 16);
+            }
+            let n = (half.width * half.height) as f64;
+            let mean = total as f64 / n;
+            let share = large as f64 / n;
+            assert!(mean < 0.5, "half-res reflections moved the picture by {mean:.2} levels on average from {eye}");
+            assert!(share < 0.005, "{:.3}% of pixels differ by more than 16 levels from {eye}", share * 100.0);
         }
     }
 
@@ -613,7 +691,8 @@ mod tests {
             _ => View::headset(Vec3::new(0.3, 1.6, -3.0), Vec3::new(0.0, 0.9, -7.0)),
         };
         let sources = std::env::var("SOURCES").as_deref() == Ok("1");
-        let Some(shot) = render_brushes("test_room", View { adapt: !sources, sources, ..v }) else {
+        let half_res_reflections = std::env::var("FULL_RES").as_deref() != Ok("1");
+        let Some(shot) = render_brushes("test_room", View { adapt: !sources, sources, half_res_reflections, ..v }) else {
             eprintln!("skipping: no GPU or no test_room");
             return;
         };
