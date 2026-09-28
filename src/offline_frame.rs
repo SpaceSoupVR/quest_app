@@ -60,6 +60,9 @@ pub struct View {
     /// pixel -- the `half_res_reflections` lever. Not for the sources view,
     /// which only the per-pixel shader paints.
     pub half_res_reflections: bool,
+    /// The brushes' depth drawn first, the `depth_prepass` lever. On as
+    /// shipped; it must change no pixel.
+    pub depth_prepass: bool,
 }
 
 impl View {
@@ -76,6 +79,7 @@ impl View {
             no_portals: false,
             light_culling: true,
             half_res_reflections: true,
+            depth_prepass: true,
         }
     }
 }
@@ -250,6 +254,9 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     } else {
         BrushPipeline::new_multisampled(&device, format, &uniforms.layout, view.samples)
     };
+    let prepass = view
+        .depth_prepass
+        .then(|| BrushPipeline::new_depth_prepass(&device, format, &uniforms.layout, view.samples, ViewMode::Mono));
     let probe_pass = half_res.then(|| {
         (
             BrushPipeline::new_probe_pass(&device, &uniforms.layout, ViewMode::Mono),
@@ -376,6 +383,15 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             }),
             ..Default::default()
         });
+        // The brushes' depth first, as the headset draws it.
+        if let Some(prepass) = &prepass {
+            pass.set_pipeline(&prepass.pipeline);
+            pass.set_bind_group(0, &uniforms.bind_group, &[]);
+            pass.set_bind_group(1, &materials.bind_group, &[]);
+            pass.set_vertex_buffer(0, vb.slice(..));
+            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
+        }
         pass.set_pipeline(&pipeline.pipeline);
         pass.set_bind_group(0, &uniforms.bind_group, &[]);
         pass.set_bind_group(1, &materials.bind_group, &[]);
@@ -513,6 +529,29 @@ mod tests {
     /// only single-pixel edges inside the reflected image moving. This keeps
     /// it there: a broken upsample bleeds across every silhouette, and a
     /// broken normalisation shifts whole surfaces.
+    /// THE DEPTH PREPASS CHANGES NO PIXEL: the brushes drawn depth-only first
+    /// and shaded after at LessEqual give byte for byte the picture of
+    /// shading them straight away. Anything else -- a surface lost to
+    /// LessEqual failing by a rounding difference between the two draws, a
+    /// face flickering -- shows here. From the back of the hall, where the
+    /// most brushes overlap.
+    #[test]
+    fn the_depth_prepass_changes_no_pixel() {
+        for (eye, at) in [
+            (Vec3::new(-1.3, 1.6, -14.5), Vec3::new(0.4, 2.4, 3.7)),
+            (Vec3::new(3.4, 1.6, -3.0), Vec3::new(9.0, 1.4, -3.0)),
+        ] {
+            let v = View::headset(eye, at);
+            let Some(with) = render_brushes("test_room", v) else {
+                eprintln!("skipping: no GPU or no test_room");
+                return;
+            };
+            let without = render_brushes("test_room", View { depth_prepass: false, ..v }).unwrap();
+            let differ = with.rgba.chunks(4).zip(without.rgba.chunks(4)).filter(|(a, b)| a != b).count();
+            assert_eq!(differ, 0, "the depth prepass changed {differ} pixel(s) looking from {eye} at {at}");
+        }
+    }
+
     #[test]
     fn half_res_reflections_match_per_pixel_ones() {
         for (eye, at) in [
