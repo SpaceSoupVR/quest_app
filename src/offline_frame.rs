@@ -791,4 +791,64 @@ mod exposure_calibration {
             eprintln!("{name:>28}: meter {m:.4}  exposure {:.2}", exposure_for(m));
         }
     }
+
+}
+
+/// The benchmark's viewpoints, checked and rendered here. See `bench.py`.
+#[cfg(test)]
+mod bench_views {
+    use super::*;
+
+    /// The benchmark's viewpoints (`bench_views.json`), as `bench.py` pins
+    /// the headset's camera to them.
+    fn bench_views() -> Vec<(String, Vec3, Vec3)> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bench_views.json");
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        doc["views"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                let at = |k: &str| Vec3::from(<[f32; 3]>::try_from(serde_json::from_value::<Vec<f32>>(v[k].clone()).unwrap()).unwrap());
+                (v["name"].as_str().unwrap().to_string(), at("eye"), at("at"))
+            })
+            .collect()
+    }
+
+    /// WHAT `bench.py` WRITES INTO THE LEVER FILE IS WHAT THE RENDERER READS.
+    /// The script's own output, not a copy of its format: a field it spells
+    /// differently would otherwise be refused on the headset, mid-run, as an
+    /// unknown lever.
+    #[test]
+    fn the_bench_scripts_lever_file_is_read_by_the_renderer() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bench.py");
+        for (name, eye, at) in bench_views() {
+            let run = std::process::Command::new("python3").arg(&script).args(["--print-levers", &name, "--ab"]).output();
+            let Ok(run) = run else {
+                eprintln!("skipping: no python3");
+                return;
+            };
+            assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+            let text = String::from_utf8(run.stdout).unwrap();
+            let levers = space_soup::renderer::levers::Levers::parse(&text).unwrap_or_else(|e| panic!("{name}: {e}\n{text}"));
+            let bench = levers.bench.as_ref().unwrap();
+            assert_eq!((bench.name.as_str(), Vec3::from(bench.eye), Vec3::from(bench.at)), (name.as_str(), eye, at));
+            assert!(levers.ab_cycle);
+        }
+    }
+
+    /// THE BENCHMARK'S VIEWPOINTS, rendered here, so the frame the headset
+    /// measures from each can be looked at: `$OUT/bench_<name>.png`.
+    #[test]
+    #[ignore]
+    fn render_the_bench_views() {
+        let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
+        for (name, eye, at) in bench_views() {
+            let Some(shot) = render_brushes("test_room", View { adapt: true, ..View::headset(eye, at) }) else {
+                eprintln!("skipping: no GPU or no test_room");
+                return;
+            };
+            shot.save(&out.join(format!("bench_{name}.png")));
+        }
+    }
 }
