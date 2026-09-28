@@ -8,6 +8,7 @@ Plug the headset in, leave it on the desk, and run one of:
     python3 bench.py --views hall_back,hallway --ab --passes 2
     python3 bench.py --levers '{"probe_trace": false}'     # a configuration
     python3 bench.py --compare ../docs/bench/2026-09-27_2210  # against a run
+    python3 bench.py --trace 2        # each render pass's bins and stage times
 
 In order, it:
 
@@ -136,13 +137,26 @@ def load_views(names: str | None) -> list:
     return picked
 
 
-def levers_for(view: dict, ab: bool, extra: dict) -> dict:
-    """The lever file for one view: the extra levers, the pin, the schedule."""
+def levers_for(view: dict, ab: bool, extra: dict, synced: bool = False) -> dict:
+    """The lever file for one view: the extra levers, the pin, the schedule.
+    `synced` blocks on the GPU every frame, so the render thread's wait is
+    the GPU's time; the A/B schedule always runs synced."""
     levers = dict(extra)
     levers["bench"] = {"name": view["name"], "eye": view["eye"], "at": view["at"]}
     if ab:
         levers["ab_cycle"] = True
+    if ab or synced:
+        levers["gpu_sync"] = True
     return levers
+
+
+def record_kind(r: dict) -> str:
+    """Which step a window belongs to: `shipped` (pipelined, as the headset
+    runs), `synced` (blocking on the GPU, so the wait is its time) or the
+    A/B phase it ran under."""
+    if r.get("cycle_len", 1) > 1 or r.get("phase", "-") not in ("-", ""):
+        return r.get("phase", "-")
+    return "synced" if "gpu_sync" in (r.get("levers") or "") else "shipped"
 
 
 def write_levers(dev: Device, levers: dict) -> None:
@@ -173,8 +187,8 @@ def read_records(dev: Device) -> list:
 
 
 def wait_for_view(dev: Device, name: str, ab: bool, passes: int, windows: int,
-                  stall_seconds: float, poll_seconds: float) -> list:
-    """The view's measured windows, once there are enough of them."""
+                  stall_seconds: float, poll_seconds: float, synced: bool = False) -> list:
+    """The view's measured windows of one step, once there are enough."""
     last_seen = -1
     last_change = time.monotonic()
     while True:
@@ -182,10 +196,11 @@ def wait_for_view(dev: Device, name: str, ab: bool, passes: int, windows: int,
         mine = [r for r in records if r.get("bench") == name]
         # The shipped windows and the schedule's are told apart by whether
         # the app was cycling, so neither step counts the other's windows.
-        measured = sorted(
-            (r for r in mine if not r.get("warmup") and (r.get("cycle_len", 1) > 1) == ab),
-            key=lambda r: r.get("window", 0),
-        )
+        def this_step(r: dict) -> bool:
+            if r.get("warmup") or (r.get("cycle_len", 1) > 1) != ab:
+                return False
+            return ab or (record_kind(r) == "synced") == synced
+        measured = sorted((r for r in mine if this_step(r)), key=lambda r: r.get("window", 0))
         if ab:
             cycle = max((r.get("cycle_len", 0) for r in measured), default=0)
             need = cycle * passes if cycle > 1 else None
@@ -293,6 +308,68 @@ def profile(dev: Device, ids: list, seconds: int) -> tuple:
     return means, text
 
 
+# One render pass as the render-stage trace reports it, e.g.
+#   Surface 1 | 1216x1344 | color 32bit, depth 24bit, stencil 0 bit, MSAA 4,
+#   Mode: 1 (HwBinning) | 60 128x224 bins ( 60 rendered) | 5.08 ms | 130 stages
+#   : Binning : 0.623ms Render : 1.877ms StoreColor : 0.309ms Preempt : 1.286ms
+# (Meta, "ovrgpuprofiler"). Read loosely -- the fields are searched for rather
+# than split by position -- because the only sample of the format is the
+# documentation's, and the raw trace is kept beside the report either way.
+TRACE_SURFACE = re.compile(r"^\s*Surface\s+\d+\s*\|")
+TRACE_SIZE = re.compile(r"\|\s*(\d+)x(\d+)\s*\|")
+TRACE_MSAA = re.compile(r"MSAA\s*(\d+)")
+TRACE_MODE = re.compile(r"Mode:\s*\d*\s*\(?([A-Za-z]+)")
+TRACE_BINS = re.compile(r"(\d+)\s+(\d+)x(\d+)\s+bins(?:\s*\(\s*(\d+)\s+rendered\))?")
+TRACE_MS = re.compile(r"\|\s*([\d.]+)\s*ms\s*\|")
+TRACE_STAGE = re.compile(r"([A-Za-z]+)\s*:\s*([\d.]+)\s*ms")
+
+
+def summarize_trace(text: str, seconds: float) -> list:
+    """Each KIND of render pass in a render-stage trace -- same size, MSAA,
+    mode and bins -- with how often it ran, its mean time and each stage's
+    mean time, heaviest first. A frame's passes are told apart by size: the
+    eye buffer, the half-resolution reflection target, the shadow maps."""
+    kinds: dict = {}
+    for line in text.splitlines():
+        if not TRACE_SURFACE.match(line):
+            continue
+        size = TRACE_SIZE.search(line)
+        ms = TRACE_MS.search(line)
+        if not size or not ms:
+            continue
+        msaa = TRACE_MSAA.search(line)
+        mode = TRACE_MODE.search(line)
+        bins = TRACE_BINS.search(line)
+        key = "%sx%s msaa%s %s %s" % (size.group(1), size.group(2), msaa.group(1) if msaa else "?",
+                                      mode.group(1) if mode else "?",
+                                      "%s bins of %sx%s" % bins.group(1, 2, 3) if bins else "no bins")
+        k = kinds.setdefault(key, {"surface": key, "count": 0, "ms": 0.0, "stages": {}})
+        k["count"] += 1
+        k["ms"] += float(ms.group(1))
+        tail = line.split("stages", 1)[1] if "stages" in line else ""
+        for stage, value in TRACE_STAGE.findall(tail):
+            k["stages"][stage] = k["stages"].get(stage, 0.0) + float(value)
+    out = []
+    for k in kinds.values():
+        n = k["count"]
+        out.append({
+            "surface": k["surface"],
+            "count": n,
+            "per_second": n / seconds if seconds else None,
+            "mean_ms": k["ms"] / n,
+            "stages_ms": {s: v / n for s, v in sorted(k["stages"].items(), key=lambda kv: -kv[1])},
+        })
+    out.sort(key=lambda k: -(k["mean_ms"] * k["count"]))
+    return out
+
+
+def trace(dev: Device, seconds: int) -> tuple:
+    """A render-stage trace of `seconds` (`ovrgpuprofiler -t`): the summary
+    and the raw output. Needs the app started in detailed profiling mode."""
+    text = dev.shell("ovrgpuprofiler -t%d" % seconds, check=False, timeout=seconds + 90)
+    return summarize_trace(text, seconds), text
+
+
 def list_screenshots(dev: Device) -> list:
     text = dev.shell("ls -1 %s 2>/dev/null" % SCREENSHOT_DIR, check=False)
     return sorted(line.strip() for line in text.splitlines() if line.strip())
@@ -335,7 +412,7 @@ def summarize_view(records: list) -> dict:
     """Per phase: the median over passes of each number, and its spread."""
     phases: dict = {}
     for r in records:
-        phases.setdefault(r.get("phase", "-"), []).append(r)
+        phases.setdefault(record_kind(r), []).append(r)
     out = {}
     for phase, rs in phases.items():
         xr_gpu = [r.get("xr", {}).get("app/gpu_frametime") for r in rs]
@@ -417,7 +494,14 @@ def render_report(run: dict, views: dict, compare: dict | None) -> str:
             if len(vr["gpu_mhz"]) > 1:
                 lines.append("**The GPU clock changed during this view: its numbers are not comparable.**")
             lines.append("")
-        base = phases.get("baseline") or phases.get("-")
+        # The A/B baseline when there is one, else the synced windows: both
+        # block on the GPU, so their wait is its time.
+        base = phases.get("baseline") or phases.get("synced") or phases.get("-")
+        shipped = phases.get("shipped")
+        if shipped:
+            lines.append("**As shipped (pipelined): %s ms a frame, %s fps**; the runtime's app GPU %s ms." % (
+                fmt(shipped["frame_ms"]), fmt(shipped["fps"], 1), fmt(shipped["app_gpu_ms"])))
+            lines.append("")
         if v.get("screenshot"):
             lines.append("![%s](%s)" % (name, v["screenshot"]))
             lines.append("")
@@ -428,12 +512,24 @@ def render_report(run: dict, views: dict, compare: dict | None) -> str:
             if base and p is not base and base["gpu_wait_ms"] is not None and p["gpu_wait_ms"] is not None:
                 cost = base["gpu_wait_ms"] - p["gpu_wait_ms"]
             lines.append("| %s | %s | %s | %s | %s | %s | %s | %s |" % (
-                "shipped" if phase == "-" else phase, fmt(p["gpu_wait_ms"]), fmt(cost), fmt(p["gpu_wait_spread_ms"]),
+                phase, fmt(p["gpu_wait_ms"]) if phase != "shipped" else "-", fmt(cost) if phase != "shipped" else "-",
+                fmt(p["gpu_wait_spread_ms"]) if phase != "shipped" else "-",
                 fmt(p["app_gpu_ms"]), fmt(p["frame_ms"]), fmt(p["fps"], 1), fmt(p["cpu_ms"])))
         if base and base["passes_ms"]:
             lines.append("")
             lines.append("Passes (baseline, one frame each): " + ", ".join(
                 "%s %s" % (k, fmt(ms)) for k, ms in base["passes_ms"].items() if ms))
+        if v.get("trace"):
+            lines.append("")
+            lines.append("Render passes (shipped renderer, `ovrgpuprofiler -t`, detailed profiling mode; "
+                         "mean over the trace, heaviest first):")
+            lines.append("")
+            lines.append("| pass | a second | ms | stages (ms) |")
+            lines.append("|---|---|---|---|")
+            for k in v["trace"]:
+                lines.append("| %s | %s | %s | %s |" % (
+                    k["surface"], fmt(k["per_second"], 1), fmt(k["mean_ms"], 3),
+                    ", ".join("%s %s" % (s, fmt(ms, 3)) for s, ms in k["stages_ms"].items())))
         if v.get("gpu_counters"):
             lines.append("")
             lines.append("GPU counters (shipped renderer, ovrgpuprofiler, mean over the capture):")
@@ -444,7 +540,12 @@ def render_report(run: dict, views: dict, compare: dict | None) -> str:
                 lines.append("| %s | %s |" % (k, fmt(val, 3)))
         if compare and name in compare.get("views", {}):
             old = compare["views"][name]["phases"]
-            old_base = old.get("baseline") or old.get("-")
+            old_base = old.get("baseline") or old.get("synced") or old.get("-")
+            old_shipped = old.get("shipped") or old.get("-")
+            if old_shipped and shipped and old_shipped.get("frame_ms") and shipped.get("frame_ms"):
+                lines.append("")
+                lines.append("Against %s: a frame %s -> %s ms as shipped." % (
+                    compare["run"]["started"], fmt(old_shipped["frame_ms"]), fmt(shipped["frame_ms"])))
             if old_base and base and old_base.get("gpu_wait_ms") is not None and base["gpu_wait_ms"] is not None:
                 d = base["gpu_wait_ms"] - old_base["gpu_wait_ms"]
                 lines.append("")
@@ -477,6 +578,10 @@ def main(argv: list | None = None) -> int:
     ap.add_argument("--no-profile", action="store_true", help="skip the GPU counters (ovrgpuprofiler)")
     ap.add_argument("--no-screenshots", action="store_true", help="skip the screenshot from each view")
     ap.add_argument("--profile-seconds", type=int, default=10, help="how long to read the GPU counters a view (default 10)")
+    ap.add_argument("--trace", type=int, metavar="SECONDS",
+                    help="capture a render-stage trace this long at each view (ovrgpuprofiler -t): each pass's "
+                         "bins and binning, rendering, store and pre-emption times. Restarts the app in the "
+                         "driver's detailed profiling mode and back out of it afterwards; skips the counters")
     ap.add_argument("--out", help="output folder (default ../docs/bench/<date_time>)")
     ap.add_argument("--compare", help="an earlier run's folder, to compare baselines against")
     ap.add_argument("--stall-seconds", type=float, default=120.0, help="give up on a view after this long with no new window")
@@ -488,6 +593,10 @@ def main(argv: list | None = None) -> int:
         extra = json.loads(args.levers) if args.levers else {}
         if not isinstance(extra, dict) or "bench" in extra or "ab_cycle" in extra:
             raise BenchError("--levers takes a JSON object of levers, without bench or ab_cycle")
+        if args.trace and args.ab:
+            # Detailed profiling mode is on for the whole run, and its overhead
+            # would sit inside every A/B number.
+            raise BenchError("--trace runs in the driver's detailed profiling mode; run --ab separately")
     except json.JSONDecodeError as e:
         print("bench: --levers is not JSON: %s" % e, file=sys.stderr)
         return 2
@@ -527,6 +636,7 @@ def main(argv: list | None = None) -> int:
         "cpu_level": "governor" if args.no_lock else args.cpu_level,
         "gpu_level": "governor" if args.no_lock else args.gpu_level,
         "views": [v["name"] for v in views],
+        "trace_seconds": args.trace,
     }
     warnings: list = []
     collected: dict = {}
@@ -550,6 +660,17 @@ def main(argv: list | None = None) -> int:
             changed.append(("restore %s to %r" % (prop, before),
                             lambda prop=prop, before=before: dev.shell("setprop %s '%s'" % (prop, before))))
         dev.run("logcat", "-G", "16M", check=False)
+        if args.trace:
+            # The render-stage trace needs the driver's detailed profiling
+            # mode, which an app only picks up when it STARTS -- so it is
+            # restarted into it, and afterwards restarted out of it rather
+            # than left running with the profiling overhead in the next run.
+            # (Undone newest first: detailed mode off, then the stop.)
+            changed.append(("stop the app profiled in detailed mode",
+                            lambda: dev.shell("am force-stop " + PACKAGE)))
+            dev.shell("ovrgpuprofiler -e " + PACKAGE)
+            changed.append(("leave detailed profiling mode", lambda: dev.shell("ovrgpuprofiler -d")))
+            dev.shell("am force-stop " + PACKAGE)
         dev.shell("rm -f " + PERF)
         # Brought to the front whether or not it is running: a process in the
         # background renders nothing. `am start` resumes a running one rather
@@ -561,7 +682,7 @@ def main(argv: list | None = None) -> int:
         capture = subprocess.Popen([ADB, "-s", dev.serial, "logcat", "-v", "time", "-T", "1", "VrApi:I", "*:S"],
                                    stdout=capture_file, stderr=subprocess.DEVNULL)
         counter_ids: list = []
-        if not args.no_profile:
+        if not args.no_profile and not args.trace:
             metrics, listing = profiler_metrics(dev)
             (out / "profiler_metrics.txt").write_text(listing)
             counter_ids = [i for i, _ in pick_metrics(metrics)]
@@ -577,6 +698,12 @@ def main(argv: list | None = None) -> int:
             if not any(what == "remove the lever file" for what, _ in changed):
                 changed.append(("remove the lever file", lambda: dev.shell("rm -f " + LEVERS)))
             records = wait_for_view(dev, name, False, args.passes, args.windows, args.stall_seconds, args.poll_seconds)
+            # The same frame blocking on the GPU each frame, whose wait is then
+            # its time -- what `--compare` and a run without --ab compare by.
+            write_levers(dev, levers_for(view, False, extra, synced=True))
+            records += wait_for_view(dev, name, False, args.passes, args.windows, args.stall_seconds, args.poll_seconds,
+                                     synced=True)
+            write_levers(dev, levers_for(view, False, extra))
             # What the view looks like, from the headset itself.
             shot = None
             if not args.no_screenshots:
@@ -587,6 +714,12 @@ def main(argv: list | None = None) -> int:
             if counter_ids:
                 counters, raw = profile(dev, counter_ids, args.profile_seconds)
                 (out / ("profiler_%s.txt" % name)).write_text(raw)
+            passes: list = []
+            if args.trace:
+                passes, raw = trace(dev, args.trace)
+                (out / ("trace_%s.txt" % name)).write_text(raw)
+                if not passes:
+                    warnings.append("the trace at %s held no render passes (see trace_%s.txt)" % (name, name))
             # Then the schedule, every phase `passes` times.
             if args.ab:
                 write_levers(dev, levers_for(view, True, extra))
@@ -596,7 +729,7 @@ def main(argv: list | None = None) -> int:
                 f.seek(mark)
                 vrapi = summarize_vrapi(f.read().decode(errors="replace"))
             collected[name] = {"phases": summarize_view(records), "vrapi": vrapi, "gpu_counters": counters,
-                               "records": len(records), "screenshot": shot.name if shot else None}
+                               "trace": passes, "records": len(records), "screenshot": shot.name if shot else None}
     except BenchError as e:
         failure = str(e)
     except KeyboardInterrupt:

@@ -72,7 +72,8 @@ FAKE_ADB = textwrap.dedent('''\
                     "window": app["window"], "t": app["window"] * 3.0, "phase": phase,
                     "cycle_pass": app["pos"] // len(PHASES) if ab else app["pos"],
                     "cycle_len": len(PHASES) if ab else 1, "warmup": app["warm"],
-                    "levers": "bench=%%s" %% bench, "bench": bench, "ssr": False, "multiview": False,
+                    "levers": "bench=%%s%%s" %% (bench, ",gpu_sync" if levers.get("gpu_sync") else ""),
+                    "bench": bench, "ssr": False, "multiview": False,
                     "frames": 112, "cpu_avg": 4.0, "cpu_max": 5.0, "gpu_avg": gpu + 1.0, "gpu_max": gpu + 3.0,
                     "frame_ms": 41.7, "fps": 24.0, "pass": {"scene_l": 20.0, "probe_l": 3.0},
                     "xr": {"app/gpu_frametime": gpu},
@@ -90,6 +91,18 @@ FAKE_ADB = textwrap.dedent('''\
         if words[:2] == ["ovrgpuprofiler", "-m"]:
             print("1       Clocks / Second\\n2       GPU %% Bus Busy\\n3       %% Vertex Fetch Stall\\n"
                   "4       %% Texture Fetch Stall\\n5       Preemptions / second")
+            sys.exit(0)
+        if words[0] == "ovrgpuprofiler" and words[1].startswith("-t"):
+            # Two frames of an eye pass and one half-resolution pass, in the
+            # documented format.
+            eye = ("Surface %%d | 1176x1232 | color 32bit, depth 32bit, stencil 0 bit, MSAA 4, Mode: 1 (HwBinning) "
+                   "| 24 256x256 bins ( 24 rendered) | %%.2f ms | 60 stages : Binning : 0.400ms Render : %%.3fms "
+                   "StoreColor : 0.300ms Preempt : 0.400ms")
+            print(eye %% (1, 6.1, 5.0))
+            print("Surface 2 | 588x616 | color 64bit, depth 32bit, stencil 0 bit, MSAA 1, Mode: 1 (HwBinning) "
+                  "| 4 320x320 bins ( 4 rendered) | 3.00 ms | 10 stages : Binning : 0.100ms Render : 2.800ms "
+                  "StoreColor : 0.100ms")
+            print(eye %% (3, 6.3, 5.2))
             sys.exit(0)
         if words[0] == "timeout" and words[2] == "ovrgpuprofiler":
             for second in range(3):
@@ -213,8 +226,8 @@ class BenchScript(unittest.TestCase):
         self.assertIsNone(report["failure"])
         for view in ("hall_back", "hallway"):
             phases = report["views"][view]["phases"]
-            self.assertEqual(sorted(phases), sorted(["-"] + PHASES))
-            self.assertEqual(phases["-"]["app_gpu_ms"], phases["baseline"]["app_gpu_ms"], "shipped and baseline disagree")
+            self.assertEqual(sorted(phases), sorted(["shipped", "synced"] + PHASES))
+            self.assertEqual(phases["synced"]["gpu_wait_ms"], phases["baseline"]["gpu_wait_ms"], "synced and baseline disagree")
             for phase in PHASES:
                 self.assertEqual(phases[phase]["windows"], 2, phase)
                 self.assertAlmostEqual(phases["baseline"]["app_gpu_ms"] - phases[phase]["app_gpu_ms"], COST[phase])
@@ -226,7 +239,8 @@ class BenchScript(unittest.TestCase):
         # the GPU's counters read while it drew them: the first second is
         # left out, and only counters that say where the time goes are asked.
         for view in ("hall_back", "hallway"):
-            self.assertEqual(report["views"][view]["phases"]["-"]["windows"], 3)
+            self.assertEqual(report["views"][view]["phases"]["shipped"]["windows"], 3)
+            self.assertEqual(report["views"][view]["phases"]["synced"]["windows"], 3)
             self.assertEqual(report["views"][view]["gpu_counters"]["% Texture Fetch Stall"], 3.5)
         # One screenshot a view, pulled beside the report and shown in it.
         for view in ("hall_back", "hallway"):
@@ -242,10 +256,12 @@ class BenchScript(unittest.TestCase):
         p, out = self.bench("--views", "pillar", "--windows", "4", "--no-profile")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         report = json.loads((out / "report.json").read_text())
-        self.assertEqual(list(report["views"]["pillar"]["phases"]), ["-"])
-        self.assertEqual(report["views"]["pillar"]["phases"]["-"]["windows"], 4)
+        self.assertEqual(sorted(report["views"]["pillar"]["phases"]), ["shipped", "synced"])
+        self.assertEqual(report["views"]["pillar"]["phases"]["shipped"]["windows"], 4)
+        self.assertEqual(report["views"]["pillar"]["phases"]["synced"]["windows"], 4)
+        # Shipped, synced, then shipped again to leave the view as it runs.
         pushed = [c for c in self.calls() if c[2:3] == ["push"]]
-        self.assertEqual(len(pushed), 1)
+        self.assertEqual(len(pushed), 3)
 
     def test_the_phone_alone_is_never_touched(self):
         self.devices([PHONE_LINE])
@@ -281,6 +297,36 @@ class BenchScript(unittest.TestCase):
         self.assertIn("blocked the app's launch", failure)
         self.assertIn("controller_required", failure)
         self.assertEqual(json.loads((self.state / "props.json").read_text()), self.props)
+
+    def test_a_trace_run_profiles_in_detailed_mode_and_leaves_it(self):
+        p, out = self.bench("--trace", "2", "--views", "hall_back", "--no-screenshots")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        shell = self.shell_calls()
+        enable = shell.index("ovrgpuprofiler -e com.example.questapp")
+        start = next(i for i, c in enumerate(shell) if c.startswith("am start "))
+        stops = [i for i, c in enumerate(shell) if c == "am force-stop com.example.questapp"]
+        disable = shell.index("ovrgpuprofiler -d")
+        # Restarted INTO detailed mode, which an app only picks up at start...
+        self.assertTrue(enable < stops[0] < start, shell)
+        # ...and out of it at the end, so the next run is not profiled.
+        self.assertTrue(start < disable < stops[-1], shell)
+        self.assertTrue(any(c.startswith("ovrgpuprofiler -t2") for c in shell))
+        self.assertFalse(any(c.startswith("timeout") for c in shell), "the counters are skipped while tracing")
+        self.assertEqual(json.loads((self.state / "props.json").read_text()), self.props)
+        passes = json.loads((out / "report.json").read_text())["views"]["hall_back"]["trace"]
+        self.assertEqual([k["surface"] for k in passes],
+                         ["1176x1232 msaa4 HwBinning 24 bins of 256x256", "588x616 msaa1 HwBinning 4 bins of 320x320"])
+        self.assertEqual(passes[0]["count"], 2)
+        self.assertAlmostEqual(passes[0]["mean_ms"], 6.2)
+        self.assertAlmostEqual(passes[0]["stages_ms"]["Render"], 5.1)
+        self.assertAlmostEqual(passes[0]["stages_ms"]["Preempt"], 0.4)
+        self.assertIn("| 1176x1232 msaa4 HwBinning 24 bins of 256x256 | 1.0 | 6.200 | Render 5.100",
+                      (out / "report.md").read_text())
+
+    def test_a_trace_is_not_mixed_into_an_ab_run(self):
+        p, _ = self.bench("--trace", "2", "--ab", "--views", "pillar")
+        self.assertEqual(p.returncode, 2)
+        self.assertEqual([c for c in self.calls() if c[:1] == ["-s"]], [])
 
     def test_the_lever_file_is_what_the_renderer_parses(self):
         p = subprocess.run([sys.executable, str(HERE / "bench.py"), "--print-levers", "hall_back", "--ab"],
