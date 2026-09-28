@@ -19,6 +19,7 @@
 
 use glam::{Mat4, Quat, Vec3};
 use space_soup::renderer::brush_pipeline::{BrushMaterials, BrushPipeline};
+use space_soup::renderer::multiview::ViewMode;
 use space_soup::renderer::lights::{Light, LightsUniform};
 use space_soup::renderer::shadow::ShadowMap;
 use space_soup::renderer::uniforms::{PlayerUpload, PostUpload, ShadowUpload, SkyUpload, UniformBuffer};
@@ -245,14 +246,14 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     let pipeline = if view.sources {
         BrushPipeline::new_multisampled_sources(&device, format, &uniforms.layout, view.samples)
     } else if half_res {
-        BrushPipeline::new_multisampled_probe_reader(&device, format, &uniforms.layout, view.samples, &probe_layout)
+        BrushPipeline::new_multisampled_probe_reader(&device, format, &uniforms.layout, view.samples, &probe_layout, ViewMode::Mono)
     } else {
         BrushPipeline::new_multisampled(&device, format, &uniforms.layout, view.samples)
     };
     let probe_pass = half_res.then(|| {
         (
-            BrushPipeline::new_probe_pass(&device, &uniforms.layout),
-            space_soup::renderer::brush_pipeline::probe_pass::Target::new(&device, &probe_layout, view.width, view.height),
+            BrushPipeline::new_probe_pass(&device, &uniforms.layout, ViewMode::Mono),
+            space_soup::renderer::brush_pipeline::probe_pass::Target::new(&device, &probe_layout, view.width, view.height, 1),
         )
     });
 

@@ -149,7 +149,7 @@ class BenchScript(unittest.TestCase):
         adb.write_text(FAKE_ADB)
         adb.chmod(adb.stat().st_mode | stat.S_IEXEC)
         self.env = dict(os.environ, FAKE_ADB_STATE=str(self.state), PATH=str(bindir) + os.pathsep + os.environ["PATH"])
-        self.props = {"debug.oculus.gpuLevel": "", "debug.oculus.cpuLevel": "3"}
+        self.props = {"debug.oculus.gpuLevel": "", "debug.oculus.cpuLevel": "3", "debug.oculus.guardian_pause": "0"}
         (self.state / "props.json").write_text(json.dumps(self.props))
         (self.state / "mode").write_text("normal")
         self.devices([QUEST_LINE, PHONE_LINE])
@@ -209,7 +209,8 @@ class BenchScript(unittest.TestCase):
             self.assertEqual(report["views"][view]["gpu_counters"]["% Texture Fetch Stall"], 3.5)
         profiled = [c for c in self.shell_calls() if c.startswith("timeout")]
         self.assertEqual(len(profiled), 2)
-        self.assertIn('-r"1,2,3,4"', profiled[0], "Preemptions / second is not a question worth a slot")
+        asked = profiled[0].split('-r"')[1].split('"')[0].split(",")
+        self.assertEqual(sorted(asked), ["1", "2", "3", "4"], "Preemptions / second is not a question worth a slot")
 
     def test_a_plain_run_takes_the_shipped_renderer_at_each_view(self):
         p, out = self.bench("--views", "pillar", "--windows", "4", "--no-profile")
