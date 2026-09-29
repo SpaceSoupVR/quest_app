@@ -1076,6 +1076,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             locomotion.player_yaw,
         );
 
+        // DIAGNOSIS: SpaceWarp without the layer settings. See
+        // `Levers::space_warp_debug`.
+        let layer_settings = xr.has_layer_settings && renderer.levers().space_warp_debug & 64 == 0;
         let proj_views = renderer.render_frame_with_meshes(
             &headset.session,
             &headset.stage,
@@ -1135,7 +1138,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 .space(&headset.stage)
                 .views(&proj_views)
                 .into_raw();
-            if xr.has_layer_settings {
+            if layer_settings {
                 raw.next = &settings as *const _ as *const std::ffi::c_void;
             }
             let proj_layer =

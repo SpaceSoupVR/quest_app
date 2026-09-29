@@ -186,6 +186,10 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     let (mut proxies, fields) = level.as_ref().map(|l| l.scene_proxies(&game, scene_name)).unwrap_or_default();
     // `NO_FIELDS=1`: the models traced by their bounds and the photographs,
     // as before their distance fields -- for a before/after.
+    // `NO_PROXIES=1`: no reflection proxies at all -- rooms and photographs only.
+    if std::env::var("NO_PROXIES").as_deref() == Ok("1") {
+        proxies.clear();
+    }
     let fields = if std::env::var("NO_FIELDS").as_deref() == Ok("1") {
         proxies.iter_mut().for_each(|p| p.field = None);
         Vec::new()
