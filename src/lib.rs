@@ -41,6 +41,7 @@ mod soundmap_client;
 mod brush_render;
 mod offline_frame;
 mod probe_level;
+mod mesh_masks;
 mod scene_lights;
 mod scene_meshes;
 mod terrain_render;
@@ -326,10 +327,17 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // THE STATIONARY LAMPS' SHADOWS ON MESHES, by object, from disk now and
+    // from the editor's stream later. See `mesh_masks`.
+    let mut mesh_masks: mesh_masks::MeshMasks<lightmap_client::LightmapUpdate> = mesh_masks::MeshMasks::default();
     {
         info!("STARTUP at lightmaps: {} ms since process start", t_start.elapsed().as_millis());
         let t_lm = std::time::Instant::now();
         let maps = space_soup_engine::lightmaps::load_scene_lightmaps(&dir, &static_scene.scene_name);
+        let masked: HashSet<String> = maps.iter().filter_map(|m| mesh_masks.take(&m.object_id, &m.rgba, m.width, m.height)).collect();
+        if !masked.is_empty() {
+            info!("lightmaps: stationary masks on {} mesh(es)", masked.len());
+        }
         info!(
             "STARTUP lightmaps: loaded {} baked map(s) from disk in {} ms",
             maps.len(),
@@ -418,8 +426,14 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 info!("terrain sky occlusion: {}x{} loaded", m.width, m.height);
                 continue;
             }
+            // A mesh's masks go in with its light, below; they are not maps
+            // of their own.
+            if space_soup_engine::lightmaps::mesh_stationary_of(&m.object_id).is_some() {
+                continue;
+            }
             renderer.set_cuboid_lightmap(&m.object_id, lightmap_light(m), m.width, m.height);
-            renderer.set_mesh_lightmap(&m.object_id, lightmap_light(m), m.width, m.height);
+            let (masks, mask_size) = mesh_masks.layers_for(&m.object_id, &stationary_channels);
+            renderer.set_mesh_lightmap(&m.object_id, lightmap_light(m), m.width, m.height, &masks, mask_size);
         }
         // THE STATIONARY LAMPS' SHADOWS ON THE GROUND, layer by layer as on
         // the brushes, and only a set baked for these lamps. Without them the
@@ -598,12 +612,20 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         for update in lightmap_rx.try_iter() {
-            let light = match &update.linear {
-                Some(l) => space_soup::renderer::mesh::LightmapLight::Linear(l),
-                None => space_soup::renderer::mesh::LightmapLight::Srgb8(&update.rgba),
-            };
-            renderer.set_cuboid_lightmap(&update.object_id, light, update.width, update.height);
-            renderer.set_mesh_lightmap(&update.object_id, light, update.width, update.height);
+            // A mesh's mask layer: kept, and put in with its light if the
+            // light came first. See `mesh_masks`.
+            if let Some(object) = mesh_masks.take(&update.object_id, &update.rgba, update.width, update.height) {
+                if let Some(light) = mesh_masks.streamed_light(&object) {
+                    let (masks, mask_size) = mesh_masks.layers_for(&object, &stationary_channels);
+                    renderer.set_mesh_lightmap(&object, streamed_light(light), light.width, light.height, &masks, mask_size);
+                }
+                continue;
+            }
+            renderer.set_cuboid_lightmap(&update.object_id, streamed_light(&update), update.width, update.height);
+            let (masks, mask_size) = mesh_masks.layers_for(&update.object_id, &stationary_channels);
+            renderer.set_mesh_lightmap(&update.object_id, streamed_light(&update), update.width, update.height, &masks, mask_size);
+            let id = update.object_id.clone();
+            mesh_masks.remember_light(&id, update);
         }
         for update in soundmap_rx.try_iter() {
             soundmap_grids.insert(update.object_id, update.grid);
@@ -1294,5 +1316,14 @@ fn lightmap_light(m: &space_soup_engine::lightmaps::LoadedLightmap) -> space_sou
     match &m.linear {
         Some(l) => space_soup::renderer::mesh::LightmapLight::Linear(l),
         None => space_soup::renderer::mesh::LightmapLight::Srgb8(&m.rgba),
+    }
+}
+
+/// The same for a map the editor's stream sent.
+#[cfg(target_os = "android")]
+fn streamed_light(u: &lightmap_client::LightmapUpdate) -> space_soup::renderer::mesh::LightmapLight<'_> {
+    match &u.linear {
+        Some(l) => space_soup::renderer::mesh::LightmapLight::Linear(l),
+        None => space_soup::renderer::mesh::LightmapLight::Srgb8(&u.rgba),
     }
 }
