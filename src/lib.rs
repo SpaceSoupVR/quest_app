@@ -112,6 +112,15 @@ use part_pull::PullSession;
 #[cfg(target_os = "android")]
 use platform::{game_dir, pump_android_events};
 
+/// WHICH IN-HEADSET CONTROLS ARE LIVE. `false` is the tester's build: the
+/// shipped settings and ONE control, the left stick click toggling the
+/// lighting-sources view (user, 2026-09-29). `true` brings back the
+/// developer A/B toggles: SSR on the right stick, the whole debug-view cycle
+/// on the left, multiview on the menu button, SpaceWarp and foveation on a
+/// trigger + menu. The lever file works either way.
+#[cfg(target_os = "android")]
+const DEVELOPER_TOGGLES: bool = false;
+
 #[cfg(target_os = "android")]
 fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     std::panic::set_hook(Box::new(|info| {
@@ -508,6 +517,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     // For the brush debug-view cycle below.
     let mut prev_l_stick_click = false;
     let mut prev_btn_menu = false;
+    // What the compositor was last asked for, logged when it changes.
+    let mut last_layer_state: Option<(bool, bool)> = None;
 
     // RUNTIME LEVERS: switch renderer features on the headset without a
     // build. Polled about once a second; see `space_soup::renderer::levers`.
@@ -686,7 +697,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         // One button rather than two because the comparison that matters is
         // between the two reflection paths FROM ONE VIEWPOINT, and reaching for
         // a second control moves your head.
-        if cs.r_stick_click && !prev_r_stick_click {
+        if DEVELOPER_TOGGLES && cs.r_stick_click && !prev_r_stick_click {
             let (on, buffered) =
                 match (renderer.screen_space_reflections(), renderer.buffered_reflections()) {
                     (false, _) => (true, false),
@@ -714,11 +725,13 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
         prev_r_stick_click = cs.r_stick_click;
         // DIAGNOSTIC: the left stick click cycles what brushes are drawn with --
-        // off, lighting sources (red direct, green baked, blue probe), then SSR
-        // (blue too rough, red left frame, green out of steps, magenta facing
-        // the viewer, grey a hit). The SSR view only shows while SSR is on.
+        // off, lighting sources (`SOURCES_VIEW`: red baked, green probe, blue
+        // direct), then SSR (blue too rough, red left frame, green out of
+        // steps, magenta facing the viewer, grey a hit). The SSR view only
+        // shows while SSR is on. The tester's build toggles off <-> sources.
         if cs.l_stick_click && !prev_l_stick_click {
-            let view = renderer.debug_view().next();
+            let now = renderer.debug_view();
+            let view = if DEVELOPER_TOGGLES { now.next() } else { now.toggle_sources() };
             renderer.set_debug_view(view);
             info!("debug view -> {:?} by left stick click", view);
         }
@@ -740,7 +753,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         //                         made by the compositor)
         //   right trigger + menu: foveation off -> low -> medium -> high
         // The lever file still wins when it changes.
-        if cs.btn_menu && !prev_btn_menu && (cs.l_trigger > 0.5 || cs.r_trigger > 0.5) {
+        if DEVELOPER_TOGGLES && cs.btn_menu && !prev_btn_menu && (cs.l_trigger > 0.5 || cs.r_trigger > 0.5) {
             use space_soup::renderer::foveation::FoveationLevel;
             let mut levers = renderer.levers();
             if cs.l_trigger > 0.5 {
@@ -756,7 +769,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 info!("foveation -> {} by right trigger + menu", levers.foveation.label());
             }
             renderer.set_levers(levers);
-        } else if cs.btn_menu && !prev_btn_menu {
+        } else if DEVELOPER_TOGGLES && cs.btn_menu && !prev_btn_menu {
             let want = !renderer.multiview_scene();
             let got = renderer.set_multiview_scene(want);
             info!(
@@ -1082,9 +1095,21 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             locomotion.player_yaw,
         );
 
-        // DIAGNOSIS: SpaceWarp without the layer settings. See
-        // `Levers::space_warp_debug`.
-        let layer_settings = xr.has_layer_settings && renderer.levers().space_warp_debug & 64 == 0;
+        // SHARPENING NEVER RIDES WITH SPACEWARP: together the compositor tore
+        // 30-60 times a second. See `layer_settings::sharpening_for`. Bit 64
+        // of `Levers::space_warp_debug` still drops it for diagnosis.
+        let sharpening = space_soup::renderer::layer_settings::sharpening_for(renderer.space_warp_running());
+        let layer_settings = xr.has_layer_settings
+            && sharpening.wants_layer_settings()
+            && renderer.levers().space_warp_debug & 64 == 0;
+        if last_layer_state != Some((renderer.space_warp_running(), layer_settings)) {
+            last_layer_state = Some((renderer.space_warp_running(), layer_settings));
+            info!(
+                "COMPOSITOR: space warp {}, sharpening {}",
+                if renderer.space_warp_running() { "ON" } else { "off" },
+                if layer_settings { format!("{sharpening:?}") } else { "off".to_string() },
+            );
+        }
         let proj_views = renderer.render_frame_with_meshes(
             &headset.session,
             &headset.stage,
@@ -1122,20 +1147,20 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             // never moved, so it outlives the `end` call that follows the
             // pointer -- that, plus `proj_views` outliving the same call, is
             // the whole of what `from_raw` is unsafe about.
-            use space_soup::renderer::layer_settings::{Sharpening, XR_SHARPENING};
+            use space_soup::renderer::layer_settings::Sharpening;
 
             let settings = openxr::sys::CompositionLayerSettingsFB {
                 ty: openxr::sys::CompositionLayerSettingsFB::TYPE,
                 next: std::ptr::null(),
-                layer_flags: match XR_SHARPENING {
+                layer_flags: match sharpening {
                     Sharpening::Quality => {
                         openxr::sys::CompositionLayerSettingsFlagsFB::QUALITY_SHARPENING
                     }
                     Sharpening::Normal => {
                         openxr::sys::CompositionLayerSettingsFlagsFB::NORMAL_SHARPENING
                     }
-                    // Never chained -- `has_layer_settings` is false when the
-                    // policy is Off, so this value is never read by anyone.
+                    // Never chained -- `layer_settings` above is false when
+                    // the policy is Off, so this value is never read by anyone.
                     Sharpening::Off => openxr::sys::CompositionLayerSettingsFlagsFB::EMPTY,
                 },
             };

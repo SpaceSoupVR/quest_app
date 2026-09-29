@@ -138,11 +138,19 @@ def load_views(names: str | None) -> list:
     return picked
 
 
+# What every bench view measures unless `--levers` says otherwise: the native
+# 72 Hz frame. SpaceWarp ships ON (2026-09-29) and paces the app to 36 fps,
+# which would halve every fps figure and hide the 13.9 ms budget this bench
+# exists to hold; multiview is pinned because the app keeps whatever the last
+# toggle left it at.
+MEASURED = {"space_warp": False, "multiview": False}
+
+
 def levers_for(view: dict, ab: bool, extra: dict, synced: bool = False) -> dict:
     """The lever file for one view: the extra levers, the pin, the schedule.
     `synced` blocks on the GPU every frame, so the render thread's wait is
     the GPU's time; the A/B schedule always runs synced."""
-    levers = dict(extra)
+    levers = dict(MEASURED, **extra)
     levers["bench"] = {"name": view["name"], "eye": view["eye"], "at": view["at"]}
     if ab:
         levers["ab_cycle"] = True
