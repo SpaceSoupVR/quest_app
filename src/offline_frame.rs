@@ -98,6 +98,8 @@ fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
         && adapter.features().contains(wgpu::Features::SHADER_F16);
     let desc = wgpu::DeviceDescriptor {
         required_features: if f16 { wgpu::Features::SHADER_F16 } else { wgpu::Features::empty() },
+        // As many textures as the scene's shaders bind, as the headset asks.
+        required_limits: space_soup::renderer::uniforms::scene_limits(wgpu::Limits::default()),
         ..Default::default()
     };
     pollster::block_on(adapter.request_device(&desc)).ok()
@@ -181,7 +183,15 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         descs.iter().enumerate().map(|(i, d)| (i as u32, d.centre, d.min, d.max)).collect();
     let rooms: Vec<u32> = descs.iter().map(|d| d.volume).collect();
     let portals = level.as_ref().map(|l| l.portals.clone()).unwrap_or_default();
-    let proxies = level.as_ref().map(|l| l.scene_proxies(&game, scene_name)).unwrap_or_default();
+    let (mut proxies, fields) = level.as_ref().map(|l| l.scene_proxies(&game, scene_name)).unwrap_or_default();
+    // `NO_FIELDS=1`: the models traced by their bounds and the photographs,
+    // as before their distance fields -- for a before/after.
+    let fields = if std::env::var("NO_FIELDS").as_deref() == Ok("1") {
+        proxies.iter_mut().for_each(|p| p.field = None);
+        Vec::new()
+    } else {
+        fields
+    };
     let brightness: Vec<f32> = owned
         .iter()
         .map(|f| space_soup::renderer::uniforms::probe_mean_radiance(f, resolution))
@@ -198,6 +208,15 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         &probe_view,
         &probe_sampler,
     );
+
+    // The models' distance fields, packed and bound as the headset binds them.
+    let field_slots = match space_soup::renderer::proxy_field::atlas(&device, &queue, &fields) {
+        Some((atlas, slots)) => {
+            uniforms.set_proxy_field_atlas(atlas);
+            slots
+        }
+        None => Vec::new(),
+    };
 
     let mut ground_placement = None;
     // THE PROBES' DISTANCES, bound as the headset binds them, so the trace
@@ -245,6 +264,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     let resident_rooms = probes.volumes();
     probes.set_portals(&portals, view.eye, &resident_rooms);
     probes.set_proxies(&proxies, view.eye, &resident_rooms);
+    probes.set_proxy_fields(&field_slots);
     // The outdoors, as the headset carries it every frame.
     probes.set_outdoors(
         space_soup::renderer::probe_stream::outdoor_volume(&descs),

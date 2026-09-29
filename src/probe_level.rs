@@ -10,6 +10,7 @@ use std::sync::Arc;
 use glam::Vec3;
 use space_soup::renderer::probe_stream::{ProbeDepthSource, ProbeDesc, ProbeSource};
 use space_soup::renderer::uniforms::{ProbePortal, ProbeProxy};
+use space_soup::renderer::proxy_field::ProxyField;
 use space_soup_engine::reflection_probe::{self, ProbeEntry};
 use space_soup_engine::scene::GameObject;
 
@@ -129,10 +130,12 @@ impl ProbeLevel {
     }
 
     /// WHAT STANDS INSIDE THE ROOMS -- a pillar, a lamp -- for the reflection
-    /// trace, named by the same room numbers as the probes and doorways.
-    /// `objects` must already be in world space (`resolve_world_transforms`).
-    /// See `space_soup_engine::reflection_proxy`.
-    pub fn proxies(&self, game_dir: &Path, objects: &[GameObject]) -> Vec<ProbeProxy> {
+    /// trace, named by the same room numbers as the probes and doorways, and
+    /// each model's distance field: one per model and scale, however many
+    /// objects use it. `objects` must already be in world space
+    /// (`resolve_world_transforms`). See `space_soup_engine::reflection_proxy`
+    /// and `space_soup::renderer::proxy_field`.
+    pub fn proxies(&self, game_dir: &Path, objects: &[GameObject]) -> (Vec<ProbeProxy>, Vec<ProxyField>) {
         // One box per room, indexed by room number: every cell of a room
         // carries the room's box.
         //
@@ -148,21 +151,50 @@ impl ProbeLevel {
                 rooms[d.volume as usize] = (d.min, d.max);
             }
         }
-        space_soup_engine::reflection_proxy::reflection_proxies(game_dir, objects, &rooms)
-            .into_iter()
-            .map(|p| ProbeProxy {
+        let mut fields: Vec<ProxyField> = Vec::new();
+        let mut field_of: std::collections::HashMap<(String, [u32; 3]), Option<u32>> = std::collections::HashMap::new();
+        let mut out = Vec::new();
+        for p in space_soup_engine::reflection_proxy::reflection_proxies(game_dir, objects, &rooms) {
+            let mesh = if p.solid { None } else { objects.get(p.object).and_then(|o| o.mesh.as_ref()) };
+            let field = mesh.and_then(|mesh| {
+                let key = (mesh.path.clone(), mesh.scale.to_array().map(f32::to_bits));
+                *field_of.entry(key).or_insert_with(|| {
+                    if fields.len() >= space_soup::renderer::proxy_field::MAX_PROXY_FIELDS {
+                        log::warn!("reflection proxies: more than {} models; '{}' is traced by its bounds", fields.len(), mesh.path);
+                        return None;
+                    }
+                    let started = std::time::Instant::now();
+                    let f = space_soup_engine::reflection_proxy::model_field(
+                        &game_dir.join(&mesh.path),
+                        mesh.scale,
+                        space_soup_engine::reflection_proxy::FIELD_SAMPLES,
+                    )?;
+                    log::info!(
+                        "reflection proxies: '{}' field {:?} ({:.0} mm reach) in {} ms",
+                        mesh.path,
+                        f.dims,
+                        f.max_distance * 1000.0,
+                        started.elapsed().as_millis(),
+                    );
+                    fields.push(ProxyField { dims: f.dims, max_distance: f.max_distance, distances: f.distances });
+                    Some(fields.len() as u32 - 1)
+                })
+            });
+            out.push(ProbeProxy {
                 centre: p.centre,
                 half_size: p.half_size,
                 rotation: p.rotation,
                 volume: p.room as u32,
                 solid: p.solid,
-            })
-            .collect()
+                field,
+            });
+        }
+        (out, fields)
     }
 
     /// [`ProbeLevel::proxies`] for the scene file itself, its transforms
     /// resolved to world space. Empty when the scene does not load.
-    pub fn scene_proxies(&self, game_dir: &Path, scene: &str) -> Vec<ProbeProxy> {
+    pub fn scene_proxies(&self, game_dir: &Path, scene: &str) -> (Vec<ProbeProxy>, Vec<ProxyField>) {
         let path = space_soup_engine::Manifest::scene_path(game_dir, scene);
         match space_soup_engine::scene::Scene::load(&path) {
             Ok(mut s) => {
@@ -171,7 +203,7 @@ impl ProbeLevel {
             }
             Err(e) => {
                 log::warn!("reflection proxies: {} did not load: {e:#}", path.display());
-                Vec::new()
+                (Vec::new(), Vec::new())
             }
         }
     }
@@ -210,7 +242,7 @@ mod tests {
             eprintln!("skipping: no test_room probes");
             return;
         };
-        let proxies = level.scene_proxies(&game, "test_room");
+        let (proxies, fields) = level.scene_proxies(&game, "test_room");
         for p in &proxies {
             eprintln!("proxy room {} centre {:?} half {:?}", p.volume, p.centre, p.half_size);
             assert!(p.half_size.max_element() < 2.0, "a room's shell became a proxy: {p:?}");
@@ -223,6 +255,21 @@ mod tests {
             let lamp = proxies.iter().find(|p| (p.centre.x - x).abs() < 0.5 && p.centre.y > 1.5).expect("a hanging lamp");
             assert!(lamp.centre.y + lamp.half_size.y <= 3.2, "the lamp reaches through the ceiling: {lamp:?}");
             assert!(lamp.half_size.y > 0.15, "the lamp's box is the editor handle, not the model: {lamp:?}");
+        }
+        // Every fixture is traced by its own shape: one field per model and
+        // scale -- the three hanging lamps share one, the two sconces another
+        // -- and the pillar, a brush, is its box.
+        assert!(pillar.field.is_none(), "the pillar is a brush: {pillar:?}");
+        let models: Vec<_> = proxies.iter().filter(|p| !p.solid).collect();
+        assert_eq!(models.len(), 5);
+        assert!(models.iter().all(|p| p.field.is_some()), "a fixture without a field: {models:?}");
+        let mut distinct: Vec<u32> = models.iter().filter_map(|p| p.field).collect();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), fields.len(), "a field no proxy uses, or a proxy naming no field");
+        assert!(fields.len() <= 3, "{} fields for test_room's two or three fixture models", fields.len());
+        for f in &fields {
+            assert_eq!(f.distances.len() as u32, f.dims.iter().product::<u32>());
         }
     }
 }
