@@ -11,6 +11,9 @@ use space_soup_protocol::{PlayerId, WireWorld};
 
 use crate::avatar;
 
+/// An adult's eyes are about 93% of the way up their standing height.
+const EYE_HEIGHT_FRACTION: f32 = 0.93;
+
 pub(crate) fn build_bodies(
     local_player: PlayerId,
     rig: &space_soup_engine::PlayerRig,
@@ -58,6 +61,12 @@ pub(crate) fn update_avatar_bodies(
     // hand_offset^-1), reproducing the editor's authored pose with no reconstruction --
     // and inheriting the arm IK's reach clamp for free.
     local_hand_world: &mut [Option<avatar_ik::Transform>; 2],
+    // Out: every body as capsules, in render space (the player's frame), in
+    // `bodies` order -- the local player first. See
+    // `space_soup::renderer::uniforms::CapsuleUpload`.
+    capsule_groups: &mut Vec<space_soup::renderer::uniforms::CapsuleGroup>,
+    // The avatar's mean surface colour, for its reflection.
+    avatar_colour: [f32; 3],
 ) {
     avatar_mesh_cache.retain(|id, _| bodies.iter().any(|(bid, _)| *bid == *id));
     avatar_skeleton_cache.retain(|id, _| bodies.iter().any(|(bid, _)| *bid == *id));
@@ -240,6 +249,19 @@ pub(crate) fn update_avatar_bodies(
             right_curl,
         );
         skin.update_joint_matrices(renderer.queue(), &skinned_mats);
+
+        // THE BODY AS CAPSULES, from the joints this solve just posed: for its
+        // soft shadows, its contact darkening and its reflection. The head is
+        // in them for the local player too -- hidden from their own eyes, not
+        // from the lamps. The calibrated height is the EYES' height, a little
+        // under the standing height.
+        let joints = avatar_ik::joint_positions(skeleton, &skinned_mats);
+        let stature = (calibrated_height / EYE_HEIGHT_FRACTION).max(1.0);
+        let capsules = avatar_ik::body_capsules(skeleton, &rig_cfg.bone_map, &joints, Vec3::Y, stature);
+        capsule_groups.push(space_soup::renderer::uniforms::CapsuleGroup {
+            capsules: capsules.iter().map(|c| (c.a, c.b, c.radius)).collect(),
+            colour: avatar_colour,
+        });
 
         if id == local_player {
             // The exact posed wrist a held object attaches to (same solve, render space).

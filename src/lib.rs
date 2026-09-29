@@ -474,6 +474,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     > = HashMap::new();
     let mut avatar_skeleton_cache: HashMap<PlayerId, avatar_ik::SkeletonData> = HashMap::new();
     let boy_glb_path = dir.join("models/boy/boy.glb");
+    // The avatar's mean colour, for its capsules' reflections.
+    let avatar_colour = space_soup_engine::mesh_lightmap::model_albedo(&boy_glb_path)
+        .map_or([0.46, 0.34, 0.27], |a| a.to_array());
     let rig_config = avatar::load_rig_config(&dir.join("avatar_rig.json"));
     let synthetic_hand_config = load_synthetic_hand_config(&dir.join("synthetic_hand.json"));
 
@@ -958,6 +961,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &pull_sessions, &static_scene, &live_objects, &part_transforms,
         );
         let mut local_hand_world: [Option<avatar_ik::Transform>; 2] = [None, None];
+        let mut capsule_groups: Vec<space_soup::renderer::uniforms::CapsuleGroup> = Vec::new();
         avatar_render::update_avatar_bodies(
             &mut renderer,
             &mut avatar_mesh_cache,
@@ -974,7 +978,19 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &bodies,
             &pull_hands,
             &mut local_hand_world,
+            &mut capsule_groups,
+            avatar_colour,
         );
+        // The local player first, then everyone else nearest first: the
+        // shaders take the first few. See `CapsuleUpload`.
+        if capsule_groups.len() > 2 {
+            let here = capsule_groups[0].capsules.first().map_or(Vec3::ZERO, |c| c.0);
+            let dist = |g: &space_soup::renderer::uniforms::CapsuleGroup| {
+                g.capsules.first().map_or(f32::MAX, |c| (c.0 - here).length_squared())
+            };
+            capsule_groups[1..].sort_by(|a, b| dist(a).total_cmp(&dist(b)));
+        }
+        renderer.set_capsules(&capsule_groups);
 
         lever_tick = lever_tick.wrapping_add(1);
         if lever_tick % 72 == 0 {
