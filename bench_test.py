@@ -391,6 +391,19 @@ class BenchScript(unittest.TestCase):
         self.assertEqual(set(levers["bench"]), {"name", "eye", "at"}, "the app refuses any other field")
         self.assertIs(levers["ab_cycle"], True)
 
+    def test_every_view_measures_the_native_frame_unless_told_otherwise(self):
+        # SpaceWarp ships on and paces the app to 36 fps; a bench that
+        # inherited it would report every view at half its frame rate.
+        def printed(*extra):
+            p = subprocess.run([sys.executable, str(HERE / "bench.py"), "--print-levers", "hall_back", *extra],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            return json.loads(p.stdout)
+        plain = printed()
+        self.assertIs(plain["space_warp"], False)
+        self.assertIs(plain["multiview"], False)
+        self.assertIs(printed("--levers", '{"space_warp": true}')["space_warp"], True, "--levers must still win")
+
 
 if __name__ == "__main__":
     unittest.main()
