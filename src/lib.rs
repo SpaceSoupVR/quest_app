@@ -727,7 +727,30 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         // MULTIVIEW or MULTISAMPLE_ARRAY the stereo pipelines were never built
         // and it stays off. Logging the request rather than the answer would
         // describe a frame that is still drawing one eye at a time.
-        if cs.btn_menu && !prev_btn_menu {
+        // IN-HEADSET A/B OF THE NEW FRAME-RATE FEATURES, on the same button
+        // with a trigger held, so neither takes a gameplay control:
+        //   left trigger + menu:  Application SpaceWarp on/off (lever
+        //                         `space_warp`; 36 fps rendered, the rest
+        //                         made by the compositor)
+        //   right trigger + menu: foveation off -> low -> medium -> high
+        // The lever file still wins when it changes.
+        if cs.btn_menu && !prev_btn_menu && (cs.l_trigger > 0.5 || cs.r_trigger > 0.5) {
+            use space_soup::renderer::foveation::FoveationLevel;
+            let mut levers = renderer.levers();
+            if cs.l_trigger > 0.5 {
+                levers.space_warp = !levers.space_warp;
+                info!("space warp -> {} by left trigger + menu", if levers.space_warp { "ON" } else { "OFF" });
+            } else {
+                levers.foveation = match levers.foveation {
+                    FoveationLevel::Off => FoveationLevel::Low,
+                    FoveationLevel::Low => FoveationLevel::Medium,
+                    FoveationLevel::Medium => FoveationLevel::High,
+                    FoveationLevel::High => FoveationLevel::Off,
+                };
+                info!("foveation -> {} by right trigger + menu", levers.foveation.label());
+            }
+            renderer.set_levers(levers);
+        } else if cs.btn_menu && !prev_btn_menu {
             let want = !renderer.multiview_scene();
             let got = renderer.set_multiview_scene(want);
             info!(
