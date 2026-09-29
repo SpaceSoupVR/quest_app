@@ -86,6 +86,8 @@ fn post_upload_for(post: &space_soup_engine::scene::PostDef)
             ToneMapDef::Aces => space_soup::renderer::tonemap::ToneMapping::Aces,
             ToneMapDef::None => space_soup::renderer::tonemap::ToneMapping::None,
         },
+        // Set per frame from the levers by the renderer.
+        terrain_detail_distance: 0.0,
     }
 }
 
