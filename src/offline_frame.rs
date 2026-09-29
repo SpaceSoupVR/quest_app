@@ -353,6 +353,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             // `TERRAIN_DETAIL=metres` renders with the terrain's normal maps
             // faded out past that distance, as the lever does on the headset.
             terrain_detail_distance: std::env::var("TERRAIN_DETAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            reflection_share: false,
         },
         &PlayerUpload { offset, yaw: 0.0, capsules: offline_capsules(offset) },
         Some(&probes),
