@@ -216,6 +216,24 @@ impl ProbeLevel {
         Arc::new(move |i| reflection_probe::decode_probe_depth(entries.get(i)?, res))
     }
 
+    /// THE BUILDINGS' OUTSIDES the bake wrote beside the probes: each one's
+    /// world box and its six outside faces, at this level's face size -- one
+    /// baked at another is left out and said so. See the renderer's
+    /// `set_building_outsides`.
+    pub fn buildings(&self, game_dir: &Path, scene: &str) -> Vec<(Vec3, Vec3, Vec<u8>)> {
+        reflection_probe::load_scene_buildings(game_dir, scene)
+            .iter()
+            .filter_map(|e| {
+                let (res, faces) = reflection_probe::decode_probe(e)?;
+                if res != self.resolution {
+                    log::warn!("building outside '{}': {res}px faces, the probes' are {}; re-bake", e.object_id, self.resolution);
+                    return None;
+                }
+                Some((Vec3::from(e.min), Vec3::from(e.max), faces))
+            })
+            .collect()
+    }
+
     /// Pixels for probe `i`, read from its file each time. Nothing keeps them.
     pub fn source(&self) -> ProbeSource {
         let entries = self.entries.clone();
