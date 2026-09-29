@@ -67,6 +67,12 @@
       "eye": [16.8, 1.6, -6.8],
       "at": [10.5, 1.2, 2.0],
       "note": "The brick hall from its back corner across to both doorways (the one reported as the slowest room, 2026-09-29)."
+    },
+    {
+      "name": "player_shadow",
+      "eye": [0.0, 1.6, -0.3],
+      "at": [0.0, 0.0, -2.3],
+      "note": "Looking down behind your own body, away from the hall's front pendant: your crisp shadow from the lamp lighting you most falls here (the characters' shadow tiles, 2026-09-29)."
     }
   ]
 }
