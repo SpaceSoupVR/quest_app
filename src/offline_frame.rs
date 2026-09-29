@@ -63,6 +63,9 @@ pub struct View {
     /// The brushes' depth drawn first, the `depth_prepass` lever. On as
     /// shipped; it must change no pixel.
     pub depth_prepass: bool,
+    /// Raw radiance -- no tone curve, exposure 1 -- to set beside a Cycles
+    /// reference, whose PNG is the same sRGB-encoded radiance.
+    pub linear: bool,
 }
 
 impl View {
@@ -80,6 +83,7 @@ impl View {
             light_culling: true,
             half_res_reflections: true,
             depth_prepass: true,
+            linear: false,
         }
     }
 }
@@ -246,7 +250,11 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             } else {
                 1.0
             },
-            ..PostUpload::default()
+            tonemap: if view.linear {
+                space_soup::renderer::tonemap::ToneMapping::None
+            } else {
+                Default::default()
+            },
         },
         &PlayerUpload { offset, yaw: 0.0 },
         Some(&probes),
@@ -756,11 +764,27 @@ mod tests {
             // The pillar from the front-left, where its floor reflection
             // seemed to meet only half its width (headset 2026-09-27 19:10).
             Ok("pillar_oblique") => View::headset(Vec3::new(-1.2, 1.6, -2.5), Vec3::new(0.2, 0.2, -7.0)),
+            // Any other viewpoint: `FAR=ex,ey,ez,ax,ay,az`.
+            Ok(s) if s.split(',').count() == 6 => {
+                let n: Vec<f32> = s.split(',').map(|x| x.trim().parse().unwrap()).collect();
+                View::headset(Vec3::new(n[0], n[1], n[2]), Vec3::new(n[3], n[4], n[5]))
+            }
             _ => View::headset(Vec3::new(0.3, 1.6, -3.0), Vec3::new(0.0, 0.9, -7.0)),
         };
         let sources = std::env::var("SOURCES").as_deref() == Ok("1");
         let half_res_reflections = std::env::var("FULL_RES").as_deref() != Ok("1");
-        let Some(shot) = render_brushes("test_room", View { adapt: !sources, sources, half_res_reflections, ..v }) else {
+        // Framed as a Cycles reference is (`tools/reference`): `W`, `H` and the
+        // vertical field of view `FOVY`, and `LINEAR=1` for raw radiance.
+        let num = |k: &str| std::env::var(k).ok().and_then(|x| x.parse::<f32>().ok());
+        let linear = std::env::var("LINEAR").as_deref() == Ok("1");
+        let v = View {
+            width: num("W").map_or(v.width, |x| x as u32),
+            height: num("H").map_or(v.height, |x| x as u32),
+            fov_y: num("FOVY").unwrap_or(v.fov_y),
+            linear,
+            ..v
+        };
+        let Some(shot) = render_brushes("test_room", View { adapt: !sources && !linear, sources, half_res_reflections, ..v }) else {
             eprintln!("skipping: no GPU or no test_room");
             return;
         };
