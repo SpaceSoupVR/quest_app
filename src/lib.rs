@@ -298,6 +298,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             let (proxies, fields) = level.scene_proxies(&dir, &static_scene.scene_name);
             info!("STARTUP probes: {} reflection prox(ies), {} model field(s)", proxies.len(), fields.len());
             let closed_rooms = level.closed_rooms.clone();
+            // The buildings' outsides, for reflections that leave a building.
+            let buildings = level.buildings(&dir, &static_scene.scene_name);
+            info!("STARTUP probes: {} building outside(s)", buildings.len());
+            renderer.set_building_outsides(buildings);
             renderer.set_reflection_probes_with_depth(level.descs, level.resolution, level.portals, source, Some(depth));
             renderer.set_reflection_proxies(proxies, fields);
             // Which rooms are walled all round but their doorways, so the

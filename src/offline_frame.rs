@@ -170,6 +170,17 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     if let Some(sky) = reflection_sky.as_ref() {
         faces.push(sky.as_slice());
     }
+    // THE BUILDINGS' OUTSIDES after the sky, as the headset's stream puts them.
+    // `NO_BUILDINGS=1` leaves them out, for a before/after.
+    let buildings = match (&level, std::env::var("NO_BUILDINGS").as_deref()) {
+        (Some(l), Err(_)) | (Some(l), Ok("0")) => l.buildings(&game, scene_name),
+        _ => Vec::new(),
+    };
+    let building_layer = (!buildings.is_empty()).then_some(faces.len() as u32);
+    for (_, _, f) in &buildings {
+        faces.push(f.as_slice());
+    }
+    let building_boxes: Vec<(Vec3, Vec3)> = buildings.iter().map(|(lo, hi, _)| (*lo, *hi)).collect();
     let probe_view = space_soup::renderer::uniforms::upload_probe_cubes(&device, &queue, resolution, &faces);
     let probe_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         mag_filter: wgpu::FilterMode::Linear,
@@ -275,6 +286,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         sky_layer,
         ground_placement,
     );
+    probes.set_buildings(&building_boxes, building_layer);
     if view.no_portals {
         probes.portal_count = 0;
     }
