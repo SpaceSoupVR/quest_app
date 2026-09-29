@@ -49,6 +49,24 @@
       "eye": [0.0, 1.6, 6.0],
       "at": [6.0, 0.8, 14.0],
       "note": "Outside, looking away from the building over the terrain: the ground shader across most of the screen."
+    },
+    {
+      "name": "outdoors_walls",
+      "eye": [-7.5, 1.6, 10.5],
+      "at": [1.0, 1.3, 1.0],
+      "note": "Outside at the front-left corner (headset 2026-09-29 00:12:49): two polished walls reflecting the ground and the hills, every pixel a ground trace."
+    },
+    {
+      "name": "brick_hall",
+      "eye": [14.0, 1.6, 2.5],
+      "at": [14.0, 1.0, -7.0],
+      "note": "Inside the brick hall from its front door toward the back: brick walls, the ceiling lamp's pool, the wall wash behind."
+    },
+    {
+      "name": "brick_hall_diagonal",
+      "eye": [16.8, 1.6, -6.8],
+      "at": [10.5, 1.2, 2.0],
+      "note": "The brick hall from its back corner across to both doorways (the one reported as the slowest room, 2026-09-29)."
     }
   ]
 }
