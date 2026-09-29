@@ -203,6 +203,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         space_soup::renderer::terrain_pipeline::load_terrain_settings(&texture_dir),
     );
     renderer.set_terrain_splat(loaded_terrain.as_ref().and_then(|(_, s)| s.as_ref()));
+    // The ground reflections land on. See `space_soup::renderer::ground_map`.
+    renderer.set_terrain_heights(
+        loaded_terrain.as_ref().and_then(|(t, _)| t.height_grid(static_scene.terrain.as_ref(), &dir)),
+    );
 
     // WATER. Built once here rather than per frame: the surface is static world
     // geometry whose depth comes from the terrain, so the only thing that
@@ -824,6 +828,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 renderer.set_terrain_splat(
                     loaded_terrain.as_ref().and_then(|(_, s)| s.as_ref()),
                 );
+                renderer.set_terrain_heights(
+                    loaded_terrain.as_ref().and_then(|(t, _)| t.height_grid(static_scene.terrain.as_ref(), &dir)),
+                );
             }
         }
 
@@ -1158,7 +1165,8 @@ fn load_scene_brushes(
     }
 }
 
-#[cfg(target_os = "android")]
+// And the offline harness, which builds the ground map from it as the headset does.
+#[cfg(any(target_os = "android", test))]
 fn load_scene_terrain(
     game_dir: &std::path::Path,
     scene_name: &str,

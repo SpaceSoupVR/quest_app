@@ -117,11 +117,13 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
 
     // Lights: the scene's realtime ones through the wire conversion, plus the
     // sky's sun exactly as the frame adds it.
-    let pano = scene.sky.as_ref().and_then(|s| {
+    // The panorama itself, kept: the reflections' sky is made from it too.
+    let sky_pano = scene.sky.as_ref().and_then(|s| {
         let bytes = std::fs::read(game.join("skies").join(&s.id).join("sky.hdr")).ok()?;
         let p = space_soup::renderer::sky::decode_radiance(&bytes).ok()?;
-        Some(space_soup::renderer::sky::sky_lighting(&p, s.rotation_deg, s.intensity))
+        Some((p, s.rotation_deg, s.intensity))
     });
+    let pano = sky_pano.as_ref().map(|(p, r, i)| space_soup::renderer::sky::sky_lighting(p, *r, *i));
     let (irradiance, sky_sun) = pano.unwrap_or((
         space_soup::renderer::sky::SkyIrradiance::flat(space_soup::renderer::sky::AMBIENT),
         None,
@@ -152,7 +154,20 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         .as_ref()
         .map(|l| (0..l.descs.len()).filter_map(|i| (l.source())(i)).collect())
         .unwrap_or_default();
-    let faces: Vec<&[u8]> = owned.iter().map(|f| f.as_slice()).collect();
+    // THE SKY REFLECTIONS SEE, as the cube after the probes' -- as the headset
+    // builds it (`ProbeStream::new_with_depth`).
+    let reflection_sky = if owned.is_empty() {
+        None
+    } else {
+        sky_pano
+            .as_ref()
+            .map(|(p, r, i)| space_soup::renderer::sky::ReflectionSky::new(p, *r, *i).cube_faces(resolution))
+    };
+    let sky_layer = reflection_sky.as_ref().map(|_| owned.len() as u32);
+    let mut faces: Vec<&[u8]> = owned.iter().map(|f| f.as_slice()).collect();
+    if let Some(sky) = reflection_sky.as_ref() {
+        faces.push(sky.as_slice());
+    }
     let probe_view = space_soup::renderer::uniforms::upload_probe_cubes(&device, &queue, resolution, &faces);
     let probe_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         mag_filter: wgpu::FilterMode::Linear,
@@ -184,6 +199,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         &probe_sampler,
     );
 
+    let mut ground_placement = None;
     // THE PROBES' DISTANCES, bound as the headset binds them, so the trace
     // this harness renders is the one the headset runs. Absent from an older
     // bake, and then zero, which the shader answers with the box projection.
@@ -202,6 +218,10 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             dimension: Some(wgpu::TextureViewDimension::CubeArray),
             ..Default::default()
         }));
+        if let Some((view, placement)) = ground_map(&device, &queue, &game, scene_name, &scene, &irradiance, sky_sun.as_ref()) {
+            uniforms.set_ground_map(view);
+            ground_placement = Some(placement);
+        }
         uniforms.rebind_probes(
             &device,
             &lights_uniform,
@@ -225,6 +245,12 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     let resident_rooms = probes.volumes();
     probes.set_portals(&portals, view.eye, &resident_rooms);
     probes.set_proxies(&proxies, view.eye, &resident_rooms);
+    // The outdoors, as the headset carries it every frame.
+    probes.set_outdoors(
+        space_soup::renderer::probe_stream::outdoor_volume(&descs),
+        sky_layer,
+        ground_placement,
+    );
     if view.no_portals {
         probes.portal_count = 0;
     }
@@ -465,6 +491,59 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         rgba.extend_from_slice(&data[start..start + (view.width * 4) as usize]);
     }
     Some(Shot { width: view.width, height: view.height, rgba })
+}
+
+/// THE GROUND MAP, built as `XrRenderer::ensure_ground_map` builds it on the
+/// headset, from the same inputs the app hands the renderer: the terrain's
+/// heights over its footprint, its baked map, its layers and settings, and the
+/// sky and its sun. `None` for a level without terrain.
+#[allow(clippy::too_many_arguments)]
+fn ground_map(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    game: &std::path::Path,
+    scene_name: &str,
+    scene: &space_soup_engine::scene::Scene,
+    sky: &space_soup::renderer::sky::SkyIrradiance,
+    sun: Option<&space_soup::renderer::sky::SkySun>,
+) -> Option<(wgpu::TextureView, ([f32; 4], f32))> {
+    let map = ground_map_cpu(game, scene_name, scene, sky, sun)?;
+    let extent = map.max - map.min;
+    let placement = ([map.min.x, map.min.y, 1.0 / extent.x, 1.0 / extent.y], map.top);
+    Some((space_soup::renderer::ground_map::upload(device, queue, &map), placement))
+}
+
+/// [`ground_map`]'s picture, before it goes to the GPU.
+pub(crate) fn ground_map_cpu(
+    game: &std::path::Path,
+    scene_name: &str,
+    scene: &space_soup_engine::scene::Scene,
+    sky: &space_soup::renderer::sky::SkyIrradiance,
+    sun: Option<&space_soup::renderer::sky::SkySun>,
+) -> Option<space_soup::renderer::ground_map::GroundMap> {
+    use space_soup::renderer::{ground_map, terrain_pipeline};
+    let (geometry, splat) = crate::load_scene_terrain(game, scene_name)?;
+    let heights = geometry.height_grid(scene.terrain.as_ref(), game)?;
+    let occlusion = space_soup_engine::lightmaps::load_scene_lightmaps(game, scene_name)
+        .into_iter()
+        .find(|m| m.target == space_soup_engine::lightmaps::LightmapTarget::Terrain)
+        .map(|m| terrain_pipeline::TerrainImage { width: m.width, height: m.height, rgba: m.rgba });
+    let dir = game.join("textures").join("terrain");
+    let layers = terrain_pipeline::load_terrain_layers(&dir);
+    let settings = terrain_pipeline::load_terrain_settings(&dir);
+    let map = ground_map::build(
+        &ground_map::GroundInputs {
+            heights: &heights,
+            sky,
+            sun,
+            sky_occlusion: occlusion.as_ref(),
+            layers: &layers,
+            splat: splat.as_ref(),
+            settings: &settings,
+        },
+        ground_map::GROUND_MAP_SIZE,
+    );
+    Some(map)
 }
 
 fn bytemuck_cast<T: Copy>(v: &[T]) -> &[u8] {
@@ -716,6 +795,47 @@ mod tests {
             render_brushes("test_room", View { adapt: true, ..v })
                 .unwrap()
                 .save(&out.join(format!("floor_{name}_adapted.png")));
+        }
+    }
+
+    /// DIAGNOSTIC: the ground map around test_room's building, radiance and
+    /// height, to $OUT/ground_rgb.png and ground_height.png.
+    #[test]
+    #[ignore]
+    fn save_the_ground_map() {
+        let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
+        let game = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game");
+        let scene = space_soup_engine::scene::Scene::load(&space_soup_engine::Manifest::scene_path(&game, "test_room")).unwrap();
+        let s = scene.sky.as_ref().unwrap();
+        let bytes = std::fs::read(game.join("skies").join(&s.id).join("sky.hdr")).unwrap();
+        let p = space_soup::renderer::sky::decode_radiance(&bytes).unwrap();
+        let (sky, sun) = space_soup::renderer::sky::sky_lighting(&p, s.rotation_deg, s.intensity);
+        let map = super::ground_map_cpu(&game, "test_room", &scene, &sky, sun.as_ref()).unwrap();
+        let extent = map.max - map.min;
+        eprintln!("ground map {}x{} min {:?} max {:?} top {}", map.width, map.height, map.min, map.max, map.top);
+        let at = |x: f32, z: f32| {
+            let i = (((x - map.min.x) / extent.x) * map.width as f32) as u32;
+            let j = (((z - map.min.y) / extent.y) * map.height as f32) as u32;
+            (i.min(map.width - 1), j.min(map.height - 1))
+        };
+        let (i0, j0) = at(-8.0, -20.0);
+        let (i1, j1) = at(22.0, 10.0);
+        let (w, h) = (i1 - i0, j1 - j0);
+        let mut rgb = image::RgbImage::new(w, h);
+        let mut height = image::GrayImage::new(w, h);
+        for j in 0..h {
+            for i in 0..w {
+                let t = map.texels[((j0 + j) * map.width + i0 + i) as usize];
+                let enc = |v: f32| ((v / (v + 0.5)).powf(1.0 / 2.2) * 255.0) as u8;
+                rgb.put_pixel(i, j, image::Rgb([enc(t[0]), enc(t[1]), enc(t[2])]));
+                height.put_pixel(i, j, image::Luma([((t[3] + 1.0) * 40.0).clamp(0.0, 255.0) as u8]));
+            }
+        }
+        rgb.save(out.join("ground_rgb.png")).unwrap();
+        height.save(out.join("ground_height.png")).unwrap();
+        for (x, z) in [(0.0, 4.05), (0.0, 4.3), (0.0, 5.0), (0.0, 8.0), (-3.05, -8.0), (-3.5, -8.0), (-5.0, -8.0), (-8.0, -8.0)] {
+            let (i, j) = at(x, z);
+            eprintln!("({x}, {z}): {:?}", map.texels[(j * map.width + i) as usize]);
         }
     }
 

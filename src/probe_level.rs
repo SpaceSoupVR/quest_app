@@ -101,6 +101,7 @@ impl ProbeLevel {
                 min: Vec3::from(e.min),
                 max: Vec3::from(e.max),
                 volume: room_of(&e.volume),
+                has_depth: e.depth.is_some(),
             })
             .collect();
         // A doorway naming a room with no probe (a stale bake) is left out:

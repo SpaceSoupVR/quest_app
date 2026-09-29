@@ -199,6 +199,28 @@ impl TerrainGeometry {
     /// The UNPOSED ones deliberately: this is the footprint the baked occlusion
     /// map was generated over, which is fixed in the world and does not move
     /// with the player.
+    /// THE TERRAIN'S HEIGHTS for the renderer's ground map
+    /// (`space_soup::renderer::ground_map`): the heightfield itself -- not this
+    /// render copy, which is decimated and has the ground under floors lowered
+    /// -- sampled over this copy's footprint, which is where the terrain's own
+    /// baked map is placed (`XrRenderer::set_terrain_footprint`).
+    pub fn height_grid(&self, def: Option<&TerrainDef>, game_dir: &std::path::Path) -> Option<space_soup::renderer::ground_map::HeightGrid> {
+        let source = space_soup_engine::terrain::load(def?, game_dir).ok()?;
+        let (lo, hi) = self.world_bounds();
+        if !(hi.x > lo.x && hi.z > lo.z) {
+            return None;
+        }
+        Some(space_soup::renderer::ground_map::HeightGrid::sample(
+            glam::Vec2::new(lo.x, lo.z),
+            glam::Vec2::new(hi.x, hi.z),
+            HEIGHT_GRID_SAMPLES,
+            HEIGHT_GRID_SAMPLES,
+            // A HOLE in the ground (a cave mouth) is no ground: far below
+            // anything, so a reflected ray passes on through it.
+            |x, z| source.height_at(x, z).unwrap_or(-1000.0),
+        ))
+    }
+
     pub fn world_bounds(&self) -> (Vec3, Vec3) {
         let mut lo = Vec3::splat(f32::INFINITY);
         let mut hi = Vec3::splat(f32::NEG_INFINITY);
@@ -332,7 +354,7 @@ pub fn load(
         .map(|(p, n)| SolidVertex {
             position: [p.x, p.y, p.z],
             normal: [n.x, n.y, n.z],
-            color: ground_colour(n.y),
+            color: GROUND_TINT,
             // Terrain is lit dynamically and has no lightmap, so the slot the
             // cuboid path uses for atlas coordinates is free. It carries the
             // splat uv instead -- one less vertex attribute, and the two can
@@ -404,18 +426,24 @@ fn vertex_normals(positions: &[Vec3], indices: &[u32]) -> Vec<Vec3> {
     normals
 }
 
-/// Flat ground reads greener, steep faces read as rock.
+/// THE VERTEX TINT: none. The ground's colour is its layers' textures, blended
+/// by slope, height or the painted splat map in the shader.
 ///
-/// A single colour makes a sculpted landscape unreadable in the headset --
-/// without a slope cue there is nothing to tell a gentle rise from a cliff until
-/// you walk into it.
-fn ground_colour(normal_y: f32) -> [f32; 4] {
-    let steepness = (1.0 - normal_y.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-    let grass = Vec3::new(0.30, 0.38, 0.22);
-    let rock = Vec3::new(0.34, 0.32, 0.30);
-    let c = grass.lerp(rock, steepness.powf(0.6));
-    [c.x, c.y, c.z, 1.0]
-}
+/// This was a grass-green (0.30, 0.38, 0.22) on flat ground turning grey-brown
+/// on slopes -- the ground's whole colour when terrain was first drawn, before
+/// it had textures. The shader multiplies its lit result by the vertex colour,
+/// so once textured layers arrived the tint stayed on top of them: the grass
+/// texture's albedo of about 0.2 came out near 0.07, three times darker than
+/// the textures, the lightmap bake, the probes, eye adaptation and the Cycles
+/// reference all took it to be. The probes photographed the ground three times
+/// brighter than it was drawn, and every exterior wall reflected that brighter
+/// ground (headset, 2026-09-28).
+const GROUND_TINT: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+/// Samples a side of the height grid the ground map is built from: finer than
+/// test_room's 129-sample heightfield, which it interpolates, so the grid adds
+/// no error of its own.
+const HEIGHT_GRID_SAMPLES: u32 = 257;
 
 #[cfg(test)]
 mod tests {
@@ -444,18 +472,12 @@ mod tests {
         assert_eq!(normals[3], Vec3::Y);
     }
 
+    /// The ground is the colour its textures say, not darker: the shader
+    /// multiplies by the vertex colour, so anything but white here scales every
+    /// layer's albedo. See `GROUND_TINT`.
     #[test]
-    fn steep_ground_is_coloured_differently_from_flat() {
-        assert_ne!(ground_colour(1.0), ground_colour(0.1));
-    }
-
-    #[test]
-    fn colours_stay_in_range() {
-        for y in [0.0, 0.25, 0.5, 0.75, 1.0] {
-            for c in ground_colour(y) {
-                assert!((0.0..=1.0).contains(&c), "colour component {c} out of range");
-            }
-        }
+    fn the_ground_carries_no_tint_over_its_textures() {
+        assert_eq!(GROUND_TINT, [1.0; 4]);
     }
 
     /// The splat uv must span the whole footprint, corner to corner. A uv that
