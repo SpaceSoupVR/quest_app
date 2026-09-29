@@ -414,10 +414,79 @@ pub fn load_materials(
         // neither, and a missing one means "fully rough, fully unoccluded" --
         // which is exactly how every brush looked before these were read at
         // all, so an older material library keeps rendering unchanged.
-        roughs.push(TerrainImage::load(&dir.join(id).join("rough.jpg")));
+        let mut rough = TerrainImage::load(&dir.join(id).join("rough.jpg"));
+        // THE AUTHOR'S READING OF THE MAP: `"roughness": {"min": a, "max": b}`
+        // maps the map's 0..1 onto a..b. A downloaded map is someone else's
+        // choice -- Rock063 ships at 0.33-0.59, wet-looking for dry cave rock,
+        // and its walls showed mirror-like patches (headset, 2026-09-29).
+        // Absent, the map is used as it is. See `roughness_range`.
+        if let (Some(img), Some((lo, hi))) = (rough.as_mut(), roughness_range(game_dir, id)) {
+            for px in img.rgba.chunks_exact_mut(4) {
+                for c in &mut px[..3] {
+                    let r = lo + (*c as f32 / 255.0) * (hi - lo);
+                    *c = (r.clamp(0.0, 1.0) * 255.0).round() as u8;
+                }
+            }
+            log::info!("brush_render: material '{id}' roughness read as {lo:.2}..{hi:.2}");
+        }
+        roughs.push(rough);
         aos.push(TerrainImage::load(&dir.join(id).join("ao.jpg")));
     }
     BrushMaterialMaps { colours, normals, roughs, aos }
+}
+
+/// What material `id`'s roughness map's 0 and 1 stand for: its
+/// `"roughness": {"min", "max"}` in the game's committed
+/// `material_overrides.json` (keyed by material id), else in the material's own
+/// `material.json`, else nothing. The overrides file wins because the library
+/// is downloaded per machine and not committed (`game/.gitignore`): a setting
+/// kept only in `materials/<id>/material.json` would reach nobody else.
+pub fn roughness_range(game_dir: &std::path::Path, id: &str) -> Option<(f32, f32)> {
+    let read = |path: std::path::PathBuf| -> Option<serde_json::Value> {
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    };
+    let range = |v: &serde_json::Value| -> Option<(f32, f32)> {
+        let r = v.get("roughness")?;
+        let lo = r.get("min")?.as_f64()? as f32;
+        let hi = r.get("max")?.as_f64()? as f32;
+        (lo.is_finite() && hi.is_finite()).then_some((lo.clamp(0.0, 1.0), hi.clamp(0.0, 1.0)))
+    };
+    read(game_dir.join("material_overrides.json"))
+        .and_then(|o| o.get(id).and_then(range))
+        .or_else(|| read(game_dir.join("materials").join(id).join("material.json")).and_then(|m| range(&m)))
+}
+
+#[cfg(test)]
+mod roughness_tests {
+    use super::roughness_range;
+
+    #[test]
+    fn the_committed_override_wins_over_the_librarys_own_file() {
+        let dir = std::env::temp_dir().join(format!("roughness_range_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("materials/Rock063")).unwrap();
+        std::fs::write(dir.join("materials/Rock063/material.json"), r#"{"roughness": {"min": 0.1, "max": 0.2}}"#).unwrap();
+        assert_eq!(roughness_range(&dir, "Rock063"), Some((0.1, 0.2)), "the library's own setting");
+        std::fs::write(dir.join("material_overrides.json"), r#"{"Rock063": {"roughness": {"min": 0.55, "max": 1.0}}}"#).unwrap();
+        assert_eq!(roughness_range(&dir, "Rock063"), Some((0.55, 1.0)), "the committed override");
+        assert_eq!(roughness_range(&dir, "Marble020"), None, "a material with neither is left as it is");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shipped override parses and gives the hallway's rock a dry range.
+    #[test]
+    fn the_hallway_rock_reads_as_dry_rock() {
+        let game = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game");
+        if !game.join("material_overrides.json").exists() {
+            eprintln!("skipping: no material_overrides.json");
+            return;
+        }
+        let (lo, hi) = roughness_range(&game, "Rock063").expect("Rock063 has an override");
+        // Rock063's map spans 0.33..0.59: read through the override, its
+        // middle must land where dry stone is, past the probe trace's fade.
+        let mid = lo + 0.46 * (hi - lo);
+        assert!(mid > 0.65 && hi <= 1.0, "Rock063 reads as {lo}..{hi}: its middle, {mid}, is still glossy");
+    }
 }
 
 /// Every map the brush shader reads, one entry per material in order.

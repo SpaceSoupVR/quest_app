@@ -26,6 +26,39 @@ use space_soup::renderer::uniforms::{PlayerUpload, PostUpload, ShadowUpload, Sky
 
 use crate::brush_render::{load_materials, BrushGeometry};
 
+/// A STANDING FIGURE as capsules, for the characters' shadows, contact
+/// darkening and reflections: `CAPSULE_AT=x,z` (or `x,y,z`) stands one 1.75 m
+/// tall, arms down, feet on the floor there, facing +z. None without it. In the
+/// harness's player frame: the world less `offset`.
+fn offline_capsules(offset: Vec3) -> space_soup::renderer::uniforms::CapsuleUpload {
+    use space_soup::renderer::uniforms::{CapsuleGroup, CapsuleUpload};
+    let at = std::env::var("CAPSULE_AT").ok().and_then(|v| {
+        let n: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        match n.as_slice() {
+            [x, z] => Some(Vec3::new(*x, 0.0, *z)),
+            [x, y, z] => Some(Vec3::new(*x, *y, *z)),
+            _ => None,
+        }
+    });
+    let Some(at) = at else { return CapsuleUpload::default() };
+    let p = |x: f32, y: f32, z: f32| at + Vec3::new(x, y, z) - offset;
+    let capsules = vec![
+        (p(0.0, 1.60, 0.0), p(0.0, 1.68, 0.0), 0.10),
+        (p(0.0, 1.40, 0.0), p(0.0, 0.95, 0.0), 0.15),
+        (p(-0.19, 1.42, 0.0), p(-0.21, 1.15, 0.0), 0.047),
+        (p(0.19, 1.42, 0.0), p(0.21, 1.15, 0.0), 0.047),
+        (p(-0.21, 1.15, 0.0), p(-0.22, 0.88, 0.0), 0.037),
+        (p(0.21, 1.15, 0.0), p(0.22, 0.88, 0.0), 0.037),
+        (p(-0.1, 0.92, 0.0), p(-0.1, 0.5, 0.0), 0.073),
+        (p(0.1, 0.92, 0.0), p(0.1, 0.5, 0.0), 0.073),
+        (p(-0.1, 0.5, 0.0), p(-0.1, 0.08, 0.0), 0.052),
+        (p(0.1, 0.5, 0.0), p(0.1, 0.08, 0.0), 0.052),
+        (p(-0.1, 0.04, 0.0), p(-0.1, 0.04, 0.16), 0.04),
+        (p(0.1, 0.04, 0.0), p(0.1, 0.04, 0.16), 0.04),
+    ];
+    CapsuleUpload::from_groups(&[CapsuleGroup { capsules, colour: [0.46, 0.34, 0.27] }])
+}
+
 /// Quest 3 eye buffer at the shipped render scale (2064 x 2208 x 0.7).
 pub const EYE_W: u32 = 1445;
 pub const EYE_H: u32 = 1546;
@@ -321,7 +354,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             // faded out past that distance, as the lever does on the headset.
             terrain_detail_distance: std::env::var("TERRAIN_DETAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
         },
-        &PlayerUpload { offset, yaw: 0.0 },
+        &PlayerUpload { offset, yaw: 0.0, capsules: offline_capsules(offset) },
         Some(&probes),
     );
 
@@ -436,12 +469,22 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("offline_probe_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target.color_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
-            })],
+            // The reflection, and how far it reached (for SpaceWarp), as the
+            // headset's pass has them. See `probe_pass::targets`.
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &target.color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &target.reach_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                }),
+            ],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &target.depth_view,
                 depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),

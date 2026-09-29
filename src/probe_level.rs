@@ -176,7 +176,11 @@ impl ProbeLevel {
                         f.max_distance * 1000.0,
                         started.elapsed().as_millis(),
                     );
-                    fields.push(ProxyField { dims: f.dims, max_distance: f.max_distance, distances: f.distances });
+                    // Its mean colour, for what no photograph saw of it. See
+                    // `probe_model_colour` in the renderer's lights block.
+                    let albedo = space_soup_engine::mesh_lightmap::model_albedo(&game_dir.join(&mesh.path))
+                        .map_or([0.2; 3], |a| a.to_array());
+                    fields.push(ProxyField { dims: f.dims, max_distance: f.max_distance, distances: f.distances, albedo });
                     Some(fields.len() as u32 - 1)
                 })
             });
