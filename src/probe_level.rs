@@ -210,7 +210,7 @@ impl ProbeLevel {
             // ITS CARDS, where the bake pictured it. See `proxy_cards`.
             let cards = match (mesh, object) {
                 (Some(_), Some(o)) => loaded_cards.iter().find(|c| c.object_id == o.id).map(|c| {
-                    out.cards.push(ProxyCards { resolution: c.resolution, texels: c.texels.clone() });
+                    out.cards.push(ProxyCards { resolution: c.resolution, texels: c.texels.clone(), normals: c.normals.clone() });
                     out.cards.len() as u32 - 1
                 }),
                 _ => None,
