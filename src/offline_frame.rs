@@ -227,7 +227,8 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         descs.iter().enumerate().map(|(i, d)| (i as u32, d.centre, d.min, d.max)).collect();
     let rooms: Vec<u32> = descs.iter().map(|d| d.volume).collect();
     let portals = level.as_ref().map(|l| l.portals.clone()).unwrap_or_default();
-    let (mut proxies, fields) = level.as_ref().map(|l| l.scene_proxies(&game, scene_name)).unwrap_or_default();
+    let crate::probe_level::ReflectionProxies { mut proxies, fields, cards } =
+        level.as_ref().map(|l| l.scene_proxies(&game, scene_name)).unwrap_or_default();
     // `NO_FIELDS=1`: the models traced by their bounds and the photographs,
     // as before their distance fields -- for a before/after.
     // `NO_PROXIES=1`: no reflection proxies at all -- rooms and photographs only.
@@ -265,6 +266,18 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         }
         None => Vec::new(),
     };
+    // And their cards, each proxy naming its row as the headset's
+    // `set_reflection_proxies` names it. `NO_CARDS=1`: none, for a
+    // before/after -- the models then take their mean colour.
+    match space_soup::renderer::proxy_cards::atlas(&device, &queue, &cards) {
+        Some((atlas, rows)) if std::env::var("NO_CARDS").as_deref() != Ok("1") => {
+            uniforms.set_proxy_card_atlas(atlas);
+            for p in &mut proxies {
+                p.cards = p.cards.and_then(|i| rows.get(i as usize).copied().flatten());
+            }
+        }
+        _ => proxies.iter_mut().for_each(|p| p.cards = None),
+    }
 
     let mut ground_placement = None;
     // THE PROBES' DISTANCES, bound as the headset binds them, so the trace

@@ -69,6 +69,12 @@
       "note": "The brick hall from its back corner across to both doorways (the one reported as the slowest room, 2026-09-29)."
     },
     {
+      "name": "sconce_jamb",
+      "eye": [1.5, 1.6, -3.6],
+      "at": [2.8, 1.75, -2.35],
+      "note": "The polished doorway jamb beside the hallway's south sconce: its reflection of the wall behind the sconce (stepped outline until the prop-free photographs, 2026-09-29)."
+    },
+    {
       "name": "player_shadow",
       "eye": [0.0, 1.6, -0.3],
       "at": [0.0, 0.0, -2.3],
