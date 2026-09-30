@@ -97,6 +97,12 @@
       "eye": [0.0, 1.6, -1.0],
       "at": [0.0, 0.0, -1.45],
       "note": "Looking down at the marble by your own feet: your body in the floor's reflection, mirrored rather than as capsules (the characters' floor mirror, 2026-09-30)."
+    },
+    {
+      "name": "floor_mirror_lit",
+      "eye": [0.0, 1.6, -4.0],
+      "at": [0.0, 0.0, -4.45],
+      "note": "Standing in the front pendant's pool of light, looking down at your feet: your lit body mirrored in the marble (the characters' floor mirror, 2026-09-30)."
     }
   ]
 }
