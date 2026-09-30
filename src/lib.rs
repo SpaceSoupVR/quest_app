@@ -41,6 +41,7 @@ mod soundmap_client;
 mod brush_render;
 mod offline_frame;
 mod probe_level;
+mod glare_fixtures;
 mod mesh_masks;
 mod scene_lights;
 mod scene_meshes;
@@ -280,6 +281,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     // Each probe's parallax box is the OBJECT's own cuboid -- the same one the
     // baker captured from -- so the two cannot disagree about which room a
     // probe describes.
+    //
+    // The lamps' glare is measured from the same cards the reflections use,
+    // so it waits for them. See `glare_fixtures`.
+    let mut glare_measured = HashMap::new();
     {
         // STARTUP IS TIMED, phase by phase.
         //
@@ -322,6 +327,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             renderer.set_building_outsides(buildings);
             renderer.set_reflection_probes_with_depth(level.descs, level.resolution, level.portals, source, Some(depth));
             renderer.set_reflection_proxies(standing.proxies, standing.fields, standing.cards);
+            glare_measured = standing.glare;
             // Which rooms are walled all round but their doorways, so the
             // terrain outside is drawn only where a doorway shows it. After
             // the probes, whose room boxes it uses. See `portal_cull`.
@@ -332,6 +338,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+    // WHICH LAMPS GLARE, from which sides. See `glare_fixtures`.
+    let mut lamp_glare = glare_fixtures::load(&dir, &static_scene.scene_name, &glare_measured);
 
     // THE STATIONARY LAMPS' SHADOWS ON MESHES, by object, from disk now and
     // from the editor's stream later. See `mesh_masks`.
@@ -881,6 +889,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 static_lights = scene_lights::load(&dir, &w.scene_name);
                 baked_lights = scene_lights::load_baked(&dir, &w.scene_name);
                 stationary_channels = scene_lights::stationary_channels(&dir, &w.scene_name);
+                // The authored faces only: the probes, and with them the cards
+                // the glare is measured from, are the first scene's.
+                lamp_glare = glare_fixtures::load(&dir, &w.scene_name, &HashMap::new());
                 static_meshes = scene_meshes::load(&dir, &w.scene_name);
                 {
                     let sky = loaders::load_scene_sky(&dir, static_scene.sky.as_ref());
@@ -1037,6 +1048,14 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         renderer.set_baked_lights(
             baked_lights.iter().map(|l| convert::to_space_soup_light(l, offset, yaw_inv)).collect(),
         );
+        // Every lamp with a fixture, live or baked: a bulb glares however its
+        // light is shaded.
+        renderer.set_glare_sources(glare_fixtures::sources(
+            lights_src.iter().chain(baked_lights.iter()),
+            &lamp_glare,
+            offset,
+            yaw_inv,
+        ));
         let (cuboids, lights, mesh_instances, mirror_only_mesh_instances, mirror_surface) =
             render_prep::build_render_lists(
                 cuboids_src,
