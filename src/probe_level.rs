@@ -24,6 +24,10 @@ pub struct ReflectionProxies {
     pub proxies: Vec<ProbeProxy>,
     pub fields: Vec<ProxyField>,
     pub cards: Vec<ProxyCards>,
+    /// Which sides each lamp's bright source shows from, measured from its
+    /// cards, by object id with the frame they were taken in. See
+    /// `glare_fixtures`.
+    pub glare: std::collections::HashMap<String, ([f32; 6], glam::Quat)>,
 }
 
 pub struct ProbeLevel {
@@ -171,6 +175,7 @@ impl ProbeLevel {
         let shaped = space_soup_engine::reflection_proxy::shaped_models(&standing, objects);
         let loaded_cards = space_soup_engine::reflection_cards::load_scene_cards(game_dir, scene);
         let mut out = ReflectionProxies::default();
+        let mut pictured = Vec::new();
         let mut field_of: Vec<Option<Option<u32>>> = vec![None; space_soup_engine::reflection_proxy::MAX_SHAPED_MODELS];
         for (p, shape) in standing.iter().zip(&shaped) {
             let object = objects.get(p.object);
@@ -210,6 +215,7 @@ impl ProbeLevel {
             // ITS CARDS, where the bake pictured it. See `proxy_cards`.
             let cards = match (mesh, object) {
                 (Some(_), Some(o)) => loaded_cards.iter().find(|c| c.object_id == o.id).map(|c| {
+                    pictured.push((p.object, c, p.half_size, p.rotation));
                     out.cards.push(ProxyCards { resolution: c.resolution, texels: c.texels.clone(), normals: c.normals.clone() });
                     out.cards.len() as u32 - 1
                 }),
@@ -225,6 +231,7 @@ impl ProbeLevel {
                 cards,
             });
         }
+        out.glare = crate::glare_fixtures::measure(objects, &pictured);
         out
     }
 
@@ -296,7 +303,7 @@ mod tests {
             eprintln!("skipping: no test_room probes");
             return;
         };
-        let ReflectionProxies { proxies, fields, cards } = level.scene_proxies(&game, "test_room");
+        let ReflectionProxies { proxies, fields, cards, .. } = level.scene_proxies(&game, "test_room");
         for p in &proxies {
             eprintln!("proxy room {} centre {:?} half {:?}", p.volume, p.centre, p.half_size);
             assert!(p.half_size.max_element() < 2.0, "a room's shell became a proxy: {p:?}");

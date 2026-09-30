@@ -238,7 +238,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         descs.iter().enumerate().map(|(i, d)| (i as u32, d.centre, d.min, d.max)).collect();
     let rooms: Vec<u32> = descs.iter().map(|d| d.volume).collect();
     let portals = level.as_ref().map(|l| l.portals.clone()).unwrap_or_default();
-    let crate::probe_level::ReflectionProxies { mut proxies, fields, cards } =
+    let crate::probe_level::ReflectionProxies { mut proxies, fields, cards, .. } =
         level.as_ref().map(|l| l.scene_proxies(&game, scene_name)).unwrap_or_default();
     // `NO_FIELDS=1`: the models traced by their bounds and the photographs,
     // as before their distance fields -- for a before/after.
