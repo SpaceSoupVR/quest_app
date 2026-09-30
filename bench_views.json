@@ -91,6 +91,12 @@
       "eye": [0.0, 1.6, -0.3],
       "at": [0.0, 0.0, -2.3],
       "note": "Looking down behind your own body, away from the hall's front pendant: your crisp shadow from the lamp lighting you most falls here (the characters' shadow tiles, 2026-09-29)."
+    },
+    {
+      "name": "floor_mirror_self",
+      "eye": [0.0, 1.6, -1.0],
+      "at": [0.0, 0.0, -1.45],
+      "note": "Looking down at the marble by your own feet: your body in the floor's reflection, mirrored rather than as capsules (the characters' floor mirror, 2026-09-30)."
     }
   ]
 }
