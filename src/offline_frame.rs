@@ -515,6 +515,8 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         depth.create_view(&Default::default()),
     );
     let mut encoder = device.create_command_encoder(&Default::default());
+    // See `FIXUP_STATS` at the fix-up's dispatch.
+    let mut fixup_census: Option<(wgpu::Buffer, (u32, u32))> = None;
     if let Some((probe_pipeline, target, fixups)) = &probe_pass {
         if let Some((fixups, _)) = fixups {
             fixups.clear(&mut encoder);
@@ -556,7 +558,20 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
         drop(pass);
         if let Some((fixups, (target_bg, _))) = fixups {
-            fixups.dispatch(&mut encoder, &uniforms.bind_group, target_bg);
+            fixups.dispatch(&mut encoder, &uniforms.bind_group, target_bg, None);
+            // `FIXUP_STATS=1`: a census of the records the pass made, read
+            // back below -- what the fix-up is asked to do in this view.
+            if std::env::var("FIXUP_STATS").as_deref() == Ok("1") {
+                let list = fixups.list_buffer();
+                let copy = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("offline_fixup_census"),
+                    size: list.size(),
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                encoder.copy_buffer_to_buffer(list, 0, &copy, 0, list.size());
+                fixup_census = Some((copy, (target.width, target.height)));
+            }
         }
     }
     {
@@ -615,6 +630,34 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         size,
     );
     queue.submit(Some(encoder.finish()));
+    if let Some((copy, (tw, th))) = &fixup_census {
+        let slice = copy.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let data = slice.get_mapped_range().expect("map the fix-up census");
+        let word = |o: usize| u32::from_le_bytes(data[o..o + 4].try_into().unwrap());
+        let capacity = ((data.len() - 16) / 128) as u32;
+        let n = word(0).min(capacity) as usize;
+        let (mut subsample, mut edge, mut rim, mut mirror) = (0usize, 0usize, 0usize, 0usize);
+        for k in 0..n {
+            let b = 16 + k * 128;
+            let f = |i: usize| f32::from_bits(word(b + 96 + i * 4));
+            let (rim_at, edge_cover) = (f(0), f(2));
+            let edge_code = word(b + 116) as i32;
+            if edge_code >= 0 && edge_cover < 0.0 {
+                subsample += 1;
+            } else if edge_code >= 0 && edge_cover < 0.99 {
+                edge += 1;
+            }
+            rim += (rim_at >= 0.0) as usize;
+            mirror += (f(7) < 0.0) as usize;
+        }
+        let texels = (tw * th).max(1) as f32;
+        eprintln!(
+            "fixups: {n} records ({:.2}% of the {tw}x{th} pass): outline subsamples {subsample}, edges {edge}, rims {rim}, floor mirror {mirror}",
+            100.0 * n as f32 / texels
+        );
+    }
     let slice = readback.slice(..);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
