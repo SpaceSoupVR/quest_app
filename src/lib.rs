@@ -588,6 +588,16 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Some(openxr::Event::InstanceLossPending(_)) => exit = true,
+                // The runtime saying compositing, rendering or heat crossed a
+                // warning level (`XR_EXT_performance_settings`): the signal
+                // for when the game needs its performance level raised.
+                Some(openxr::Event::PerfSettingsEXT(e)) => info!(
+                    "XR PERF SETTINGS: {:?} {:?} {:?} -> {:?}",
+                    e.domain(),
+                    e.sub_domain(),
+                    e.from_level(),
+                    e.to_level()
+                ),
                 Some(_) => {}
                 None => break,
             }

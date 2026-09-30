@@ -89,6 +89,13 @@ pub struct View {
     /// The light loop's culling of lamps that cannot reach a pixel -- the
     /// `light_culling` lever. On as shipped.
     pub light_culling: bool,
+    /// Each lamp's terminator shaded over the pixel's footprint -- the
+    /// `terminator_aa` lever. On as shipped.
+    pub terminator_aa: bool,
+    /// MEASUREMENT: one of the scene shader's register cuts applied to the
+    /// picture (`BrushPipeline::new_multisampled_probe_reader_with_cut`), to
+    /// see what that term contributes. Half-resolution reflections only.
+    pub cut: Option<&'static str>,
     /// Reflections from the half-resolution probe pass rather than traced per
     /// pixel -- the `half_res_reflections` lever. Not for the sources view,
     /// which only the per-pixel shader paints.
@@ -123,6 +130,8 @@ impl View {
             adapt: false,
             no_portals: false,
             light_culling: true,
+            terminator_aa: true,
+            cut: None,
             half_res_reflections: true,
             depth_prepass: true,
             linear: false,
@@ -142,8 +151,15 @@ fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
         && adapter.features().contains(wgpu::Features::SHADER_F16);
     let desc = wgpu::DeviceDescriptor {
         required_features: if f16 { wgpu::Features::SHADER_F16 } else { wgpu::Features::empty() },
-        // As many textures as the scene's shaders bind, as the headset asks.
-        required_limits: space_soup::renderer::uniforms::scene_limits(wgpu::Limits::default()),
+        // As many textures as the scene's shaders bind, as the headset asks;
+        // and buffers as large as this machine's GPU takes, for the aliasing
+        // test's supersampled renders (its probe pass fix-up list outgrows
+        // the default 256 MB at three times the eye's size).
+        required_limits: wgpu::Limits {
+            max_buffer_size: adapter.limits().max_buffer_size,
+            max_storage_buffer_binding_size: adapter.limits().max_storage_buffer_binding_size,
+            ..space_soup::renderer::uniforms::scene_limits(wgpu::Limits::default())
+        },
         ..Default::default()
     };
     pollster::block_on(adapter.request_device(&desc)).ok()
@@ -190,6 +206,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     let lights = space_soup::renderer::lights::rank_for_budget(&lights, space_soup::renderer::lights::MAX_LIGHTS);
     let lights_uniform = LightsUniform::new(&device);
     lights_uniform.set_culling(view.light_culling);
+    lights_uniform.set_terminator_aa(view.terminator_aa);
     lights_uniform.upload_frame(&queue, &lights, &[], sun.is_some());
 
     // Probes, as `set_reflection_probes` binds them.
@@ -395,6 +412,9 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     let half_res = view.half_res_reflections && !view.sources;
     let pipeline = if view.sources {
         BrushPipeline::new_multisampled_sources(&device, format, &uniforms.layout, view.samples)
+    } else if let (true, Some(cut)) = (half_res, view.cut) {
+        BrushPipeline::new_multisampled_probe_reader_with_cut(&device, format, &uniforms.layout, view.samples, &probe_layout, cut)
+            .unwrap_or_else(|| panic!("no scene register cut {cut}, or it no longer matches the shader"))
     } else if half_res {
         BrushPipeline::new_multisampled_probe_reader(&device, format, &uniforms.layout, view.samples, &probe_layout, ViewMode::Mono)
     } else {
@@ -1129,7 +1149,7 @@ mod bench_views {
 
     /// The benchmark's viewpoints (`bench_views.json`), as `bench.py` pins
     /// the headset's camera to them.
-    fn bench_views() -> Vec<(String, Vec3, Vec3)> {
+    pub(super) fn bench_views() -> Vec<(String, Vec3, Vec3)> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bench_views.json");
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         doc["views"]
@@ -1178,5 +1198,232 @@ mod bench_views {
             };
             shot.save(&out.join(format!("bench_{name}.png")));
         }
+    }
+}
+
+/// ALIASING, MEASURED AGAINST A SUPERSAMPLED REFERENCE (2026-09-30).
+///
+/// The crawl probe (`jitter_px`) slides the pixel grid under a still camera
+/// and watches each pixel change -- but a sharp texture that is filtered
+/// correctly changes too, so change alone cannot tell detail from aliasing
+/// (the hallway's crawl was "mostly texture and normal detail", which is
+/// either). Here every shift is rendered twice: at the headset's resolution,
+/// and at `K` times it with each K x K block averaged in linear light -- the
+/// picture the frame would be with K x K times the shading samples. A pixel
+/// that follows its reference differs from it by about the same amount at
+/// every shift, however sharp it is; an aliased one differs by a different
+/// amount at every shift. The score is that variation: the standard deviation,
+/// across the shifts, of the frame's luma minus the reference's, in sRGB
+/// levels (0-255).
+///
+/// What it cannot see: anything the reference aliases the same way -- shadow
+/// and lightmap texels, which are fixed in the world, not on the screen.
+#[cfg(test)]
+mod aliasing {
+    use super::*;
+
+    fn srgb_to_linear(c: u8) -> f32 {
+        let c = c as f32 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    }
+
+    /// Linear light to sRGB-encoded levels, 0-255, unrounded.
+    fn linear_to_levels(l: f32) -> f32 {
+        let l = l.clamp(0.0, 1.0);
+        255.0 * if l <= 0.0031308 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 }
+    }
+
+    /// `shot` averaged over `k` x `k` blocks in linear light: the per-pixel
+    /// luminance, sRGB-encoded (levels), and the averaged colour for saving.
+    fn downsampled(shot: &Shot, k: u32) -> (Vec<f32>, Shot) {
+        let lut: Vec<f32> = (0..=255u8).map(srgb_to_linear).collect();
+        let (w, h) = (shot.width / k, shot.height / k);
+        let mut luma = Vec::with_capacity((w * h) as usize);
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        let n = (k * k) as f32;
+        for y in 0..h {
+            for x in 0..w {
+                let mut sum = [0.0f32; 3];
+                for dy in 0..k {
+                    for dx in 0..k {
+                        let p = shot.px(x * k + dx, y * k + dy);
+                        for c in 0..3 {
+                            sum[c] += lut[p[c] as usize];
+                        }
+                    }
+                }
+                let rgb = sum.map(|s| s / n);
+                luma.push(linear_to_levels(0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]));
+                rgba.extend(rgb.map(|c| linear_to_levels(c).round() as u8));
+                rgba.push(255);
+            }
+        }
+        (luma, Shot { width: w, height: h, rgba })
+    }
+
+    /// Per pixel: the standard deviation across the shifts of `frames[i] -
+    /// refs[i]` -- the part of the frame's error that moves with the grid.
+    fn aliasing_score(frames: &[Vec<f32>], refs: &[Vec<f32>]) -> Vec<f32> {
+        let n = frames.len() as f32;
+        (0..frames[0].len())
+            .map(|p| {
+                let d: Vec<f32> = frames.iter().zip(refs).map(|(f, r)| f[p] - r[p]).collect();
+                let mean = d.iter().sum::<f32>() / n;
+                (d.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n).sqrt()
+            })
+            .collect()
+    }
+
+    /// Per pixel: the standard deviation across the shifts of the value
+    /// itself -- the crawl probe's measure, detail and aliasing together.
+    fn change(frames: &[Vec<f32>]) -> Vec<f32> {
+        let n = frames.len() as f32;
+        (0..frames[0].len())
+            .map(|p| {
+                let mean = frames.iter().map(|f| f[p]).sum::<f32>() / n;
+                (frames.iter().map(|f| (f[p] - mean) * (f[p] - mean)).sum::<f32>() / n).sqrt()
+            })
+            .collect()
+    }
+
+    /// A still frame that follows its reference scores nothing however much
+    /// both change; one that flips a pixel the reference only shades scores.
+    #[test]
+    fn a_frame_that_follows_its_reference_scores_nothing_and_a_flipping_one_scores() {
+        let refs: Vec<Vec<f32>> = (0..6).map(|i| vec![100.0 + 20.0 * i as f32, 50.0]).collect();
+        let following: Vec<Vec<f32>> = refs.iter().map(|r| r.iter().map(|v| v - 7.0).collect()).collect();
+        assert!(aliasing_score(&following, &refs).iter().all(|&s| s < 1e-4));
+        assert!(change(&following)[0] > 30.0, "the detail itself changes");
+        let flipping: Vec<Vec<f32>> = (0..6).map(|i| vec![100.0 + 20.0 * i as f32, if i % 2 == 0 { 0.0 } else { 100.0 }]).collect();
+        let s = aliasing_score(&flipping, &refs);
+        assert!(s[0] < 1e-4 && (s[1] - 50.0).abs() < 1e-3, "{s:?}");
+    }
+
+    #[test]
+    fn a_block_average_is_taken_in_linear_light() {
+        // Black and white average to half the light: level 188, not 128.
+        let shot = Shot { width: 2, height: 2, rgba: [[0, 0, 0, 255], [255; 4], [255; 4], [0, 0, 0, 255]].concat() };
+        let (luma, small) = downsampled(&shot, 2);
+        assert_eq!((small.width, small.height), (1, 1));
+        assert!((luma[0] - 187.5).abs() < 0.5, "{}", luma[0]);
+        assert_eq!(small.px(0, 0)[0], 188);
+    }
+
+    /// `VIEW=<bench view>` or `FAR=ex,ey,ez,ax,ay,az`; `K` (default 3) and
+    /// `SHIFTS` (default 6, along the diagonal, a pixel in all); `TILE` (32)
+    /// for the table of worst tiles; `REGION=x0,y0,x1,y1` to score one area
+    /// alone; `FULL_RES=1` for per-pixel reflections, `TERMINATOR_AA=0` for
+    /// the lamps' hard terminator, `CUT=<scene register cut>` to take one
+    /// term out of the picture (`scene_cut_lamp_spec`, `scene_cut_bounce`,
+    /// ...), `ROLL` in degrees.
+    /// Writes $OUT/alias_$TAG.png -- the score over the frame, dimmed -- and
+    /// the frame and its reference at the first shift beside it.
+    #[test]
+    #[ignore]
+    fn measure_the_aliasing() {
+        let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
+        let tag = std::env::var("TAG").unwrap_or_else(|_| "current".into());
+        let num = |k: &str| std::env::var(k).ok().and_then(|x| x.parse::<f32>().ok());
+        let (eye, at) = match (std::env::var("VIEW"), std::env::var("FAR")) {
+            (Ok(name), _) => {
+                let views = super::bench_views::bench_views();
+                let v = views.iter().find(|v| v.0 == name).unwrap_or_else(|| panic!("no bench view {name}"));
+                (v.1, v.2)
+            }
+            (_, Ok(s)) => {
+                let n: Vec<f32> = s.split(',').map(|x| x.trim().parse().unwrap()).collect();
+                (Vec3::new(n[0], n[1], n[2]), Vec3::new(n[3], n[4], n[5]))
+            }
+            _ => panic!("set VIEW=<bench view> or FAR=ex,ey,ez,ax,ay,az"),
+        };
+        let k = num("K").map_or(3, |x| x as u32);
+        let shifts = num("SHIFTS").map_or(6, |x| x as usize);
+        let tile = num("TILE").map_or(32, |x| x as u32);
+        let base = View {
+            adapt: true,
+            half_res_reflections: std::env::var("FULL_RES").as_deref() != Ok("1"),
+            terminator_aa: std::env::var("TERMINATOR_AA").as_deref() != Ok("0"),
+            cut: std::env::var("CUT").ok().map(|c| &*Box::leak(c.into_boxed_str())),
+            roll_deg: num("ROLL").unwrap_or(0.0),
+            ..View::headset(eye, at)
+        };
+        let (w, h) = (base.width, base.height);
+
+        let mut frames = Vec::new();
+        let mut refs = Vec::new();
+        let mut first: Option<(Shot, Shot)> = None;
+        for i in 0..shifts {
+            let s = i as f32 / shifts as f32;
+            let Some(frame) = render_brushes("test_room", View { jitter_px: [s, s], ..base }) else {
+                eprintln!("skipping: no GPU or no test_room");
+                return;
+            };
+            let big = render_brushes(
+                "test_room",
+                View { width: w * k, height: h * k, jitter_px: [s * k as f32, s * k as f32], ..base },
+            )
+            .expect("the reference renders where the frame did");
+            let (frame_luma, _) = downsampled(&frame, 1);
+            let (ref_luma, reference) = downsampled(&big, k);
+            frames.push(frame_luma);
+            refs.push(ref_luma);
+            if first.is_none() {
+                first = Some((frame, reference));
+            }
+            eprintln!("shift {}/{shifts} rendered", i + 1);
+        }
+        let score = aliasing_score(&frames, &refs);
+        let moved = change(&frames);
+        let moved_ref = change(&refs);
+
+        let stats = |x0: u32, y0: u32, x1: u32, y1: u32| {
+            let mut n = 0usize;
+            let (mut sum, mut sum_moved, mut sum_ref, mut over4, mut over8) = (0.0f64, 0.0f64, 0.0f64, 0usize, 0usize);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let p = (y * w + x) as usize;
+                    n += 1;
+                    sum += score[p] as f64;
+                    sum_moved += moved[p] as f64;
+                    sum_ref += moved_ref[p] as f64;
+                    over4 += (score[p] > 4.0) as usize;
+                    over8 += (score[p] > 8.0) as usize;
+                }
+            }
+            let n = n.max(1) as f64;
+            (sum / n, sum_moved / n, sum_ref / n, 100.0 * over4 as f64 / n, 100.0 * over8 as f64 / n)
+        };
+        let (a, m, r, o4, o8) = stats(0, 0, w, h);
+        eprintln!(
+            "{tag}: aliasing {a:.3} levels (pixels over 4: {o4:.2}%, over 8: {o8:.2}%); change {m:.3}, reference's own change {r:.3}; K={k}, {shifts} shifts"
+        );
+        if let Some(region) = std::env::var("REGION").ok() {
+            let c: Vec<u32> = region.split(',').map(|x| x.trim().parse().unwrap()).collect();
+            let (a, m, r, o4, o8) = stats(c[0], c[1], c[2].min(w), c[3].min(h));
+            eprintln!("{tag} region {region}: aliasing {a:.3} (over 4: {o4:.2}%, over 8: {o8:.2}%); change {m:.3}, reference {r:.3}");
+        }
+        let mut tiles: Vec<(f64, u32, u32)> = Vec::new();
+        for ty in 0..h / tile {
+            for tx in 0..w / tile {
+                let (a, ..) = stats(tx * tile, ty * tile, (tx + 1) * tile, (ty + 1) * tile);
+                tiles.push((a, tx * tile, ty * tile));
+            }
+        }
+        tiles.sort_by(|p, q| q.0.total_cmp(&p.0));
+        for (a, x, y) in tiles.iter().take(12) {
+            let (_, m, r, o4, _) = stats(*x, *y, x + tile, y + tile);
+            eprintln!("  tile {x},{y}..{},{}: aliasing {a:.2} (over 4: {o4:.1}%), change {m:.2}, reference {r:.2}", x + tile, y + tile);
+        }
+
+        let (frame, reference) = first.unwrap();
+        let mut heat = Vec::with_capacity((w * h * 4) as usize);
+        for p in 0..(w * h) as usize {
+            let dim = (frames[0][p] * 0.3) as u8;
+            let hot = (score[p] * 16.0).min(255.0) as u8;
+            heat.extend([dim.saturating_add(hot), dim, dim, 255]);
+        }
+        Shot { width: w, height: h, rgba: heat }.save(&out.join(format!("alias_{tag}.png")));
+        frame.save(&out.join(format!("alias_{tag}_frame.png")));
+        reference.save(&out.join(format!("alias_{tag}_reference.png")));
     }
 }
