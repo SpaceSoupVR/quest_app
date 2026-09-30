@@ -75,6 +75,18 @@
       "note": "The polished doorway jamb beside the hallway's south sconce: its reflection of the wall behind the sconce (stepped outline until the prop-free photographs, 2026-09-29)."
     },
     {
+      "name": "sconce_below",
+      "eye": [5.0, 0.4, -3.5],
+      "at": [5.0, 1.85, -4.15],
+      "note": "Looking up at the hallway's south sconce from near the floor: its underside as drawn, beside how its cards show it in reflections (2026-09-29)."
+    },
+    {
+      "name": "hall_to_hallway_floor",
+      "eye": [-1.66, 1.56, -3.71],
+      "at": [3.0, 0.6, -3.0],
+      "note": "From the hall toward the hallway door: the south sconce as drawn and its reflection in the marble floor, in one frame (headset 22:07:41, 2026-09-29)."
+    },
+    {
       "name": "player_shadow",
       "eye": [0.0, 1.6, -0.3],
       "at": [0.0, 0.0, -2.3],

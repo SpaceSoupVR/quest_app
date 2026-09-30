@@ -99,6 +99,15 @@ pub struct View {
     /// Raw radiance -- no tone curve, exposure 1 -- to set beside a Cycles
     /// reference, whose PNG is the same sRGB-encoded radiance.
     pub linear: bool,
+    /// The head's roll about the view direction, degrees. An edge the eye
+    /// sees vertical runs down the pixel grid and cannot show a staircase;
+    /// the headset's 22:04:15 screenshot was tilted about 15 degrees, and its
+    /// reflected doorway edges stepped (2026-09-29).
+    pub roll_deg: f32,
+    /// The pixel grid shifted by this many pixels, x and y, with the camera
+    /// held still: the crawl test's probe. A band-limited picture resamples
+    /// smoothly under it; a hard per-pixel decision flips whole pixels.
+    pub jitter_px: [f32; 2],
 }
 
 impl View {
@@ -117,6 +126,8 @@ impl View {
             half_res_reflections: true,
             depth_prepass: true,
             linear: false,
+            roll_deg: 0.0,
+            jitter_px: [0.0, 0.0],
         }
     }
 }
@@ -318,7 +329,13 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     let eye_p = to_player(view.eye);
     let at_p = to_player(view.at);
     let proj = Mat4::perspective_rh(view.fov_y.to_radians(), view.width as f32 / view.height as f32, 0.03, 1000.0);
-    let view_proj = proj * Mat4::look_at_rh(eye_p, at_p, Vec3::Y);
+    let up = glam::Quat::from_axis_angle((at_p - eye_p).normalize(), view.roll_deg.to_radians()) * Vec3::Y;
+    let shift = Mat4::from_translation(Vec3::new(
+        2.0 * view.jitter_px[0] / view.width as f32,
+        -2.0 * view.jitter_px[1] / view.height as f32,
+        0.0,
+    ));
+    let view_proj = shift * proj * Mat4::look_at_rh(eye_p, at_p, up);
     let mut probes = space_soup::renderer::uniforms::select_resident_probes(&volumes, view.eye, |_, _| true);
     probes.fill_brightness(&brightness);
     probes.fill_volumes(&rooms);
@@ -997,6 +1014,8 @@ mod tests {
             width: num("W").map_or(v.width, |x| x as u32),
             height: num("H").map_or(v.height, |x| x as u32),
             fov_y: num("FOVY").unwrap_or(v.fov_y),
+            roll_deg: num("ROLL").unwrap_or(0.0),
+            jitter_px: [num("JX").unwrap_or(0.0), num("JY").unwrap_or(0.0)],
             linear,
             ..v
         };
