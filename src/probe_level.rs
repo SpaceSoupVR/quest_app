@@ -10,9 +10,21 @@ use std::sync::Arc;
 use glam::Vec3;
 use space_soup::renderer::probe_stream::{ProbeDepthSource, ProbeDesc, ProbeSource};
 use space_soup::renderer::uniforms::{ProbePortal, ProbeProxy};
+use space_soup::renderer::proxy_cards::ProxyCards;
 use space_soup::renderer::proxy_field::ProxyField;
 use space_soup_engine::reflection_probe::{self, ProbeEntry};
 use space_soup_engine::scene::GameObject;
+
+/// WHAT STANDS IN A LEVEL'S ROOMS for the reflection trace, as
+/// [`ProbeLevel::proxies`] builds it: the proxies, the models' distance
+/// fields (`ProbeProxy::field` indexes `fields`) and the models' cards
+/// (`ProbeProxy::cards` indexes `cards`).
+#[derive(Default)]
+pub struct ReflectionProxies {
+    pub proxies: Vec<ProbeProxy>,
+    pub fields: Vec<ProxyField>,
+    pub cards: Vec<ProxyCards>,
+}
 
 pub struct ProbeLevel {
     pub resolution: u32,
@@ -130,12 +142,13 @@ impl ProbeLevel {
     }
 
     /// WHAT STANDS INSIDE THE ROOMS -- a pillar, a lamp -- for the reflection
-    /// trace, named by the same room numbers as the probes and doorways, and
-    /// each model's distance field: one per model and scale, however many
-    /// objects use it. `objects` must already be in world space
-    /// (`resolve_world_transforms`). See `space_soup_engine::reflection_proxy`
-    /// and `space_soup::renderer::proxy_field`.
-    pub fn proxies(&self, game_dir: &Path, objects: &[GameObject]) -> (Vec<ProbeProxy>, Vec<ProxyField>) {
+    /// trace, named by the same room numbers as the probes and doorways; each
+    /// model's distance field, one per model and scale however many objects
+    /// use it; and each model's cards, from `scene`'s probe bake. `objects`
+    /// must already be in world space (`resolve_world_transforms`). See
+    /// `space_soup_engine::reflection_proxy`, `space_soup::renderer::proxy_field`
+    /// and `space_soup::renderer::proxy_cards`.
+    pub fn proxies(&self, game_dir: &Path, scene: &str, objects: &[GameObject]) -> ReflectionProxies {
         // One box per room, indexed by room number: every cell of a room
         // carries the room's box.
         //
@@ -151,18 +164,19 @@ impl ProbeLevel {
                 rooms[d.volume as usize] = (d.min, d.max);
             }
         }
-        let mut fields: Vec<ProxyField> = Vec::new();
-        let mut field_of: std::collections::HashMap<(String, [u32; 3]), Option<u32>> = std::collections::HashMap::new();
-        let mut out = Vec::new();
-        for p in space_soup_engine::reflection_proxy::reflection_proxies(game_dir, objects, &rooms) {
-            let mesh = if p.solid { None } else { objects.get(p.object).and_then(|o| o.mesh.as_ref()) };
-            let field = mesh.and_then(|mesh| {
-                let key = (mesh.path.clone(), mesh.scale.to_array().map(f32::to_bits));
-                *field_of.entry(key).or_insert_with(|| {
-                    if fields.len() >= space_soup::renderer::proxy_field::MAX_PROXY_FIELDS {
-                        log::warn!("reflection proxies: more than {} models; '{}' is traced by its bounds", fields.len(), mesh.path);
-                        return None;
-                    }
+        let standing = space_soup_engine::reflection_proxy::reflection_proxies(game_dir, objects, &rooms);
+        // WHICH MODELS ARE TRACED BY THEIR OWN SHAPE: the baker's rule, so
+        // the models it left out of the photographs are exactly the ones
+        // given a field here. See `shaped_models`.
+        let shaped = space_soup_engine::reflection_proxy::shaped_models(&standing, objects);
+        let loaded_cards = space_soup_engine::reflection_cards::load_scene_cards(game_dir, scene);
+        let mut out = ReflectionProxies::default();
+        let mut field_of: Vec<Option<Option<u32>>> = vec![None; space_soup_engine::reflection_proxy::MAX_SHAPED_MODELS];
+        for (p, shape) in standing.iter().zip(&shaped) {
+            let object = objects.get(p.object);
+            let mesh = if p.solid { None } else { object.and_then(|o| o.mesh.as_ref()) };
+            let field = match (mesh, shape) {
+                (Some(mesh), Some(k)) => *field_of[*k as usize].get_or_insert_with(|| {
                     let started = std::time::Instant::now();
                     let f = space_soup_engine::reflection_proxy::model_field(
                         &game_dir.join(&mesh.path),
@@ -176,38 +190,56 @@ impl ProbeLevel {
                         f.max_distance * 1000.0,
                         started.elapsed().as_millis(),
                     );
-                    // Its mean colour, for what no photograph saw of it. See
+                    // Its mean colour, for what its cards do not show. See
                     // `probe_model_colour` in the renderer's lights block.
                     let albedo = space_soup_engine::mesh_lightmap::model_albedo(&game_dir.join(&mesh.path))
                         .map_or([0.2; 3], |a| a.to_array());
-                    fields.push(ProxyField { dims: f.dims, max_distance: f.max_distance, distances: f.distances, albedo });
-                    Some(fields.len() as u32 - 1)
-                })
-            });
-            out.push(ProbeProxy {
+                    out.fields.push(ProxyField { dims: f.dims, max_distance: f.max_distance, distances: f.distances, albedo });
+                    Some(out.fields.len() as u32 - 1)
+                }),
+                (Some(mesh), None) => {
+                    log::warn!(
+                        "reflection proxies: more than {} models; '{}' is traced by its bounds",
+                        space_soup_engine::reflection_proxy::MAX_SHAPED_MODELS,
+                        mesh.path,
+                    );
+                    None
+                }
+                (None, _) => None,
+            };
+            // ITS CARDS, where the bake pictured it. See `proxy_cards`.
+            let cards = match (mesh, object) {
+                (Some(_), Some(o)) => loaded_cards.iter().find(|c| c.object_id == o.id).map(|c| {
+                    out.cards.push(ProxyCards { resolution: c.resolution, texels: c.texels.clone() });
+                    out.cards.len() as u32 - 1
+                }),
+                _ => None,
+            };
+            out.proxies.push(ProbeProxy {
                 centre: p.centre,
                 half_size: p.half_size,
                 rotation: p.rotation,
                 volume: p.room as u32,
                 solid: p.solid,
                 field,
+                cards,
             });
         }
-        (out, fields)
+        out
     }
 
     /// [`ProbeLevel::proxies`] for the scene file itself, its transforms
     /// resolved to world space. Empty when the scene does not load.
-    pub fn scene_proxies(&self, game_dir: &Path, scene: &str) -> (Vec<ProbeProxy>, Vec<ProxyField>) {
+    pub fn scene_proxies(&self, game_dir: &Path, scene: &str) -> ReflectionProxies {
         let path = space_soup_engine::Manifest::scene_path(game_dir, scene);
         match space_soup_engine::scene::Scene::load(&path) {
             Ok(mut s) => {
                 s.resolve_world_transforms();
-                self.proxies(game_dir, &s.objects)
+                self.proxies(game_dir, scene, &s.objects)
             }
             Err(e) => {
                 log::warn!("reflection proxies: {} did not load: {e:#}", path.display());
-                (Vec::new(), Vec::new())
+                ReflectionProxies::default()
             }
         }
     }
@@ -264,7 +296,7 @@ mod tests {
             eprintln!("skipping: no test_room probes");
             return;
         };
-        let (proxies, fields) = level.scene_proxies(&game, "test_room");
+        let ReflectionProxies { proxies, fields, cards } = level.scene_proxies(&game, "test_room");
         for p in &proxies {
             eprintln!("proxy room {} centre {:?} half {:?}", p.volume, p.centre, p.half_size);
             assert!(p.half_size.max_element() < 2.0, "a room's shell became a proxy: {p:?}");
@@ -293,6 +325,24 @@ mod tests {
         for f in &fields {
             assert_eq!(f.distances.len() as u32, f.dims.iter().product::<u32>());
         }
+        // A bake with cards pictures every fixture on its own, and a proxy
+        // names its own cards; the pillar has none.
+        if !cards.is_empty() {
+            assert!(pillar.cards.is_none(), "the pillar is in the photographs: {pillar:?}");
+            assert!(models.iter().all(|p| p.cards.is_some()), "a fixture without cards: {models:?}");
+            assert_eq!(cards.len(), 5, "one set of cards a placed fixture");
+        }
+    }
+
+    /// The engine numbers the models the baker leaves out of the photographs;
+    /// the renderer holds a field for each. The two budgets are one number.
+    #[test]
+    fn the_shaped_model_budget_is_the_renderers_field_budget() {
+        assert_eq!(
+            space_soup_engine::reflection_proxy::MAX_SHAPED_MODELS,
+            space_soup::renderer::proxy_field::MAX_PROXY_FIELDS,
+        );
+        assert_eq!(space_soup_engine::reflection_cards::CARD_FACES, space_soup::renderer::proxy_cards::CARD_FACES);
     }
 }
 
