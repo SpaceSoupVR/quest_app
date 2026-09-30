@@ -415,7 +415,8 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             let fixups = space_soup::renderer::probe_fixup::ProbeFixups::new(&device, &uniforms.layout, target.width * target.height);
             let pipeline = BrushPipeline::new_probe_pass_deferred(&device, &uniforms.layout, &fixups);
             let target_bg = fixups.target_bind_group(&device, &target);
-            (pipeline, target, Some((fixups, target_bg)))
+            let pass_bg = fixups.pass_bind_group_for(&device, &target);
+            (pipeline, target, Some((fixups, (target_bg, pass_bg))))
         }
     });
 
@@ -527,14 +528,14 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         pass.set_bind_group(0, &uniforms.bind_group, &[]);
         pass.set_bind_group(1, &materials.bind_group, &[]);
         pass.set_bind_group(2, &lightmap.bind_group, &[]);
-        if let Some((fixups, _)) = fixups {
-            pass.set_bind_group(3, fixups.pass_bind_group(), &[]);
+        if let Some((_, (_, pass_bg))) = fixups {
+            pass.set_bind_group(3, pass_bg, &[]);
         }
         pass.set_vertex_buffer(0, vb.slice(..));
         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
         drop(pass);
-        if let Some((fixups, target_bg)) = fixups {
+        if let Some((fixups, (target_bg, _))) = fixups {
             fixups.dispatch(&mut encoder, &uniforms.bind_group, target_bg);
         }
     }
