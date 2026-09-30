@@ -197,13 +197,17 @@ pub(crate) fn sources<'a>(
             let f = fixtures.get(&l.id)?;
             let direction = Vec3::from(l.direction);
             let c = space_soup::renderer::Color3(l.color.0, l.color.1, l.color.2, l.color.3).to_linear();
+            // A SPOT'S BEAM decides only where its cards do not: the cards saw
+            // where its bulb shows, which is wider than where its light goes --
+            // the hanging lamps' bulbs are in plain view from well outside
+            // their beams.
             let cone = match l.kind {
-                WireLightKind::Spot => Some((
+                WireLightKind::Spot if f.frame.is_none() => Some((
                     yaw_inv * direction.normalize_or_zero(),
                     (l.cone_angle_deg.to_radians() * 0.5).cos(),
                     (l.inner_cone_angle_deg.to_radians() * 0.5).cos(),
                 )),
-                WireLightKind::Point => None,
+                WireLightKind::Spot | WireLightKind::Point => None,
                 WireLightKind::Directional => return None,
             };
             Some(GlareSource {
@@ -313,24 +317,29 @@ mod tests {
         let (axis, outer, inner) = s[0].cone.expect("a spot's beam");
         assert!((axis - Vec3::NEG_Y).length() < 1e-5 && (outer - 30f32.to_radians().cos()).abs() < 1e-5);
         assert!((inner - 10f32.to_radians().cos()).abs() < 1e-5);
+        // Measured by its cards, the bulb shows wherever they saw it, beam or
+        // no beam.
+        fixtures.insert("lamp#0".to_string(), FixtureGlare { sides: [1.0; 6], frame: Some(Quat::IDENTITY) });
+        let measured = sources([&spot], &fixtures, Vec3::new(1.0, 0.0, 0.0), yaw_inv);
+        assert_eq!(measured[0].cone, None);
     }
 
-    /// THE LEVEL'S OWN: the sconces' cards carry their bulbs, which show from
-    /// below and not from above; the hanging lamps', whose bulbs glow by a
-    /// texture, do not, and their lights' faces decide.
+    /// THE LEVEL'S OWN: every fixture's cards carry its bulb -- the sconces'
+    /// glowing whole, the hanging lamps' placed by their emissive texture --
+    /// and each shows from below and not from above.
     #[test]
-    fn test_rooms_sconces_glare_from_below_by_their_cards() {
+    fn test_rooms_lamps_glare_from_below_by_their_cards() {
         let game = Path::new(env!("CARGO_MANIFEST_DIR")).join("../game");
         let Some(level) = crate::probe_level::ProbeLevel::load(&game, "test_room") else {
             eprintln!("test_room probes not baked; skipping");
             return;
         };
         let standing = level.scene_proxies(&game, "test_room");
-        let south = standing.glare.get("hallway_sconce_south").expect("the south sconce's cards carry its bulb");
-        let (sides, _) = south;
-        eprintln!("south sconce sides {sides:?}");
-        assert!(sides[3] > 0.2, "from below: {sides:?}");
-        assert!(sides[2] < 0.25 * sides[3], "from above, far less: {sides:?}");
-        assert!(!standing.glare.contains_key("hall_spot_1"), "the hanging lamp's glow is a texture, not on its cards");
+        for lamp in ["hallway_sconce_south", "hallway_sconce_north", "hall_spot_1", "hall_spot_2", "brick_lamp"] {
+            let (sides, _) = standing.glare.get(lamp).unwrap_or_else(|| panic!("{lamp}'s cards carry its bulb"));
+            eprintln!("{lamp} sides {sides:?}");
+            assert!(sides[3] > 0.1, "{lamp} from below: {sides:?}");
+            assert!(sides[2] < 0.25 * sides[3], "{lamp} from above, far less: {sides:?}");
+        }
     }
 }
