@@ -43,10 +43,12 @@ import os
 import re
 import statistics
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import zlib
 from pathlib import Path
 
 QUEST_SERIAL = "2G0YC5ZG7706YV"
@@ -70,6 +72,9 @@ GPU_LEVEL_PROP = "debug.oculus.gpuLevel"
 GUARDIAN_PAUSE_PROP = "debug.oculus.guardian_pause"
 # Where the system's screenshot service (MetaCam) writes.
 SCREENSHOT_DIR = "/sdcard/Oculus/Screenshots"
+# Lets the renderer copy its eye images out (`Levers::eye_capture`); read when
+# the app starts, so setting it means a restart.
+EYE_CAPTURE_PROP = "debug.spacesoup.eyecapture"
 
 
 class BenchError(Exception):
@@ -464,6 +469,57 @@ def screenshot(dev: Device, dest_stem: Path, timeout: float = 20.0, poll: float 
     return None
 
 
+def eye_capture(dev: Device, levers: dict, n: int, dest_stem: Path, timeout: float = 30.0,
+                poll: float = 1.0) -> list | None:
+    """Both eyes' finished images of one frame, from the renderer itself
+    (`Levers::eye_capture`): the system's screenshot is ONE view, and a
+    difference between the eyes shows no other way. Written beside
+    `dest_stem` as `<name>_eye_left.png` and `_eye_right.png`; their names, or
+    `None` when nothing came back."""
+    remote = "%s/eyecapture_%d.bin" % (FILES, n)
+    dev.shell("rm -f " + remote, check=False)
+    write_levers(dev, dict(levers, eye_capture=n))
+    deadline = time.monotonic() + timeout
+    size = None
+    while time.monotonic() < deadline:
+        time.sleep(poll)
+        now = dev.shell("stat -c %%s %s" % remote, check=False).strip()
+        if now.isdigit() and now == size:
+            break
+        size = now if now.isdigit() else None
+    else:
+        return None
+    local = dest_stem.parent / (dest_stem.name + "_eyes.bin")
+    dev.run("pull", remote, str(local))
+    dev.shell("rm -f " + remote, check=False)
+    names = write_eye_pngs(local.read_bytes(), dest_stem)
+    local.unlink()
+    return names
+
+
+def write_eye_pngs(data: bytes, dest_stem: Path) -> list:
+    """A capture (`EYES`, width, height as little-endian u32s, then each eye's
+    RGBA rows) as two PNGs, left then right; their names."""
+    if data[:4] != b"EYES":
+        raise BenchError("not an eye capture")
+    width, height = struct.unpack("<II", data[4:12])
+    eye_bytes = width * height * 4
+    if len(data) != 12 + 2 * eye_bytes:
+        raise BenchError("an eye capture of %dx%d should be %d bytes, not %d" % (width, height, 12 + 2 * eye_bytes, len(data)))
+    names = []
+    for i, side in enumerate(("left", "right")):
+        rgba = data[12 + i * eye_bytes:12 + (i + 1) * eye_bytes]
+        rows = b"".join(b"\x00" + rgba[y * width * 4:(y + 1) * width * 4] for y in range(height))
+        def chunk(kind: bytes, body: bytes) -> bytes:
+            return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
+        png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+               + chunk(b"IDAT", zlib.compress(rows, 6)) + chunk(b"IEND", b""))
+        path = dest_stem.parent / ("%s_eye_%s.png" % (dest_stem.name, side))
+        path.write_bytes(png)
+        names.append(path.name)
+    return names
+
+
 def median(values: list) -> float | None:
     values = [v for v in values if v is not None]
     return statistics.median(values) if values else None
@@ -565,6 +621,8 @@ def render_report(run: dict, views: dict, compare: dict | None) -> str:
             lines.append("")
         if v.get("screenshot"):
             lines.append("![%s](%s)" % (name, v["screenshot"]))
+        for eye in v.get("eyes") or []:
+            lines.append("![%s](%s)" % (eye, eye))
             lines.append("")
         lines.append("| phase | GPU ms | cost ms | spread | app GPU ms | frame ms | fps | CPU ms |")
         lines.append("|---|---|---|---|---|---|---|---|")
@@ -650,6 +708,9 @@ def main(argv: list | None = None) -> int:
     ap.add_argument("--no-lock", action="store_true", help="leave the clock levels to the governor")
     ap.add_argument("--no-profile", action="store_true", help="skip the GPU counters (ovrgpuprofiler)")
     ap.add_argument("--no-screenshots", action="store_true", help="skip the screenshot from each view")
+    ap.add_argument("--eye-capture", action="store_true",
+                    help="also both eyes' finished images at each view, from the renderer itself (restarts the app "
+                         "with debug.spacesoup.eyecapture set, and afterwards without it)")
     ap.add_argument("--profile-seconds", type=int, default=10, help="how long to read the GPU counters a view (default 10)")
     ap.add_argument("--trace", type=int, metavar="SECONDS",
                     help="capture a render-stage trace this long at each view (ovrgpuprofiler -t): each pass's "
@@ -758,6 +819,17 @@ def main(argv: list | None = None) -> int:
             dev.shell("ovrgpuprofiler -e " + PACKAGE)
             changed.append(("leave detailed profiling mode", lambda: dev.shell("ovrgpuprofiler -d")))
             dev.shell("am force-stop " + PACKAGE)
+        if args.eye_capture:
+            # The swapchain is made copyable only when the app STARTS with the
+            # property set, so it is restarted with it -- and, once the
+            # property is put back, stopped, so the next run is not measured
+            # with a copyable swapchain. (Undone newest first.)
+            changed.append(("stop the app started for eye captures", lambda: dev.shell("am force-stop " + PACKAGE)))
+            before = dev.shell("getprop " + EYE_CAPTURE_PROP).strip()
+            dev.shell("setprop %s 1" % EYE_CAPTURE_PROP)
+            changed.append(("restore %s to %r" % (EYE_CAPTURE_PROP, before),
+                            lambda before=before: dev.shell("setprop %s '%s'" % (EYE_CAPTURE_PROP, before))))
+            dev.shell("am force-stop " + PACKAGE)
         dev.shell("rm -f " + PERF)
         # Brought to the front whether or not it is running: a process in the
         # background renders nothing. `am start` resumes a running one rather
@@ -797,6 +869,12 @@ def main(argv: list | None = None) -> int:
                 shot = screenshot(dev, out / name)
                 if shot is None:
                     warnings.append("no screenshot came back for %s" % name)
+            eyes = None
+            if args.eye_capture:
+                eyes = eye_capture(dev, levers_for(view, False, extra), len(collected) + 1, out / name)
+                write_levers(dev, levers_for(view, False, extra))
+                if eyes is None:
+                    warnings.append("no eye capture came back for %s (is the app built with it?)" % name)
             counters: dict = {}
             if counter_ids:
                 counters, raw = profile(dev, counter_ids, args.profile_seconds)
@@ -834,7 +912,7 @@ def main(argv: list | None = None) -> int:
                 vrapi = summarize_vrapi(f.read().decode(errors="replace"))
             collected[name] = {"phases": summarize_view(records), "vrapi": vrapi, "gpu_counters": counters,
                                "trace": passes, "draws": draws, "records": len(records),
-                               "screenshot": shot.name if shot else None}
+                               "screenshot": shot.name if shot else None, "eyes": eyes}
     except BenchError as e:
         failure = str(e)
     except KeyboardInterrupt:

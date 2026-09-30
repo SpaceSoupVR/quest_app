@@ -383,6 +383,27 @@ class BenchScript(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertEqual([c for c in self.calls() if c[:1] == ["-s"]], [])
 
+    def test_an_eye_capture_becomes_two_pngs(self):
+        # Two 2 x 1 eyes: left red then green, right blue then white.
+        sys.path.insert(0, str(HERE))
+        import bench
+        import zlib
+        data = b"EYES" + (2).to_bytes(4, "little") + (1).to_bytes(4, "little")
+        data += bytes([255, 0, 0, 255, 0, 255, 0, 255]) + bytes([0, 0, 255, 255, 255, 255, 255, 255])
+        with tempfile.TemporaryDirectory() as d:
+            names = bench.write_eye_pngs(data, Path(d) / "view")
+            self.assertEqual(names, ["view_eye_left.png", "view_eye_right.png"])
+            for name, pixels in zip(names, (bytes([255, 0, 0, 255, 0, 255, 0, 255]), bytes([0, 0, 255, 255, 255, 255, 255, 255]))):
+                png = (Path(d) / name).read_bytes()
+                self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+                width, height = int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big")
+                self.assertEqual((width, height), (2, 1))
+                idat = png.index(b"IDAT")
+                length = int.from_bytes(png[idat - 4:idat], "big")
+                self.assertEqual(zlib.decompress(png[idat + 4:idat + 4 + length]), b"\x00" + pixels)
+        with self.assertRaises(bench.BenchError):
+            bench.write_eye_pngs(data[:-1], Path("/nonexistent/view"))
+
     def test_the_lever_file_is_what_the_renderer_parses(self):
         p = subprocess.run([sys.executable, str(HERE / "bench.py"), "--print-levers", "hall_back", "--ab"],
                            capture_output=True, text=True)
