@@ -27,7 +27,7 @@ pub struct ReflectionProxies {
     /// Which sides each lamp's bright source shows from, measured from its
     /// cards, by object id with the frame they were taken in. See
     /// `glare_fixtures`.
-    pub glare: std::collections::HashMap<String, ([f32; 6], glam::Quat)>,
+    pub glare: std::collections::HashMap<String, crate::glare_fixtures::MeasuredGlare>,
 }
 
 pub struct ProbeLevel {
@@ -215,7 +215,7 @@ impl ProbeLevel {
             // ITS CARDS, where the bake pictured it. See `proxy_cards`.
             let cards = match (mesh, object) {
                 (Some(_), Some(o)) => loaded_cards.iter().find(|c| c.object_id == o.id).map(|c| {
-                    pictured.push((p.object, c, p.half_size, p.rotation));
+                    pictured.push((p.object, c, p.centre, p.half_size, p.rotation));
                     out.cards.push(ProxyCards { resolution: c.resolution, texels: c.texels.clone(), normals: c.normals.clone() });
                     out.cards.len() as u32 - 1
                 }),
