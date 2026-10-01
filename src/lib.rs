@@ -1073,7 +1073,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             offset,
             yaw_inv,
         ));
-        let (cuboids, lights, mesh_instances, mirror_only_mesh_instances, mirror_surface) =
+        let (cuboids, lights, mut mesh_instances, mirror_only_mesh_instances, mirror_surface) =
             render_prep::build_render_lists(
                 cuboids_src,
                 lights_src,
@@ -1108,6 +1108,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 l
             })
             .collect();
+        // A spot fixture's bulb lights its own housing outside the beam: see
+        // `render_prep::attach_own_lights`.
+        render_prep::attach_own_lights(&mut mesh_instances, lights_src, &lights);
 
         let sounds_src = world.as_ref().map(|w| w.sounds.as_slice()).unwrap_or(&[]);
         let occlusion: HashMap<String, f32> = sounds_src

@@ -14,6 +14,19 @@ use space_soup_protocol::{
 };
 
 use crate::convert::{to_space_soup_cuboid, to_space_soup_light};
+
+/// Each fixture's own lamp, from this frame's lights (see
+/// `MeshInstance::own_light`): `lights[i]` is `lights_src[i]` converted --
+/// mask channel included -- whose id is `<object>#<index>`, and a static
+/// mesh's `lightmap_key` is its object's id. Only a stationary spot: a point
+/// lamp's light loop already lights its own housing every way, and a lamp
+/// without a mask has nothing to shadow the fill with.
+pub(crate) fn attach_own_lights(instances: &mut [MeshInstance], lights_src: &[WireRenderLight], lights: &[Light]) {
+    for inst in instances.iter_mut() {
+        inst.own_light = inst.lightmap_key.and_then(|object| crate::scene_lights::own_light_of(object, lights_src, lights));
+    }
+}
+
 use crate::grab_detect::StaticScene;
 use crate::part_pull::PullSession;
 use space_soup::renderer::mesh::ClipBlendMode;
@@ -216,6 +229,7 @@ pub(crate) fn build_render_lists<'a>(
                     model,
                     lightmap_key: Some(rm.id.as_str()),
                     emissive_drive: rm.emissive_drive,
+                    own_light: None,
                 });
             }
             let (mesh, model) = mesh_cache.get(&rm.id)?;
@@ -224,6 +238,7 @@ pub(crate) fn build_render_lists<'a>(
                 model,
                 lightmap_key: Some(rm.id.as_str()),
                 emissive_drive: rm.emissive_drive,
+                own_light: None,
             })
         })
         .chain(
@@ -236,6 +251,7 @@ pub(crate) fn build_render_lists<'a>(
                     lightmap_key: None,
                     // An avatar is not a fixture.
                     emissive_drive: 0.0,
+                    own_light: None,
                 }),
         )
         .chain(
@@ -246,6 +262,7 @@ pub(crate) fn build_render_lists<'a>(
                     model,
                     lightmap_key: None,
                     emissive_drive: 0.0,
+                    own_light: None,
                 }),
         )
         .collect();
@@ -257,6 +274,7 @@ pub(crate) fn build_render_lists<'a>(
             model,
             lightmap_key: None,
             emissive_drive: 0.0,
+            own_light: None,
         })
         .into_iter()
         .collect();
