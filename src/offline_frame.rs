@@ -646,13 +646,16 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         let word = |o: usize| u32::from_le_bytes(data[o..o + 4].try_into().unwrap());
         let capacity = ((data.len() - 16) / 128) as u32;
         let n = word(0).min(capacity) as usize;
-        let (mut subsample, mut edge, mut rim, mut mirror) = (0usize, 0usize, 0usize, 0usize);
+        let (mut subsample, mut retest, mut edge, mut rim, mut mirror) = (0usize, 0usize, 0usize, 0usize, 0usize);
         for k in 0..n {
             let b = 16 + k * 128;
             let f = |i: usize| f32::from_bits(word(b + 96 + i * 4));
             let (rim_at, edge_cover) = (f(0), f(2));
             let edge_code = word(b + 116) as i32;
-            if edge_code >= 0 && edge_cover < 0.0 {
+            // `PROBE_RETEST` (-4 less the cover) or `PROBE_SUBSAMPLE` (-cover).
+            if edge_code >= 0 && edge_cover < -2.0 {
+                retest += 1;
+            } else if edge_code >= 0 && edge_cover < 0.0 {
                 subsample += 1;
             } else if edge_code >= 0 && edge_cover < 0.99 {
                 edge += 1;
@@ -662,7 +665,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         }
         let texels = (tw * th).max(1) as f32;
         eprintln!(
-            "fixups: {n} records ({:.2}% of the {tw}x{th} pass): outline subsamples {subsample}, edges {edge}, rims {rim}, floor mirror {mirror}",
+            "fixups: {n} records ({:.2}% of the {tw}x{th} pass): outline subsamples {subsample}, card retests {retest}, edges {edge}, rims {rim}, floor mirror {mirror}",
             100.0 * n as f32 / texels
         );
     }
@@ -1359,6 +1362,105 @@ mod aliasing {
         assert_eq!((small.width, small.height), (1, 1));
         assert!((luma[0] - 187.5).abs() < 0.5, "{}", luma[0]);
         assert_eq!(small.px(0, 0)[0], 188);
+    }
+
+    /// SHIMMER UNDER A HEAD MOVE (2026-10-01): `VIEW` (or `FAR`) rendered
+    /// with the head moved right `STEP_MM` (default 1) at a time, `STEPS`
+    /// (default 8) times -- `bench.py`'s `-mQ` views, offline. A steady
+    /// picture slides nearly linearly over a millimetre, so per pixel the RMS
+    /// of the series' second difference (display levels, 0-255) is what
+    /// changes incoherently: on the headset, the bright bits of the lamps'
+    /// reflections in the polished walls. `REGION=x0,y0,x1,y1` scores one area
+    /// alone; `NO_CARDS=1` etc. as for `render_brushes`. Writes
+    /// $OUT/move_$TAG.png, the score over the first frame.
+    #[test]
+    #[ignore]
+    fn measure_the_move_shimmer() {
+        let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
+        let tag = std::env::var("TAG").unwrap_or_else(|_| "current".into());
+        let num = |k: &str| std::env::var(k).ok().and_then(|x| x.parse::<f32>().ok());
+        let (eye, at) = match (std::env::var("VIEW"), std::env::var("FAR")) {
+            (Ok(name), _) => {
+                let views = super::bench_views::bench_views();
+                let v = views.iter().find(|v| v.0 == name).unwrap_or_else(|| panic!("no bench view {name}"));
+                (v.1, v.2)
+            }
+            (_, Ok(s)) => {
+                let n: Vec<f32> = s.split(',').map(|x| x.trim().parse().unwrap()).collect();
+                (Vec3::new(n[0], n[1], n[2]), Vec3::new(n[3], n[4], n[5]))
+            }
+            _ => panic!("set VIEW=<bench view> or FAR=ex,ey,ez,ax,ay,az"),
+        };
+        let steps = num("STEPS").map_or(8, |x| x as usize).max(3);
+        let step = num("STEP_MM").unwrap_or(1.0) / 1000.0;
+        let f = (at - eye).normalize();
+        let right = Vec3::new(-f.z, 0.0, f.x).normalize();
+        let base = View {
+            adapt: true,
+            half_res_reflections: std::env::var("FULL_RES").as_deref() != Ok("1"),
+            cut: std::env::var("CUT").ok().map(|c| &*Box::leak(c.into_boxed_str())),
+            ..View::headset(eye, at)
+        };
+        let (w, h) = (base.width, base.height);
+        let mut frames = Vec::new();
+        let mut first = None;
+        for k in 0..steps {
+            let d = right * (k as f32 * step);
+            let Some(frame) = render_brushes("test_room", View { eye: eye + d, at: at + d, ..base }) else {
+                eprintln!("skipping: no GPU or no test_room");
+                return;
+            };
+            frames.push(downsampled(&frame, 1).0);
+            if std::env::var("SAVE_FRAMES").as_deref() == Ok("1") {
+                frame.save(&out.join(format!("move_{tag}_{k}.png")));
+            }
+            first.get_or_insert(frame);
+        }
+        let n = (steps - 2) as f32;
+        let score: Vec<f32> = (0..frames[0].len())
+            .map(|p| {
+                let s: f32 = (1..steps - 1).map(|k| (frames[k + 1][p] - 2.0 * frames[k][p] + frames[k - 1][p]).powi(2)).sum();
+                (s / n).sqrt()
+            })
+            .collect();
+        let stats = |x0: u32, y0: u32, x1: u32, y1: u32| {
+            let (mut sum, mut over8, mut count) = (0.0f64, 0usize, 0usize);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let v = score[(y * w + x) as usize];
+                    sum += v as f64;
+                    over8 += (v > 8.0) as usize;
+                    count += 1;
+                }
+            }
+            (sum / count.max(1) as f64, 100.0 * over8 as f64 / count.max(1) as f64)
+        };
+        let (a, o8) = stats(0, 0, w, h);
+        eprintln!("{tag}: move shimmer {a:.3} levels (pixels over 8: {o8:.3}%), {steps} steps of {:.1} mm", step * 1000.0);
+        if let Some(region) = std::env::var("REGION").ok() {
+            let c: Vec<u32> = region.split(',').map(|x| x.trim().parse().unwrap()).collect();
+            let (a, o8) = stats(c[0], c[1], c[2].min(w), c[3].min(h));
+            eprintln!("{tag} region {region}: move shimmer {a:.3} (over 8: {o8:.2}%)");
+        }
+        let tile = 32;
+        let mut tiles: Vec<(f64, u32, u32)> = Vec::new();
+        for ty in 0..h / tile {
+            for tx in 0..w / tile {
+                tiles.push((stats(tx * tile, ty * tile, (tx + 1) * tile, (ty + 1) * tile).0, tx * tile, ty * tile));
+            }
+        }
+        tiles.sort_by(|p, q| q.0.total_cmp(&p.0));
+        for (a, x, y) in tiles.iter().take(10) {
+            eprintln!("  tile {x},{y}..{},{}: move shimmer {a:.2}", x + tile, y + tile);
+        }
+        let mut heat = Vec::with_capacity((w * h * 4) as usize);
+        for p in 0..(w * h) as usize {
+            let dim = (frames[0][p] * 0.3) as u8;
+            let hot = (score[p] * 16.0).min(255.0) as u8;
+            heat.extend([dim.saturating_add(hot), dim, dim, 255]);
+        }
+        Shot { width: w, height: h, rgba: heat }.save(&out.join(format!("move_{tag}.png")));
+        first.unwrap().save(&out.join(format!("move_{tag}_frame.png")));
     }
 
     /// `VIEW=<bench view>` or `FAR=ex,ey,ez,ax,ay,az`; `K` (default 3) and

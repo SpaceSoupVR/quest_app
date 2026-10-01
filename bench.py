@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import math
 import os
 import re
 import statistics
@@ -136,11 +137,43 @@ def load_views(names: str | None) -> list:
         return views
     picked = []
     for name in [n.strip() for n in names.split(",") if n.strip()]:
-        if name not in by_name:
-            raise BenchError("no view %r; bench_views.json has: %s" % (name, ", ".join(by_name)))
+        view = None
+        for sep, derive in (("-t", lambda v, q: turned_view(v, q / 100.0, name)),
+                            ("-m", lambda v, q: moved_view(v, q / 10000.0, name)),
+                            ("-y", lambda v, q: snap_turned_view(v, q, name))):
+            base, found, q = name.rpartition(sep)
+            if found and q.isdigit() and base in by_name:
+                view = derive(by_name[base], int(q))
+                break
+        if view is None:
+            if name not in by_name:
+                raise BenchError("no view %r; bench_views.json has: %s" % (name, ", ".join(by_name)))
+            view = by_name[name]
         if name not in [v["name"] for v in picked]:
-            picked.append(by_name[name])
+            picked.append(view)
     return picked
+
+
+# One eye pixel of the left eye's image across its middle, in radians: the
+# frustum's tangents left and right (1.376 + 0.839) over its 1176 pixels.
+EYE_PIXEL_RAD = (1.376 + 0.839) / 1176
+
+
+def turned_view(view: dict, pixels: float, name: str) -> dict:
+    """`view` turned right by `pixels` eye pixels about its eye -- `NAME-tQ`,
+    Q in hundredths of a pixel (`hall_back-t25`; the app takes only letters,
+    digits, '_' and '-' in a view's name):
+    the same picture a fraction of a pixel over, to measure losslessly with
+    --eye-capture whether small bright things hold their size and light as
+    the head turns -- shimmer, without a video encoder in the way."""
+    eye, at = view["eye"], view["at"]
+    dx, dz = at[0] - eye[0], at[2] - eye[2]
+    # Turned about +y by `a`: (x, z) -> (c x - s z, s x + c z). Facing +z,
+    # right is -x, so a positive angle turns right.
+    a = pixels * EYE_PIXEL_RAD
+    c, s = math.cos(a), math.sin(a)
+    turned = [eye[0] + c * dx - s * dz, at[1], eye[2] + s * dx + c * dz]
+    return dict(view, name=name, at=turned, note="%s, turned %g eye pixels right" % (view["name"], pixels))
 
 
 # What every bench view measures unless `--levers` says otherwise: the native
@@ -149,6 +182,29 @@ def load_views(names: str | None) -> list:
 # exists to hold; multiview is pinned because the app keeps whatever the last
 # toggle left it at.
 MEASURED = {"space_warp": False, "multiview": False}
+
+
+
+def moved_view(view: dict, metres: float, name: str) -> dict:
+    """`view` with the head moved `metres` to the right, still looking the
+    same way -- `NAME-mQ`, Q in tenths of a millimetre (`hall_back-m20` is 2
+    mm). A turn changes no surface's view of its reflection; a move does: the
+    measure of reflections and highlights sliding as the head moves."""
+    eye, at = view["eye"], view["at"]
+    f = [at[i] - eye[i] for i in range(3)]
+    r = [-f[2], 0.0, f[0]]  # forward x up, up = +y
+    n = math.hypot(r[0], r[2]) or 1.0
+    d = [r[0] / n * metres, 0.0, r[2] / n * metres]
+    return dict(view, name=name, eye=[eye[i] + d[i] for i in range(3)], at=[at[i] + d[i] for i in range(3)],
+                note="%s, moved %g mm right" % (view["name"], metres * 1000.0))
+
+def snap_turned_view(view: dict, degrees: int, name: str) -> dict:
+    """The same eyes looking the same way, with the rig turned `degrees` (0-359)
+    as snap or smooth turning leaves it and the head turned back by the rest --
+    `NAME-yQ`. Every picture must match the unturned one: a difference is
+    something still kept in the player's frame instead of the world's."""
+    return dict(view, name=name, rig_yaw=float(degrees),
+                note="%s, rig turned %d degrees" % (view["name"], degrees))
 
 
 def levers_for(view: dict, ab: bool, extra: dict, synced: bool = False) -> dict:
@@ -179,13 +235,27 @@ def record_kind(r: dict) -> str:
     return "synced" if "gpu_sync" in (r.get("levers") or "") else "shipped"
 
 
+_last_lever_length = [-1]
+
+
 def write_levers(dev: Device, levers: dict) -> None:
     """Pushed to a temporary name and moved over the lever file, so the app
-    never reads half a file."""
+    never reads half a file.
+
+    The app notices a new file by its modification time and length
+    (`LeverFile::poll`), and `adb push` stamps whole seconds: two files of the
+    same length pushed within a second look like one, and the second view is
+    never picked up -- `back_wall_self-y180` then `-y270` stalled a run
+    (2026-10-01). A file as long as the last one written takes a trailing
+    space, which JSON ignores."""
+    text = json.dumps(levers, separators=(",", ":"))
+    if len(text) == _last_lever_length[0]:
+        text += " "
+    _last_lever_length[0] = len(text)
     fd, tmp = tempfile.mkstemp(suffix=".json")
     try:
         with os.fdopen(fd, "w") as f:
-            f.write(json.dumps(levers, separators=(",", ":")))
+            f.write(text)
         dev.run("push", tmp, LEVERS + ".tmp")
         dev.shell("mv %s.tmp %s" % (LEVERS, LEVERS))
     finally:

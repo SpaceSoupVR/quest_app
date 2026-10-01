@@ -147,6 +147,25 @@ fn load_matching(
     out
 }
 
+/// `object`'s own stationary spot in this frame's lights. See
+/// `render_prep::attach_own_lights`.
+pub(crate) fn own_light_of(
+    object: &str,
+    lights_src: &[space_soup_protocol::WireRenderLight],
+    lights: &[space_soup::renderer::Light],
+) -> Option<space_soup::renderer::Light> {
+    lights_src
+        .iter()
+        .zip(lights)
+        .find(|(src, l)| {
+            l.kind == space_soup::renderer::LightKind::Spot
+                && l.mask_channel.is_some()
+                // `<object>#<index>`: hall_spot_1 must not take hall_spot_10's.
+                && src.id.strip_prefix(object).is_some_and(|rest| rest.starts_with('#'))
+        })
+        .map(|(_, l)| *l)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +263,42 @@ mod tests {
     #[test]
     fn a_missing_scene_is_not_fatal() {
         assert!(load(&game_dir(), "no_such_scene_at_all").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod own_light_tests {
+    use super::*;
+    use glam::{Quat, Vec3};
+    use space_soup::renderer::Light;
+
+    /// test_room's hanging lamps each find their own stationary spot; a
+    /// sconce, whose lamp is a point, finds none; and an id that merely
+    /// begins with a fixture's takes nothing of it.
+    #[test]
+    fn each_hanging_lamp_finds_its_own_spot_and_nothing_else_does() {
+        let game = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game");
+        let src = load(&game, "test_room");
+        if src.is_empty() {
+            eprintln!("skipping: test_room not present");
+            return;
+        }
+        let channels = stationary_channels(&game, "test_room");
+        let lights: Vec<Light> = src
+            .iter()
+            .map(|l| {
+                let mut light = crate::convert::to_space_soup_light(l, Vec3::ZERO, Quat::IDENTITY);
+                light.mask_channel = channels.get(&l.id).copied();
+                light
+            })
+            .collect();
+        for lamp in ["hall_spot_1", "hall_spot_2", "brick_lamp"] {
+            let own = own_light_of(lamp, &src, &lights).unwrap_or_else(|| panic!("{lamp} found no lamp of its own"));
+            let at = src.iter().position(|l| l.id == format!("{lamp}#0")).expect("its lamp in the list");
+            assert_eq!(own.position, lights[at].position, "{lamp} took another lamp");
+            assert!(own.mask_channel.is_some());
+        }
+        assert!(own_light_of("hallway_sconce_south", &src, &lights).is_none(), "a point lamp's housing is lit by its loop");
+        assert!(own_light_of("hall_spot", &src, &lights).is_none(), "a prefix of an id took its lamp");
     }
 }
