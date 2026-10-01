@@ -209,7 +209,9 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             light
         })
         .collect();
-    let sun = space_soup::renderer::lights::sky_sun_light(sky_sun.as_ref(), &lights, yaw_inv.inverse());
+    // World to player, as the frame passes it: the inverse turned the sun
+    // the wrong way, and sunlit walls went dark at 90 degrees (2026-10-01).
+    let sun = space_soup::renderer::lights::sky_sun_light(sky_sun.as_ref(), &lights, yaw_inv);
     lights.extend(sun);
     let lights = space_soup::renderer::lights::rank_for_budget(&lights, space_soup::renderer::lights::MAX_LIGHTS);
     let lights_uniform = LightsUniform::new(&device);
@@ -387,12 +389,10 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         &PostUpload {
             exposure: if view.adapt {
                 let (irr, _) = (irradiance, ());
-                let loaded: Vec<(&[u8], u32, Vec3, Vec3, Vec3)> = owned
-                    .iter()
-                    .zip(&descs)
-                    .map(|(f, d)| (f.as_slice(), resolution, d.centre, d.min, d.max))
-                    .collect();
-                let eye = space_soup::renderer::exposure::EyeAdaptation::from_probes(&loaded, irr);
+                let loaded: Vec<(&[u8], u32, space_soup::renderer::probe_stream::ProbeDesc)> =
+                    owned.iter().zip(&descs).map(|(f, d)| (f.as_slice(), resolution, *d)).collect();
+                let mut eye = space_soup::renderer::exposure::EyeAdaptation::from_probes(&loaded, irr);
+                eye.set_portals(&portals);
                 let m = eye.meter(view.eye, view.at - view.eye);
                 let e = space_soup::renderer::exposure::exposure_for(m);
                 eprintln!("offline frame: metered {m:.4}, exposure x{e:.2}");
@@ -1034,25 +1034,33 @@ mod tests {
     /// bounce direction a lightmap stores was baked in the world and read
     /// against the player's normals: the hallway's rock read 1% darker at 180
     /// degrees on the headset and exactly the same here once fixed. From the
-    /// hall through the hallway door, where rock, marble and both rooms show.
+    /// hall through the hallway door, where rock, marble and both rooms show;
+    /// and outside, at the building's sunlit walls. This harness draws no
+    /// ground: the grass, whose normal map was bent along the player's axes
+    /// (headset `outdoors_front-y90`, 2026-10-01 12:30), is
+    /// `terrain_pipeline`'s `a_normal_maps_bumps_do_not_turn_with_the_player`.
     #[test]
     fn a_view_is_the_same_picture_at_any_turn() {
-        let view = View {
-            width: 192,
-            height: 192,
-            linear: true,
-            ..View::headset(Vec3::new(1.5, 1.6, -3.6), Vec3::new(2.8, 1.75, -2.35))
-        };
-        let Some(still) = render_brushes("test_room", view) else {
-            eprintln!("skipping: no GPU or no test_room");
-            return;
-        };
-        for yaw_deg in [90.0, 180.0, -45.0] {
-            let turned = render_brushes("test_room", View { yaw_deg, ..view }).unwrap();
-            let off: Vec<u8> = still.rgba.iter().zip(&turned.rgba).map(|(a, b)| a.abs_diff(*b)).collect();
-            let share = off.iter().filter(|&&d| d > 2).count() as f32 / off.len() as f32;
-            let mean = off.iter().map(|&d| d as f32).sum::<f32>() / off.len() as f32;
-            assert!(share < 0.001 && mean < 0.05, "turned {yaw_deg} degrees: {:.3}% of channels off by more than 2, mean {mean:.3}", share * 100.0);
+        for (eye, at) in [
+            (Vec3::new(1.5, 1.6, -3.6), Vec3::new(2.8, 1.75, -2.35)),
+            (Vec3::new(0.0, 1.6, 10.0), Vec3::new(0.5, 0.0, 7.0)),
+        ] {
+            let view = View { width: 192, height: 192, linear: true, ..View::headset(eye, at) };
+            let Some(still) = render_brushes("test_room", view) else {
+                eprintln!("skipping: no GPU or no test_room");
+                return;
+            };
+            for yaw_deg in [90.0, 180.0, -45.0] {
+                let turned = render_brushes("test_room", View { yaw_deg, ..view }).unwrap();
+                let off: Vec<u8> = still.rgba.iter().zip(&turned.rgba).map(|(a, b)| a.abs_diff(*b)).collect();
+                let share = off.iter().filter(|&&d| d > 2).count() as f32 / off.len() as f32;
+                let mean = off.iter().map(|&d| d as f32).sum::<f32>() / off.len() as f32;
+                assert!(
+                    share < 0.001 && mean < 0.05,
+                    "from {eye} turned {yaw_deg} degrees: {:.3}% of channels off by more than 2, mean {mean:.3}",
+                    share * 100.0
+                );
+            }
         }
     }
 
@@ -1199,12 +1207,15 @@ mod exposure_calibration {
         let bytes = std::fs::read(game.join("skies").join(&s.id).join("sky.hdr")).ok()?;
         let pano = space_soup::renderer::sky::decode_radiance(&bytes).ok()?;
         let (sky, _) = space_soup::renderer::sky::sky_lighting(&pano, s.rotation_deg, s.intensity);
-        let loaded = space_soup_engine::reflection_probe::load_scene_probes(&game, "test_room");
-        let probes: Vec<(&[u8], u32, Vec3, Vec3, Vec3)> = loaded
-            .iter()
-            .map(|p| (p.faces.as_slice(), p.resolution, Vec3::from(p.centre), Vec3::from(p.min), Vec3::from(p.max)))
-            .collect();
-        Some(EyeAdaptation::from_probes(&probes, sky))
+        let level = crate::probe_level::ProbeLevel::load(&game, "test_room")?;
+        let source = level.source();
+        let faces: Vec<(Vec<u8>, space_soup::renderer::probe_stream::ProbeDesc)> =
+            level.descs.iter().enumerate().filter_map(|(i, d)| Some((source(i)?, *d))).collect();
+        let probes: Vec<(&[u8], u32, space_soup::renderer::probe_stream::ProbeDesc)> =
+            faces.iter().map(|(f, d)| (f.as_slice(), level.resolution, *d)).collect();
+        let mut eye = EyeAdaptation::from_probes(&probes, sky);
+        eye.set_portals(&level.portals);
+        Some(eye)
     }
 
     #[test]
@@ -1219,9 +1230,33 @@ mod exposure_calibration {
             ("hall mid, looking back", Vec3::new(-1.3, 1.6, -6.0), Vec3::new(0.0, 0.0, -1.0)),
             ("hall back, looking front", Vec3::new(-1.3, 1.6, -14.5), Vec3::new(0.1, 0.05, 1.0)),
             ("hall back, looking at wall", Vec3::new(-1.3, 1.6, -14.5), Vec3::new(0.0, 0.0, -1.0)),
+            // The hallway between the hall and the brick hall, and the views
+            // into it from either side.
+            ("hall, looking into hallway", Vec3::new(1.5, 1.6, -3.0), Vec3::new(1.0, 0.0, 0.0)),
+            ("hallway west, looking east", Vec3::new(4.0, 1.6, -3.0), Vec3::new(1.0, 0.0, 0.0)),
+            ("hallway mid, looking east", Vec3::new(6.5, 1.6, -3.0), Vec3::new(1.0, 0.0, 0.0)),
+            ("hallway mid, looking west", Vec3::new(6.5, 1.6, -3.0), Vec3::new(-1.0, 0.0, 0.0)),
+            ("hallway east, looking west", Vec3::new(9.0, 1.6, -3.0), Vec3::new(-1.0, 0.0, 0.0)),
+            ("brick, looking into hallway", Vec3::new(11.5, 1.6, -3.0), Vec3::new(-1.0, 0.0, 0.0)),
+            ("brick mid, looking west", Vec3::new(14.0, 1.6, -2.0), Vec3::new(-1.0, 0.0, 0.0)),
         ] {
             let m = eye.meter(at, look);
             eprintln!("{name:>28}: meter {m:.4}  exposure {:.2}", exposure_for(m));
+        }
+        // Walking into the hallway from either side, looking down it: the
+        // meter should hand over through each doorway without a jump.
+        for (name, from, to, look) in [
+            ("hall -> hallway", Vec3::new(0.5, 1.6, -3.0), Vec3::new(5.0, 1.6, -3.0), Vec3::X),
+            ("brick -> hallway", Vec3::new(13.0, 1.6, -3.0), Vec3::new(8.0, 1.6, -3.0), Vec3::NEG_X),
+        ] {
+            let steps = 18;
+            let line: Vec<String> = (0..=steps)
+                .map(|i| {
+                    let at = from.lerp(to, i as f32 / steps as f32);
+                    format!("{:.2}:{:.2}", at.x, exposure_for(eye.meter(at, look)))
+                })
+                .collect();
+            eprintln!("{name}, x:exposure: {}", line.join(" "));
         }
     }
 

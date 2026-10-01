@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use glam::{Mat3, Quat, Vec3};
-use space_soup::renderer::glare::{GlareSource, GlareTable, GlareTableSplit};
+use space_soup::renderer::glare::{GlareBulbRows, GlareSource, GlareTable, GlareTableSplit};
 use space_soup_engine::reflection_cards::{card_point, LoadedCards, CARD_FACES, GLARE_BRIGHT};
 use space_soup_engine::scene::GameObject;
 use space_soup_engine::scene_light::{GlareFacesDef, LightDef};
@@ -97,6 +97,12 @@ pub(crate) fn glare_table(cards: &LoadedCards, luminance: f32) -> Option<GlareTa
         bulb_centre: s.bulb_centre.clone(),
         lit_centre: s.lit_centre.clone(),
         lit_spread: s.lit_spread.clone(),
+        // The bulb in finer rows, capped as the whole is.
+        bulb_fine: s.bulb_fine.as_ref().map(|f| {
+            let share: Vec<f32> = f.flux.iter().map(|b| of_lamp(b).clamp(0.0, MAX_SIDE)).collect();
+            let whole = share.iter().copied().fold(0.0, f32::max);
+            GlareBulbRows { rows: f.rows, share, centre: f.centre.clone(), whole }
+        }),
     });
     (share.iter().copied().fold(0.0, f32::max) >= CARRIES_GLOW).then(|| GlareTable {
         rows: t.rows,
@@ -502,9 +508,20 @@ mod tests {
                 bulb_centre: vec![Vec3::new(0.0, -0.12, 0.0), Vec3::ZERO, Vec3::X],
                 lit_centre: vec![Vec3::new(0.0, -0.05, 0.0), Vec3::ZERO, Vec3::X],
                 lit_spread: vec![0.03, 0.0, 0.1],
+                bulb_fine: Some(space_soup_engine::reflection_cards::GlareBulbRows {
+                    rows: 2,
+                    flux: vec![0.2 * pi_l, 0.0, 9.5 * pi_l, 0.3 * pi_l, 0.0, 0.0],
+                    centre: vec![Vec3::new(0.0, -0.12, 0.0); 6],
+                }),
             }),
         });
         let t = glare_table(&cards, luminance).expect("it shows");
+        // The bulb's finer rows come over as shares too, capped as a side is,
+        // the most of them its whole.
+        let fine = t.split.as_ref().unwrap().bulb_fine.clone().unwrap();
+        assert_eq!((fine.rows, fine.whole), (2, MAX_SIDE));
+        let s = &fine.share;
+        assert!((s[0] - 0.2).abs() < 1e-6 && s[2] == MAX_SIDE && (s[3] - 0.3).abs() < 1e-6, "{s:?}");
         assert!((t.share[0] - 0.5).abs() < 1e-6 && t.share[1] == 0.0 && t.share[2] == MAX_SIDE, "{:?}", t.share);
         assert_eq!(t.centre[0], Vec3::new(0.0, -0.1, 0.0));
         let split = t.split.as_ref().expect("the split carried over");
@@ -556,6 +573,54 @@ mod tests {
         }
     }
 
+    /// THE HANGING LAMPS' BULBS COME OUT FROM UNDER THEIR RIMS AS SLIVERS: going
+    /// down from level with a lamp, the first of its bulb's veil is small -- a
+    /// little of the bulb, a little of its glare -- and comes from low on the
+    /// bulb, under the rim. Read from the table's rows, 10 degrees apart, it came
+    /// from where a view 10 degrees lower sees the bulb, as wide as the whole
+    /// bulb, and its bright core lay on the shade's outside, above the rim
+    /// (headset, 2026-10-01).
+    #[test]
+    fn test_rooms_hanging_lamps_glare_from_the_sliver_under_the_rim() {
+        let game = Path::new(env!("CARGO_MANIFEST_DIR")).join("../game");
+        let Some(level) = crate::probe_level::ProbeLevel::load(&game, "test_room") else {
+            eprintln!("test_room probes not baked; skipping");
+            return;
+        };
+        let standing = level.scene_proxies(&game, "test_room");
+        for lamp in ["hall_spot_1", "hall_spot_2", "brick_lamp"] {
+            let m = standing.glare.get(lamp).unwrap_or_else(|| panic!("{lamp} is measured"));
+            let (table, middle) = m.table.clone().unwrap_or_else(|| panic!("{lamp} has a glare table"));
+            assert!(table.split.as_ref().and_then(|s| s.bulb_fine.as_ref()).is_some(), "{lamp}: re-bake its glare table");
+            let s = GlareSource {
+                position: middle,
+                radiance: Vec3::ONE,
+                sides: m.sides,
+                rotation: m.frame,
+                cone: None,
+                centres: Some(m.centres),
+                table: Some((table, middle)),
+            };
+            let at = |elevation: f32| {
+                let e = elevation.to_radians();
+                middle + m.frame * Vec3::new(e.cos(), e.sin(), 0.0) * 3.0
+            };
+            let bulb = |elevation: f32| glare::glare_lobes(&s, at(elevation)).into_iter().find(|l| l.radius <= glare::LAMP_RADIUS);
+            let whole = bulb(-40.0).unwrap_or_else(|| panic!("{lamp} shows its bulb from 40 degrees below"));
+            let first = (0..60).map(|i| -2.0 - 0.5 * i as f32).find_map(|e| bulb(e).filter(|l| l.share > 0.0).map(|l| (e, l)));
+            let (e, sliver) = first.unwrap_or_else(|| panic!("{lamp}'s bulb never shows"));
+            eprintln!("{lamp}: first shows {e} degrees below: {sliver:?}; whole: {whole:?}");
+            let up = m.frame * Vec3::Y;
+            assert!(sliver.share < 0.2 * whole.share, "{lamp}: {} of {} as it first shows", sliver.share, whole.share);
+            assert!(sliver.radius < 0.5 * glare::LAMP_RADIUS, "{lamp}: a sliver's veil {} m across", sliver.radius);
+            assert!(
+                (sliver.centre - whole.centre).dot(up) < -0.005,
+                "{lamp}: the sliver shows from {} m above the whole bulb's middle",
+                (sliver.centre - whole.centre).dot(up)
+            );
+        }
+    }
+
     /// THE LEVEL'S OWN: every fixture's cards carry its bulb -- the sconces'
     /// glowing whole, the hanging lamps' placed by their emissive texture --
     /// and each shows from below and not from above.
@@ -572,6 +637,70 @@ mod tests {
             eprintln!("{lamp} sides {sides:?}");
             assert!(sides[3] > 0.1, "{lamp} from below: {sides:?}");
             assert!(sides[2] < 0.25 * sides[3], "{lamp} from above, far less: {sides:?}");
+        }
+    }
+
+    /// DIAGNOSTIC: hall_spot_1's glare from the bench's pendant views -- each
+    /// part's share, size and where it sits against the bulb, and its veil at
+    /// exposure `EXPOSURE` (default 3, the hall's).
+    #[test]
+    #[ignore]
+    fn print_the_pendant_glare() {
+        let game = Path::new(env!("CARGO_MANIFEST_DIR")).join("../game");
+        let Some(level) = crate::probe_level::ProbeLevel::load(&game, "test_room") else {
+            eprintln!("test_room probes not baked; skipping");
+            return;
+        };
+        let exposure = std::env::var("EXPOSURE").ok().and_then(|e| e.parse().ok()).unwrap_or(3.0f32);
+        let standing = level.scene_proxies(&game, "test_room");
+        let m = standing.glare.get("hall_spot_1").unwrap();
+        let (table, middle) = m.table.clone().unwrap();
+        let bulb = Vec3::new(0.0, 3.1 - 1.065, -4.5);
+        let warm = space_soup::renderer::Color3(255, 244, 214, 255).to_linear();
+        let s = GlareSource {
+            position: bulb,
+            radiance: Vec3::new(warm[0], warm[1], warm[2]) * 9.0,
+            sides: m.sides,
+            rotation: m.frame,
+            cone: None,
+            centres: Some(m.centres),
+            table: Some((table, middle)),
+        };
+        eprintln!("bulb {bulb}, box middle {middle}");
+        for (name, eye) in [
+            ("pendant_far", Vec3::new(0.3, 1.6, 1.0)),
+            ("pendant_mid", Vec3::new(0.6, 1.6, -2.2)),
+            ("pendant_rim", Vec3::new(0.55, 1.58, -3.45)),
+            ("pendant_close", Vec3::new(0.5, 1.5, -3.6)),
+            ("pendant_below", Vec3::new(0.35, 1.2, -3.85)),
+        ] {
+            let to = bulb - eye;
+            let elevation = (to.y / Vec3::new(to.x, 0.0, to.z).length()).atan().to_degrees();
+            eprintln!("{name}: {:.2} m, {elevation:.1} degrees up", to.length());
+            for l in glare::glare_lobes(&s, eye) {
+                let along = (l.centre - eye).dot(to.normalize()) - to.length();
+                let q = glare::glare_quad(&s, &l, eye, exposure, 1.0);
+                eprintln!(
+                    "  share {:.3} radius {:.3} centre-bulb {:?} depth vs bulb {along:+.3} m{}",
+                    l.share,
+                    l.radius,
+                    (l.centre - bulb).to_array().map(|x| (x * 1000.0).round() / 1000.0),
+                    q.map_or(String::new(), |q| format!(
+                        "; a {:.3} core {:.2} deg reach {:.1} deg (cut by depth to {:.1}) peak {:.2} veil at 2/4/8 deg {:.3}/{:.3}/{:.3}",
+                        q.a,
+                        q.core2.sqrt(),
+                        q.degrees,
+                        q.core_degrees,
+                        q.peak,
+                        q.a * glare::cie_veil(4.0 + q.core2) - q.edge,
+                        q.a * glare::cie_veil(16.0 + q.core2) - q.edge,
+                        q.a * glare::cie_veil(64.0 + q.core2) - q.edge,
+                    ))
+                );
+                // Where the core's depth test stands, against the bulb.
+                let plane = l.centre + (eye - l.centre).normalize() * glare::LAMP_RADIUS.max(l.radius);
+                eprintln!("    core tested from {:+.3} m against the bulb", (plane - eye).dot(to.normalize()) - to.length());
+            }
         }
     }
 }

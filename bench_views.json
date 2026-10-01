@@ -69,6 +69,12 @@
       "note": "The brick hall from its back corner across to both doorways (the one reported as the slowest room, 2026-09-29)."
     },
     {
+      "name": "brick_to_hallway",
+      "eye": [12.0, 1.6, -3.0],
+      "at": [8.0, 1.5, -3.0],
+      "note": "In the brick hall, 1.7 m from the hallway's doorway, looking through it: the hallway is the brighter room, and the eye adapts toward it before going in (user, 2026-10-01)."
+    },
+    {
       "name": "sconce_jamb",
       "eye": [1.5, 1.6, -3.6],
       "at": [2.8, 1.75, -2.35],
@@ -128,6 +134,12 @@
       "eye": [0.65, 1.58, -5.4],
       "at": [0.0, 1.3, -6.55],
       "note": "The marble pillar's corner seen past its front face: a green line ran down the side face's grazing sliver (2026-10-01, face codes)."
+    },
+    {
+      "name": "pillar_face",
+      "eye": [0.0, 1.6, -5.95],
+      "at": [0.0, 1.0, -6.55],
+      "note": "Standing 0.6 m in front of the marble pillar, looking at its face: the player's contact darkening drew a faint disc on it with a hard rim, which grew and shrank as the arm rose (user, headset 2026-10-01). Compare with the capsules lever off."
     },
     {
       "name": "hallway_jamb",
@@ -213,6 +225,24 @@
       "eye": [0.35, 1.2, -3.85],
       "at": [0.0, 1.95, -4.5],
       "note": "The back pendant from 1 m, 47 degrees below: the bulb in full view in its cage, the lit inside of the shade round it."
+    },
+    {
+      "name": "pendant_rim",
+      "eye": [0.55, 1.58, -3.45],
+      "at": [0.0, 1.95, -4.5],
+      "note": "The back pendant from 1.2 m, 17 degrees below: its bulb just coming out from under the rim (user's screenshots 10:59, 2026-10-01). The bulb's veil must come from the sliver under the rim, not lie on the shade's outside above it."
+    },
+    {
+      "name": "lamp_in_floor",
+      "eye": [-1.5, 1.6, -9.0],
+      "at": [-0.6, 0.3, -5.0],
+      "note": "From behind the pillar on its left, down at the polished floor where the front pendant (hall_spot_1) reflects beside the pillar: the reflection the user's hand pointed at as jittering (screenshot 11:05:24, 2026-10-01)."
+    },
+    {
+      "name": "lamp_by_pillar",
+      "eye": [-1.3, 1.6, -8.3],
+      "at": [0.0, 1.95, -4.5],
+      "note": "From behind the pillar on its left, at the front pendant (hall_spot_1) just past the pillar's edge: the lamp the user's hand pointed at as jittering (screenshot 11:05:38, 2026-10-01)."
     },
     {
       "name": "sconce_far",
