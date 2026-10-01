@@ -103,6 +103,12 @@
       "eye": [0.0, 1.6, -4.0],
       "at": [0.0, 0.0, -4.45],
       "note": "Standing in the front pendant's pool of light, looking down at your feet: your lit body mirrored in the marble (the characters' floor mirror, 2026-09-30)."
+    },
+    {
+      "name": "sun_shadow_down",
+      "eye": [0.0, 1.6, 10.0],
+      "at": [0.05, 0.0, 10.05],
+      "note": "Outside in the sun, looking straight down at your own feet: your body's sun shadow on the grass, from the moving-objects sun map (user, 2026-09-30: outdoor player shadows look pixellated)."
     }
   ]
 }

@@ -22,20 +22,19 @@
 //! its own direction exactly as the editor draws them.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use glam::{Mat3, Quat, Vec3};
-use space_soup::renderer::glare::GlareSource;
-use space_soup_engine::reflection_cards::{card_point, LoadedCards, CARD_FACES};
+use space_soup::renderer::glare::{GlareSource, GlareTable};
+use space_soup_engine::reflection_cards::{card_point, LoadedCards, CARD_FACES, GLARE_BRIGHT};
 use space_soup_engine::scene::GameObject;
 use space_soup_engine::scene_light::{GlareFacesDef, LightDef};
 use space_soup_engine::LightKind;
 use space_soup_protocol::{WireLightKind, WireRenderLight};
 
-/// A displayed value this many times the renderer's white is past anything the
-/// display shows at any exposure the eye adapts to; only light beyond it
-/// counts toward glare. The rest -- a shade's outside, lit like a wall -- the
-/// display draws, and the eye's own veil already answers it.
-const BRIGHT: f32 = 4.0;
+/// Only light past this counts toward glare: see `GLARE_BRIGHT`, which the
+/// bake's glare tables measure against too.
+const BRIGHT: f32 = GLARE_BRIGHT;
 
 /// Cards whose brightest side sends less than this share of a bare lamp's light
 /// are not carrying the fixture's glow (see the module notes); the author's
@@ -53,23 +52,49 @@ const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
 /// `frame` -- +x, -x, +y, -y, +z, -z -- in the world. `frame` is `None` for
 /// sides around the light's own direction, taken every frame (the author's
 /// faces; see [`light_frame`]).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FixtureGlare {
     pub sides: [f32; 6],
     pub frame: Option<Quat>,
     /// Where each side sees the light come out, in the world: see
     /// [`card_centres`]. `None` for the author's faces.
     pub centres: Option<[Vec3; 6]>,
+    /// The fixture's glare from every direction, with the middle of its box
+    /// in the world, which the table's centres are measured from: see
+    /// [`glare_table`]. Where there is one it decides alone.
+    pub table: Option<(Arc<GlareTable>, Vec3)>,
 }
 
 /// What a fixture's cards say about its glare: each side's share
 /// ([`card_sides`]), the frame they were taken in, and where on the fixture
 /// each side sees its light, in the world ([`card_centres`]).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MeasuredGlare {
     pub sides: [f32; 6],
     pub frame: Quat,
     pub centres: [Vec3; 6],
+    /// The bake's glare table, as shares of the lamp's light, and the box's
+    /// middle in the world. See [`glare_table`].
+    pub table: Option<(Arc<GlareTable>, Vec3)>,
+}
+
+/// THE BAKE'S GLARE TABLE AS SHARES OF THE LAMP'S LIGHT: each direction's
+/// light past `BRIGHT` over `pi` times the lamp's `luminance`, exactly as
+/// [`card_sides`] takes a card's -- what an eye that way gets of a bare lamp's
+/// light. Capped like a side. `None` without a table, or with one that shows
+/// nothing. See `reflection_cards::GlareTable`.
+pub(crate) fn glare_table(cards: &LoadedCards, luminance: f32) -> Option<GlareTable> {
+    let t = cards.glare.as_ref()?;
+    if luminance <= 0.0 {
+        return None;
+    }
+    let share: Vec<f32> = t.flux.iter().map(|f| (f / (std::f32::consts::PI * luminance)).min(MAX_SIDE)).collect();
+    (share.iter().copied().fold(0.0, f32::max) >= CARRIES_GLOW).then(|| GlareTable {
+        rows: t.rows,
+        cols: t.cols,
+        share,
+        centre: t.centre.clone(),
+    })
 }
 
 /// Each side's share of a bare lamp's light, from a fixture's cards: card `k`
@@ -163,8 +188,8 @@ pub(crate) fn fixtures(objects: &[GameObject], measured: &HashMap<String, Measur
                 continue;
             }
             let glare = match measured.get(&o.id) {
-                Some(m) => FixtureGlare { sides: m.sides, frame: Some(m.frame), centres: Some(m.centres) },
-                None => FixtureGlare { sides: authored_sides(&l.glare_faces), frame: None, centres: None },
+                Some(m) => FixtureGlare { sides: m.sides, frame: Some(m.frame), centres: Some(m.centres), table: m.table.clone() },
+                None => FixtureGlare { sides: authored_sides(&l.glare_faces), frame: None, centres: None, table: None },
             };
             out.insert(format!("{}#{i}", o.id), glare);
         }
@@ -215,7 +240,11 @@ pub(crate) fn measure(
                     sides.map(|s| (s * 100.0).round() / 100.0),
                 );
                 let centres = card_centres(c, half_size).map(|p| centre + rotation * p);
-                out.insert(o.id.clone(), MeasuredGlare { sides, frame: rotation, centres });
+                let table = glare_table(c, luminance).map(|t| (Arc::new(t), centre));
+                if table.is_none() {
+                    log::info!("glare: '{}' has no glare table; its six cards' sides decide", o.id);
+                }
+                out.insert(o.id.clone(), MeasuredGlare { sides, frame: rotation, centres, table });
             }
             None if luminance > 0.0 => {
                 log::info!("glare: '{}' cards carry no glow; its lights' authored faces decide", o.id)
@@ -260,6 +289,7 @@ pub(crate) fn sources<'a>(
                 rotation: yaw_inv * f.frame.unwrap_or_else(|| light_frame(direction)),
                 cone,
                 centres: f.centres.map(|cs| cs.map(|c| yaw_inv * (c - offset))),
+                table: f.table.as_ref().map(|(t, middle)| (t.clone(), yaw_inv * (*middle - offset))),
             })
         })
         .collect()
@@ -268,6 +298,7 @@ pub(crate) fn sources<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use space_soup::renderer::glare;
     use std::path::Path;
 
     fn blank_cards(res: u32) -> LoadedCards {
@@ -277,6 +308,7 @@ mod tests {
             resolution: res,
             texels: vec![[0.0, 0.0, 0.0, 2.0]; n],
             normals: vec![[0.0; 3]; n],
+            glare: None,
         }
     }
 
@@ -341,7 +373,7 @@ mod tests {
     #[test]
     fn a_fixtures_lamp_becomes_a_source_in_the_players_frame() {
         let mut fixtures = HashMap::new();
-        fixtures.insert("lamp#0".to_string(), FixtureGlare { sides: [1.0; 6], frame: None, centres: None });
+        fixtures.insert("lamp#0".to_string(), FixtureGlare { sides: [1.0; 6], frame: None, centres: None, table: None });
         let spot = WireRenderLight {
             position: [2.0, 3.0, 0.0],
             direction: [0.0, -1.0, 0.0],
@@ -363,7 +395,7 @@ mod tests {
         assert!((inner - 10f32.to_radians().cos()).abs() < 1e-5);
         // Measured by its cards, the bulb shows wherever they saw it, beam or
         // no beam.
-        fixtures.insert("lamp#0".to_string(), FixtureGlare { sides: [1.0; 6], frame: Some(Quat::IDENTITY), centres: None });
+        fixtures.insert("lamp#0".to_string(), FixtureGlare { sides: [1.0; 6], frame: Some(Quat::IDENTITY), centres: None, table: None });
         let measured = sources([&spot], &fixtures, Vec3::new(1.0, 0.0, 0.0), yaw_inv);
         assert_eq!(measured[0].cone, None);
     }
@@ -417,6 +449,90 @@ mod tests {
             eprintln!("{lamp}: bulb {bulb}, light from below shows at {below}");
             assert!(below.y < bulb.y - 0.02, "{lamp}: {below} not below the bulb {bulb}");
             assert!((below - bulb).length() < 0.25, "{lamp}: {below} is not on the fixture round {bulb}");
+        }
+    }
+
+    /// The bake's table directions and the renderer's are one mapping: the
+    /// engine and the renderer each have it, and the renderer may not depend
+    /// on the engine.
+    #[test]
+    fn the_bakes_glare_directions_are_the_renderers() {
+        use space_soup_engine::reflection_cards::{glare_direction, GLARE_COLS, GLARE_ROWS};
+        let n = GLARE_ROWS * GLARE_COLS;
+        let t = GlareTable { rows: GLARE_ROWS, cols: GLARE_COLS, share: vec![0.0; n], centre: vec![Vec3::ZERO; n] };
+        for row in 0..GLARE_ROWS {
+            for col in 0..GLARE_COLS {
+                let (bake, render) = (glare_direction(row, col, GLARE_ROWS, GLARE_COLS), t.direction(row, col));
+                assert!((bake - render).length() < 1e-6, "({row}, {col}): {bake} vs {render}");
+            }
+        }
+        // And a lookup straight along an entry's direction reads that entry.
+        let mut one = t.clone();
+        one.share[5 * GLARE_COLS + 7] = 1.0;
+        assert!((one.sample(glare_direction(5, 7, GLARE_ROWS, GLARE_COLS)).0 - 1.0).abs() < 1e-4);
+    }
+
+    /// A table's light is a share of its lamp's exactly as a card's is --
+    /// over `pi` times the lamp's luminance -- capped like a side; a table
+    /// that shows nothing is no table.
+    #[test]
+    fn a_glare_tables_light_is_a_share_of_its_lamps() {
+        use space_soup_engine::reflection_cards::GlareTable as BakedTable;
+        let luminance = 3.0f32;
+        let mut cards = blank_cards(4);
+        let pi_l = std::f32::consts::PI * luminance;
+        cards.glare = Some(BakedTable {
+            rows: 1,
+            cols: 3,
+            flux: vec![0.5 * pi_l, 0.0, 9.0 * pi_l],
+            centre: vec![Vec3::new(0.0, -0.1, 0.0), Vec3::ZERO, Vec3::X],
+        });
+        let t = glare_table(&cards, luminance).expect("it shows");
+        assert!((t.share[0] - 0.5).abs() < 1e-6 && t.share[1] == 0.0 && t.share[2] == MAX_SIDE, "{:?}", t.share);
+        assert_eq!(t.centre[0], Vec3::new(0.0, -0.1, 0.0));
+        cards.glare.as_mut().unwrap().flux = vec![0.001; 3];
+        assert_eq!(glare_table(&cards, luminance), None, "below CARRIES_GLOW everywhere");
+    }
+
+    /// THE LEVEL'S LAMPS BY THEIR GLARE TABLES: none shows its bulb from
+    /// level with it or from above -- the hanging lamps' shades hide theirs,
+    /// which the six cards' blend let glare through from the side (headset,
+    /// 2026-09-30) -- and every one shows from below.
+    #[test]
+    fn test_rooms_lamps_hide_their_bulbs_where_their_shades_do() {
+        let game = Path::new(env!("CARGO_MANIFEST_DIR")).join("../game");
+        let Some(level) = crate::probe_level::ProbeLevel::load(&game, "test_room") else {
+            eprintln!("test_room probes not baked; skipping");
+            return;
+        };
+        let standing = level.scene_proxies(&game, "test_room");
+        for lamp in ["hallway_sconce_south", "hallway_sconce_north", "hall_spot_1", "hall_spot_2", "brick_lamp"] {
+            let m = standing.glare.get(lamp).unwrap_or_else(|| panic!("{lamp} is measured"));
+            let (table, middle) = m.table.clone().unwrap_or_else(|| panic!("{lamp} has a glare table"));
+            let s = GlareSource {
+                position: middle,
+                radiance: Vec3::ONE,
+                sides: m.sides,
+                rotation: m.frame,
+                cone: None,
+                centres: Some(m.centres),
+                table: Some((table, middle)),
+            };
+            let blended = GlareSource { table: None, ..s.clone() };
+            let around = |elevation: f32, azimuth: f32| {
+                let (e, a) = (elevation.to_radians(), azimuth.to_radians());
+                middle + m.frame * Vec3::new(e.cos() * a.cos(), e.sin(), e.cos() * a.sin()) * 3.0
+            };
+            let below = glare::visible_share(&s, around(-80.0, 0.0));
+            let (mut level_most, mut leak) = (0.0f32, 0.0f32);
+            for azimuth in (0..360).step_by(15) {
+                let a = azimuth as f32;
+                level_most = level_most.max(glare::visible_share(&s, around(0.0, a))).max(glare::visible_share(&s, around(40.0, a)));
+                leak = leak.max(glare::visible_share(&blended, around(0.0, a)));
+            }
+            eprintln!("{lamp}: from below {below:.3}, level or above at most {level_most:.4} (the sides' blend: {leak:.3})");
+            assert!(below > 0.1, "{lamp} shows from below: {below}");
+            assert!(level_most < 0.02 * below, "{lamp} shows {level_most} from level or above, against {below} below");
         }
     }
 
