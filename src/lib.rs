@@ -561,6 +561,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     // with nobody wearing the headset. See `space_soup::renderer::bench`.
     // `bench_return` is where the player stood before, to go back to.
     let mut bench: Option<space_soup::renderer::bench::BenchRig> = None;
+    // The pose it came from and when it was set: a swaying pose moves the rig
+    // every frame (`BenchPose::sway`).
+    let mut bench_pose: Option<(space_soup::renderer::bench::BenchPose, std::time::Instant)> = None;
     let mut bench_return: Option<(Vec3, f32)> = None;
     'main: loop {
         pump_android_events(&mut exit);
@@ -698,6 +701,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         // player goes back to where they stood. Taken once, here: the lever
         // file is read later in the frame, and a pin that changed halfway
         // would draw the new head against geometry placed for the old rig.
+        if let Some((pose, since)) = bench_pose.as_ref().filter(|(pose, _)| pose.sway.is_some()) {
+            bench = Some(space_soup::renderer::bench::BenchRig::for_pose_at(pose, since.elapsed().as_secs_f32()));
+        }
         let frame_bench = bench;
         match &frame_bench {
             Some(rig) => {
@@ -1047,6 +1053,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 Some(Ok(levers)) => {
                     info!("LEVERS: {} (from {})", levers.summary(), lever_file.path().display());
                     bench = levers.bench.as_ref().map(space_soup::renderer::bench::BenchRig::for_pose);
+                    bench_pose = levers.bench.clone().map(|pose| (pose, std::time::Instant::now()));
                     renderer.set_levers(levers);
                 }
                 Some(Err(e)) => log::warn!("LEVERS: {} ignored, previous levers kept: {e}", lever_file.path().display()),

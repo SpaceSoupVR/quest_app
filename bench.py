@@ -157,6 +157,12 @@ def levers_for(view: dict, ab: bool, extra: dict, synced: bool = False) -> dict:
     the GPU's time; the A/B schedule always runs synced."""
     levers = dict(MEASURED, **extra)
     levers["bench"] = {"name": view["name"], "eye": view["eye"], "at": view["at"]}
+    # The same view with the rig turned as a snap turn leaves it (BenchPose::rig_yaw).
+    if "rig_yaw" in view:
+        levers["bench"]["rig_yaw"] = view["rig_yaw"]
+    # A head that sways side to side (BenchPose::sway), for watching what moves.
+    if "sway" in view:
+        levers["bench"]["sway"] = view["sway"]
     if ab:
         levers["ab_cycle"] = True
     if ab or synced:
@@ -497,6 +503,45 @@ def eye_capture(dev: Device, levers: dict, n: int, dest_stem: Path, timeout: flo
     return names
 
 
+VIDEO_DIR = "/sdcard/Oculus/VideoShots"
+
+
+def record_video(dev: Device, seconds: float, dest: Path, timeout: float = 60.0, poll: float = 1.0) -> Path | None:
+    """What the headset shows for `seconds`, through the system's own video
+    capture -- the compositor's output, SpaceWarp's synthesised frames
+    included, which no eye capture can show -- pulled to `dest`. `None` when
+    no new file appeared."""
+    listing = lambda: set(dev.shell("ls -1 %s 2>/dev/null" % VIDEO_DIR, check=False).split())
+    before = listing()
+    # The capture service's own debugging actions (its package's strings; the
+    # START_CAPTURE some write-ups give is refused as invalid). It records
+    # only while the display is on: run inside the bench, which holds the
+    # proximity sensor closed.
+    service = "am startservice -n com.oculus.metacam/.capture.CaptureService -a %s_INTERNAL_CAPTURE_TO_DISK"
+    dev.shell(service % "START", check=False)
+    time.sleep(seconds)
+    dev.shell(service % "STOP", check=False)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(poll)
+        new = sorted(f for f in listing() if f not in before and f.endswith(".mp4"))
+        if not new:
+            continue
+        remote = "%s/%s" % (VIDEO_DIR, new[-1])
+        # The file is there from the start, its header first; it is finished
+        # once its size has held still for a few seconds after the stop.
+        size, still = None, 0
+        while time.monotonic() < deadline and still < 3:
+            time.sleep(poll)
+            now = dev.shell("stat -c %%s %s" % remote, check=False).strip()
+            still = still + 1 if (now and now == size and int(now) > 4096) else 0
+            size = now
+        dev.run("pull", remote, str(dest), check=False)
+        dev.shell("rm -f " + remote, check=False)
+        return dest if dest.exists() else None
+    return None
+
+
 def write_eye_pngs(data: bytes, dest_stem: Path) -> list:
     """A capture (`EYES`, width, height as little-endian u32s, then each eye's
     RGBA rows) as two PNGs, left then right; their names."""
@@ -711,6 +756,9 @@ def main(argv: list | None = None) -> int:
     ap.add_argument("--eye-capture", action="store_true",
                     help="also both eyes' finished images at each view, from the renderer itself (restarts the app "
                          "with debug.spacesoup.eyecapture set, and afterwards without it)")
+    ap.add_argument("--record", type=float, metavar="SECONDS",
+                    help="also record what the headset shows at each view for this long, through the system's "
+                         "video capture: SpaceWarp's synthesised frames included (`<view>.mp4`)")
     ap.add_argument("--profile-seconds", type=int, default=10, help="how long to read the GPU counters a view (default 10)")
     ap.add_argument("--trace", type=int, metavar="SECONDS",
                     help="capture a render-stage trace this long at each view (ovrgpuprofiler -t): each pass's "
@@ -875,6 +923,10 @@ def main(argv: list | None = None) -> int:
                 write_levers(dev, levers_for(view, False, extra))
                 if eyes is None:
                     warnings.append("no eye capture came back for %s (is the app built with it?)" % name)
+            if args.record:
+                video = record_video(dev, args.record, out / (name + ".mp4"))
+                if video is None:
+                    warnings.append("no video came back for %s" % name)
             counters: dict = {}
             if counter_ids:
                 counters, raw = profile(dev, counter_ids, args.profile_seconds)

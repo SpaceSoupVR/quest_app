@@ -29,8 +29,8 @@ use crate::brush_render::{load_materials, BrushGeometry};
 /// A STANDING FIGURE as capsules, for the characters' shadows, contact
 /// darkening and reflections: `CAPSULE_AT=x,z` (or `x,y,z`) stands one 1.75 m
 /// tall, arms down, feet on the floor there, facing +z. None without it. In the
-/// harness's player frame: the world less `offset`.
-fn offline_capsules(offset: Vec3) -> space_soup::renderer::uniforms::CapsuleUpload {
+/// harness's player frame: the world less `offset`, turned by `yaw_inv`.
+fn offline_capsules(offset: Vec3, yaw_inv: Quat) -> space_soup::renderer::uniforms::CapsuleUpload {
     use space_soup::renderer::uniforms::{CapsuleGroup, CapsuleUpload};
     let at = std::env::var("CAPSULE_AT").ok().and_then(|v| {
         let n: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
@@ -41,7 +41,7 @@ fn offline_capsules(offset: Vec3) -> space_soup::renderer::uniforms::CapsuleUplo
         }
     });
     let Some(at) = at else { return CapsuleUpload::default() };
-    let p = |x: f32, y: f32, z: f32| at + Vec3::new(x, y, z) - offset;
+    let p = |x: f32, y: f32, z: f32| yaw_inv * (at + Vec3::new(x, y, z) - offset);
     let capsules = vec![
         (p(0.0, 1.60, 0.0), p(0.0, 1.68, 0.0), 0.10),
         (p(0.0, 1.40, 0.0), p(0.0, 0.95, 0.0), 0.15),
@@ -111,6 +111,12 @@ pub struct View {
     /// the headset's 22:04:15 screenshot was tilted about 15 degrees, and its
     /// reflected doorway edges stepped (2026-09-29).
     pub roll_deg: f32,
+    /// The rig's turn, degrees: `Locomotion::player_yaw`, which a snap turn
+    /// changes. The world drawn is the same at any turn; only the player's
+    /// frame, the one geometry and lights reach the shaders in, rotates. A
+    /// picture that changes with it is a frame bug (the headset's 45-degree
+    /// snap turn at 00:59, 2026-10-01).
+    pub yaw_deg: f32,
     /// The pixel grid shifted by this many pixels, x and y, with the camera
     /// held still: the crawl test's probe. A band-limited picture resamples
     /// smoothly under it; a hard per-pixel decision flips whole pixels.
@@ -136,6 +142,7 @@ impl View {
             depth_prepass: true,
             linear: false,
             roll_deg: 0.0,
+            yaw_deg: 0.0,
             jitter_px: [0.0, 0.0],
         }
     }
@@ -174,8 +181,9 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
 
     // THE PLAYER'S FRAME, as on the headset: the rig stands under the eye.
     let offset = Vec3::new(view.eye.x, 0.0, view.eye.z);
-    let yaw_inv = Quat::IDENTITY;
-    let to_player = |p: Vec3| p - offset;
+    let yaw = view.yaw_deg.to_radians();
+    let yaw_inv = Quat::from_rotation_y(-yaw);
+    let to_player = |p: Vec3| yaw_inv * (p - offset);
 
     // Lights: the scene's realtime ones through the wire conversion, plus the
     // sky's sun exactly as the frame adds it.
@@ -402,7 +410,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             terrain_detail_distance: std::env::var("TERRAIN_DETAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
             reflection_share: false,
         },
-        &PlayerUpload { offset, yaw: 0.0, capsules: offline_capsules(offset) },
+        &PlayerUpload { offset, yaw, capsules: offline_capsules(offset, yaw_inv) },
         Some(&probes),
     );
 
@@ -1079,6 +1087,7 @@ mod tests {
             height: num("H").map_or(v.height, |x| x as u32),
             fov_y: num("FOVY").unwrap_or(v.fov_y),
             roll_deg: num("ROLL").unwrap_or(0.0),
+            yaw_deg: num("YAW").unwrap_or(0.0),
             jitter_px: [num("JX").unwrap_or(0.0), num("JY").unwrap_or(0.0)],
             linear,
             ..v
