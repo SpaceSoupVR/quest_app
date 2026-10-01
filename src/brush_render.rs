@@ -150,13 +150,20 @@ impl BrushGeometry {
         // repaired ACROSS objects as well as within one: a room's carve and the
         // shell it is carved from are one object, but two buildings that touch
         // are two, and a crack does not care which.
+        // Cut where the rooms' boxes cut them; see `split_at_rooms`.
+        let brushes: Vec<(&str, &space_soup_engine::brush::BrushDef)> =
+            scene.objects.iter().filter_map(|o| o.brush.as_ref().map(|b| (o.id.as_str(), b))).collect();
+        let rooms: Vec<(Vec3, Vec3)> =
+            space_soup_engine::room_graph::rooms_from_scene(&brushes).0.iter().map(|r| (r.min, r.max)).collect();
         let mut per_object: Vec<(&space_soup_engine::scene::GameObject, usize)> = Vec::new();
         let mut all_polys: Vec<space_soup_engine::brush::BrushPolygon> = Vec::new();
         let mut brush_index = 0usize;
         for obj in &scene.objects {
             let Some(def) = obj.brush.as_ref() else { continue };
-            let polys =
-                space_soup_engine::brush::brush_polygons_in_atlas(def, &lm_layout, brush_index);
+            let polys = split_at_rooms(
+                space_soup_engine::brush::brush_polygons_in_atlas(def, &lm_layout, brush_index),
+                &rooms,
+            );
             brush_index += 1;
             per_object.push((obj, polys.len()));
             all_polys.extend(polys);
@@ -373,6 +380,140 @@ impl BrushGeometry {
         }
         Some((&self.vertices, &self.indices))
     }
+}
+
+/// How far past a room's plane a polygon must reach, on both sides, before it
+/// is cut there. A wall flush with the plane, or a few millimetres over it, is
+/// left whole: cutting it would only make slivers.
+const ROOM_SPLIT_SLACK: f32 = 0.01;
+
+/// EVERY POLYGON CUT WHERE A ROOM'S BOX CUTS IT, so no polygon lies partly in a
+/// room and partly out of it.
+///
+/// A face's reflection traces from the room its CENTROID is in (the shader's
+/// `probe_face_room`; see `face_centre` for why not per pixel). A polygon that
+/// straddles a room boundary therefore reflects one room over all of it. The
+/// hallway has no end walls of its own: both its ends are the outside walls of
+/// the buildings it joins, and those are single polygons metres long whose
+/// centroids lie outdoors -- so the marble border round each hallway door, a
+/// strip of the hall's outside wall seen from inside the hallway, reflected the
+/// sky and the hills (headset, 2026-10-01 01:03:41). Cut at the hallway's box,
+/// the strip is a polygon of its own whose centroid lies in the hallway.
+///
+/// The rooms are the level's room carves (`room_graph::rooms_from_scene`), the
+/// boxes the probe volumes are made from. Done before the T-junction repair,
+/// which then joins the new vertices to the neighbouring polygons.
+fn split_at_rooms(
+    polys: Vec<space_soup_engine::brush::BrushPolygon>,
+    rooms: &[(Vec3, Vec3)],
+) -> Vec<space_soup_engine::brush::BrushPolygon> {
+    let mut out = Vec::with_capacity(polys.len());
+    for poly in polys {
+        let mut pieces = vec![poly];
+        for &(lo, hi) in rooms {
+            let mut next = Vec::with_capacity(pieces.len());
+            for piece in pieces {
+                split_at_room(piece, lo, hi, &mut next);
+            }
+            pieces = next;
+        }
+        out.extend(pieces);
+    }
+    out
+}
+
+/// `poly` cut by the six planes of the box `lo..hi` into the part inside it and
+/// the parts outside, all pushed onto `out`. A polygon that does not reach into
+/// the box is pushed whole; one lying IN a plane of the box -- a wall the room
+/// is flush with -- is cut across that plane's neighbours, never along it.
+fn split_at_room(
+    poly: space_soup_engine::brush::BrushPolygon,
+    lo: Vec3,
+    hi: Vec3,
+    out: &mut Vec<space_soup_engine::brush::BrushPolygon>,
+) {
+    let (plo, phi) = poly.positions.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| {
+        (a.min(Vec3::from(*p)), b.max(Vec3::from(*p)))
+    });
+    // Flush with a face of the box counts as reaching it: that is the wall a
+    // room's end is made of.
+    let slack = Vec3::splat(ROOM_SPLIT_SLACK);
+    if plo.cmpgt(hi + slack).any() || phi.cmplt(lo - slack).any() {
+        out.push(poly);
+        return;
+    }
+    let mut rest = poly;
+    for axis in 0..3 {
+        // Below the box's low face is outside it; so is above its high face.
+        let (below, above) = split_polygon(rest, axis, lo[axis], true);
+        out.extend(below);
+        let Some(above) = above else { return };
+        let (below, above) = split_polygon(above, axis, hi[axis], false);
+        out.extend(above);
+        let Some(below) = below else { return };
+        rest = below;
+    }
+    out.push(rest);
+}
+
+/// A convex polygon cut by the plane where coordinate `axis` equals `at`, as
+/// (the part below, the part above). Uncut -- one side `None` -- unless it
+/// reaches `ROOM_SPLIT_SLACK` past the plane on both sides; one lying in the
+/// plane goes above if `flush_above`, else below -- the box's side, so a wall
+/// flush with either end of a room counts as the room's. The new corners lie
+/// exactly on the plane, their uvs and lightmap uvs interpolated along the edge
+/// they cut, which is exact: both are affine across a planar face.
+fn split_polygon(
+    poly: space_soup_engine::brush::BrushPolygon,
+    axis: usize,
+    at: f32,
+    flush_above: bool,
+) -> (Option<space_soup_engine::brush::BrushPolygon>, Option<space_soup_engine::brush::BrushPolygon>) {
+    let d: Vec<f32> = poly.positions.iter().map(|p| p[axis] - at).collect();
+    let below_it = d.iter().any(|&s| s < -ROOM_SPLIT_SLACK);
+    let above_it = d.iter().any(|&s| s > ROOM_SPLIT_SLACK);
+    match (below_it, above_it) {
+        (false, false) if flush_above => return (None, Some(poly)),
+        (true, false) | (false, false) => return (Some(poly), None),
+        (false, true) => return (None, Some(poly)),
+        (true, true) => {}
+    }
+    let empty = || space_soup_engine::brush::BrushPolygon {
+        material: poly.material.clone(),
+        normal: poly.normal,
+        tangent: poly.tangent,
+        ..Default::default()
+    };
+    let (mut below, mut above) = (empty(), empty());
+    let push = |q: &mut space_soup_engine::brush::BrushPolygon, p: [f32; 3], uv: [f32; 2], uv2: [f32; 2]| {
+        q.positions.push(p);
+        q.uvs.push(uv);
+        q.uv2.push(uv2);
+    };
+    let lerp2 = |a: [f32; 2], b: [f32; 2], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+    let n = poly.positions.len();
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let (p, uv, uv2) = (poly.positions[i], poly.uvs[i], poly.uv2[i]);
+        // On the plane (to a rounding error): a corner of both pieces.
+        if d[i] <= 1e-6 {
+            push(&mut below, p, uv, uv2);
+        }
+        if d[i] >= -1e-6 {
+            push(&mut above, p, uv, uv2);
+        }
+        if (d[i] < -1e-6 && d[j] > 1e-6) || (d[i] > 1e-6 && d[j] < -1e-6) {
+            let t = d[i] / (d[i] - d[j]);
+            let q = poly.positions[j];
+            let mut c = [p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t, p[2] + (q[2] - p[2]) * t];
+            c[axis] = at;
+            let (cuv, cuv2) = (lerp2(uv, poly.uvs[j], t), lerp2(uv2, poly.uv2[j], t));
+            push(&mut below, c, cuv, cuv2);
+            push(&mut above, c, cuv, cuv2);
+        }
+    }
+    let real = |q: space_soup_engine::brush::BrushPolygon| (q.positions.len() >= 3).then_some(q);
+    (real(below), real(above))
 }
 
 /// Load a scene's brush materials from the game's material library.
@@ -670,6 +811,52 @@ mod tests {
         assert!(!g.objects.is_empty(), "the level produced no brush geometry to check");
         let hits = triangle_level_t_junctions(&g);
         assert_eq!(hits, 0, "{hits} vertices still sit inside another triangle's edge");
+    }
+
+    /// NO FACE OF THE REAL LEVEL LIES PARTLY IN A ROOM AND PARTLY OUT OF IT: a
+    /// face reflects the room its centre is in, so one that straddles reflects
+    /// the wrong room over part of itself. Before `split_at_rooms` the hall's
+    /// outside wall at x = 3 ran from the hallway out to the front of the
+    /// building in one polygon, and the hallway saw it reflect the sky.
+    #[test]
+    fn no_face_of_the_shipped_level_straddles_a_room() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../game/scenes/test_room.json");
+        let scene = space_soup_engine::scene::Scene::load(std::path::Path::new(path)).unwrap();
+        let brushes: Vec<(&str, &space_soup_engine::brush::BrushDef)> =
+            scene.objects.iter().filter_map(|o| o.brush.as_ref().map(|b| (o.id.as_str(), b))).collect();
+        let rooms = space_soup_engine::room_graph::rooms_from_scene(&brushes).0;
+        assert!(rooms.len() >= 3, "test_room has the hall, the hallway and the brick hall: {}", rooms.len());
+        let g = BrushGeometry::load_with(&scene, true);
+        let key = |c: [f32; 3]| c.map(f32::to_bits);
+        let mut faces: std::collections::HashMap<[u32; 3], (Vec3, Vec3, Vec3)> = Default::default();
+        for v in g.objects.iter().flat_map(|o| o.vertices.iter()) {
+            let p = Vec3::from(v.position);
+            let e = faces.entry(key(v.face_centre)).or_insert((p, p, Vec3::from(v.face_centre)));
+            e.0 = e.0.min(p);
+            e.1 = e.1.max(p);
+        }
+        let s = ROOM_SPLIT_SLACK;
+        let mut straddling = Vec::new();
+        for (lo, hi, centre) in faces.values() {
+            for r in &rooms {
+                // Reaching into the room's box -- by more than the slack along
+                // every axis the face spans, and within it along the one it is
+                // flat in (a wall flush with the room's end)...
+                let reaches = (0..3).all(|a| {
+                    if hi[a] - lo[a] < 1e-4 {
+                        lo[a] >= r.min[a] - s && lo[a] <= r.max[a] + s
+                    } else {
+                        hi[a].min(r.max[a]) - lo[a].max(r.min[a]) > s
+                    }
+                });
+                // ...while not lying inside it.
+                let inside = (0..3).all(|a| lo[a] >= r.min[a] - s && hi[a] <= r.max[a] + s);
+                if reaches && !inside {
+                    straddling.push((r.id.clone(), *lo, *hi, *centre));
+                }
+            }
+        }
+        assert!(straddling.is_empty(), "{} face(s) straddle a room: {:?}", straddling.len(), &straddling[..straddling.len().min(4)]);
     }
 
     #[test]

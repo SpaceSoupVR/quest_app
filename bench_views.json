@@ -109,6 +109,142 @@
       "eye": [0.0, 1.6, 10.0],
       "at": [0.05, 0.0, 10.05],
       "note": "Outside in the sun, looking straight down at your own feet: your body's sun shadow on the grass, from the moving-objects sun map (user, 2026-09-30: outdoor player shadows look pixellated)."
+    },
+    {
+      "name": "back_wall_self",
+      "eye": [-1.0, 1.6, -14.3],
+      "at": [-1.0, 1.3, -15.6],
+      "note": "Close to the back wall, looking into it: your own reflection, from the character cards (2026-10-01)."
+    },
+    {
+      "name": "back_wall_self_turned",
+      "eye": [-1.0, 1.6, -14.3],
+      "at": [-1.0, 1.3, -15.6],
+      "rig_yaw": 45.0,
+      "note": "back_wall_self with the rig snap-turned 45 degrees: must show the same reflection. A turned rig smeared it (cards square to the rig, 2026-10-01)."
+    },
+    {
+      "name": "pillar_corner",
+      "eye": [0.65, 1.58, -5.4],
+      "at": [0.0, 1.3, -6.55],
+      "note": "The marble pillar's corner seen past its front face: a green line ran down the side face's grazing sliver (2026-10-01, face codes)."
+    },
+    {
+      "name": "hallway_jamb",
+      "eye": [3.8, 1.59, -2.1],
+      "at": [2.0, 1.2, -3.3],
+      "note": "From the hallway toward the marble hall's doorway: its marble border reflected the sky and the grass (faces whose middle lay outdoors, 2026-10-01)."
+    },
+    {
+      "name": "corner_spot_self",
+      "eye": [2.35, 1.6, -14.35],
+      "at": [3.0, 1.25, -14.5],
+      "note": "Standing in the back corner spot's beam, facing the wall it lights: your own shadow on the wall, from the characters' tile fitted to the spot's cone (2026-10-01)."
+    },
+    {
+      "name": "corner_spot_self_turned",
+      "eye": [2.35, 1.6, -14.35],
+      "at": [3.0, 1.25, -14.5],
+      "rig_yaw": -90.0,
+      "note": "corner_spot_self with the rig turned: the same shadow."
+    },
+    {
+      "name": "hall_back_sway",
+      "eye": [-1.3, 1.6, -14.5],
+      "at": [0.4, 2.4, 3.7],
+      "sway": 0.1,
+      "note": "hall_back with the head swaying 10 cm side to side: the polished floor's and walls' reflections as the head moves, for --record with SpaceWarp on and off (reflections jittering, 2026-10-01)."
+    },
+    {
+      "name": "hall_front_sway",
+      "eye": [0.0, 1.6, 2.5],
+      "at": [0.2, 0.0, -6.0],
+      "sway": 0.1,
+      "note": "hall_front swaying: the pendant's and the doorways' reflections on the marble floor in motion."
+    },
+    {
+      "name": "brick_hall_sway",
+      "eye": [14.0, 1.6, 2.5],
+      "at": [14.0, 1.0, -7.0],
+      "sway": 0.1,
+      "note": "brick_hall swaying: shimmer on the brick and its floor under the pendant."
+    },
+    {
+      "name": "hallway_sway",
+      "eye": [3.4, 1.6, -3.0],
+      "at": [9.0, 1.4, -3.0],
+      "sway": 0.1,
+      "note": "hallway swaying: the sconce-lit rock walls and floor in motion."
+    },
+    {
+      "name": "hall_to_hallway_floor_sway",
+      "eye": [-1.66, 1.56, -3.71],
+      "at": [3.0, 0.6, -3.0],
+      "sway": 0.1,
+      "note": "hall_to_hallway_floor swaying: the south sconce's reflection in the marble floor in motion (reflections jittering, 2026-10-01)."
+    },
+    {
+      "name": "sconce_jamb_sway",
+      "eye": [1.5, 1.6, -3.6],
+      "at": [2.8, 1.75, -2.35],
+      "sway": 0.05,
+      "note": "sconce_jamb swaying 5 cm: the polished jamb's reflection of the sconce in motion."
+    },
+    {
+      "name": "pendant_far",
+      "eye": [0.3, 1.6, 1.0],
+      "at": [0.0, 1.92, -4.5],
+      "note": "The hall's back pendant from 5.5 m, the eye 32 cm below its bulb: near level, where the shade hides the bulb and a photograph shows a dark outline with a bright rim (glare far/medium/close, 2026-10-01)."
+    },
+    {
+      "name": "pendant_mid",
+      "eye": [0.6, 1.6, -2.2],
+      "at": [0.0, 1.92, -4.5],
+      "note": "The back pendant from 2.4 m, 8 degrees below its bulb: a white veil wider than its shade read as light through the shade (user, headset 2026-10-01)."
+    },
+    {
+      "name": "pendant_close",
+      "eye": [0.5, 1.5, -3.6],
+      "at": [0.0, 1.95, -4.5],
+      "note": "The back pendant from 1.1 m, 22 degrees below its bulb: the bulb partly in view under the shade."
+    },
+    {
+      "name": "pendant_below",
+      "eye": [0.35, 1.2, -3.85],
+      "at": [0.0, 1.95, -4.5],
+      "note": "The back pendant from 1 m, 47 degrees below: the bulb in full view in its cage, the lit inside of the shade round it."
+    },
+    {
+      "name": "sconce_far",
+      "eye": [8.8, 1.6, -3.0],
+      "at": [5.0, 2.0, -4.0],
+      "note": "The hallway's south sconce from 3.9 m down the hallway, from its side."
+    },
+    {
+      "name": "sconce_mid",
+      "eye": [6.4, 1.6, -2.6],
+      "at": [5.0, 2.0, -4.0],
+      "note": "The south sconce from 2 m, a little below."
+    },
+    {
+      "name": "sconce_close",
+      "eye": [5.6, 1.5, -3.2],
+      "at": [5.0, 2.0, -4.0],
+      "note": "The south sconce from 1.1 m, below and to its side: its mouth, bulb and lit inside."
+    },
+    {
+      "name": "hall_back_walk",
+      "eye": [-1.3, 1.6, -14.5],
+      "at": [0.4, 2.4, 3.7],
+      "sway": 0.6,
+      "note": "hall_back with the head carried 60 cm side to side, 0.94 m/s at the middle -- walking pace, where SpaceWarp's synthesized frames move a reflection furthest from where it belongs (reflections jittering, 2026-10-01)."
+    },
+    {
+      "name": "hall_to_hallway_floor_walk",
+      "eye": [-1.66, 1.56, -3.71],
+      "at": [3.0, 0.6, -3.0],
+      "sway": 0.6,
+      "note": "hall_to_hallway_floor at walking pace: the sconce's reflection in the marble floor."
     }
   ]
 }

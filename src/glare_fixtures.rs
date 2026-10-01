@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use glam::{Mat3, Quat, Vec3};
-use space_soup::renderer::glare::{GlareSource, GlareTable};
+use space_soup::renderer::glare::{GlareSource, GlareTable, GlareTableSplit};
 use space_soup_engine::reflection_cards::{card_point, LoadedCards, CARD_FACES, GLARE_BRIGHT};
 use space_soup_engine::scene::GameObject;
 use space_soup_engine::scene_light::{GlareFacesDef, LightDef};
@@ -81,19 +81,29 @@ pub(crate) struct MeasuredGlare {
 /// THE BAKE'S GLARE TABLE AS SHARES OF THE LAMP'S LIGHT: each direction's
 /// light past `BRIGHT` over `pi` times the lamp's `luminance`, exactly as
 /// [`card_sides`] takes a card's -- what an eye that way gets of a bare lamp's
-/// light. Capped like a side. `None` without a table, or with one that shows
-/// nothing. See `reflection_cards::GlareTable`.
+/// light. Capped like a side, and the bulb's own part of it (the table's
+/// split, where the bake told them apart) never more than the whole. `None`
+/// without a table, or with one that shows nothing. See
+/// `reflection_cards::GlareTable`.
 pub(crate) fn glare_table(cards: &LoadedCards, luminance: f32) -> Option<GlareTable> {
     let t = cards.glare.as_ref()?;
     if luminance <= 0.0 {
         return None;
     }
-    let share: Vec<f32> = t.flux.iter().map(|f| (f / (std::f32::consts::PI * luminance)).min(MAX_SIDE)).collect();
+    let of_lamp = |f: &f32| f / (std::f32::consts::PI * luminance);
+    let share: Vec<f32> = t.flux.iter().map(|f| of_lamp(f).min(MAX_SIDE)).collect();
+    let split = t.split.as_ref().map(|s| GlareTableSplit {
+        bulb: s.bulb.iter().zip(&share).map(|(b, whole)| of_lamp(b).clamp(0.0, *whole)).collect(),
+        bulb_centre: s.bulb_centre.clone(),
+        lit_centre: s.lit_centre.clone(),
+        lit_spread: s.lit_spread.clone(),
+    });
     (share.iter().copied().fold(0.0, f32::max) >= CARRIES_GLOW).then(|| GlareTable {
         rows: t.rows,
         cols: t.cols,
         share,
         centre: t.centre.clone(),
+        split,
     })
 }
 
@@ -459,7 +469,7 @@ mod tests {
     fn the_bakes_glare_directions_are_the_renderers() {
         use space_soup_engine::reflection_cards::{glare_direction, GLARE_COLS, GLARE_ROWS};
         let n = GLARE_ROWS * GLARE_COLS;
-        let t = GlareTable { rows: GLARE_ROWS, cols: GLARE_COLS, share: vec![0.0; n], centre: vec![Vec3::ZERO; n] };
+        let t = GlareTable { rows: GLARE_ROWS, cols: GLARE_COLS, share: vec![0.0; n], centre: vec![Vec3::ZERO; n], split: None };
         for row in 0..GLARE_ROWS {
             for col in 0..GLARE_COLS {
                 let (bake, render) = (glare_direction(row, col, GLARE_ROWS, GLARE_COLS), t.direction(row, col));
@@ -473,11 +483,12 @@ mod tests {
     }
 
     /// A table's light is a share of its lamp's exactly as a card's is --
-    /// over `pi` times the lamp's luminance -- capped like a side; a table
-    /// that shows nothing is no table.
+    /// over `pi` times the lamp's luminance -- capped like a side; its bulb's
+    /// part the same, and never past the capped whole; a table that shows
+    /// nothing is no table.
     #[test]
     fn a_glare_tables_light_is_a_share_of_its_lamps() {
-        use space_soup_engine::reflection_cards::GlareTable as BakedTable;
+        use space_soup_engine::reflection_cards::{GlareSplit, GlareTable as BakedTable};
         let luminance = 3.0f32;
         let mut cards = blank_cards(4);
         let pi_l = std::f32::consts::PI * luminance;
@@ -486,10 +497,19 @@ mod tests {
             cols: 3,
             flux: vec![0.5 * pi_l, 0.0, 9.0 * pi_l],
             centre: vec![Vec3::new(0.0, -0.1, 0.0), Vec3::ZERO, Vec3::X],
+            split: Some(GlareSplit {
+                bulb: vec![0.4 * pi_l, 0.0, 8.0 * pi_l],
+                bulb_centre: vec![Vec3::new(0.0, -0.12, 0.0), Vec3::ZERO, Vec3::X],
+                lit_centre: vec![Vec3::new(0.0, -0.05, 0.0), Vec3::ZERO, Vec3::X],
+                lit_spread: vec![0.03, 0.0, 0.1],
+            }),
         });
         let t = glare_table(&cards, luminance).expect("it shows");
         assert!((t.share[0] - 0.5).abs() < 1e-6 && t.share[1] == 0.0 && t.share[2] == MAX_SIDE, "{:?}", t.share);
         assert_eq!(t.centre[0], Vec3::new(0.0, -0.1, 0.0));
+        let split = t.split.as_ref().expect("the split carried over");
+        assert!((split.bulb[0] - 0.4).abs() < 1e-6 && split.bulb[2] == MAX_SIDE, "{:?}", split.bulb);
+        assert_eq!((split.bulb_centre[0], split.lit_centre[0], split.lit_spread[0]), (Vec3::new(0.0, -0.12, 0.0), Vec3::new(0.0, -0.05, 0.0), 0.03));
         cards.glare.as_mut().unwrap().flux = vec![0.001; 3];
         assert_eq!(glare_table(&cards, luminance), None, "below CARRIES_GLOW everywhere");
     }
