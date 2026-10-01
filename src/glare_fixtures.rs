@@ -25,7 +25,7 @@ use std::collections::HashMap;
 
 use glam::{Mat3, Quat, Vec3};
 use space_soup::renderer::glare::GlareSource;
-use space_soup_engine::reflection_cards::{LoadedCards, CARD_FACES};
+use space_soup_engine::reflection_cards::{card_point, LoadedCards, CARD_FACES};
 use space_soup_engine::scene::GameObject;
 use space_soup_engine::scene_light::{GlareFacesDef, LightDef};
 use space_soup_engine::LightKind;
@@ -57,6 +57,19 @@ const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
 pub(crate) struct FixtureGlare {
     pub sides: [f32; 6],
     pub frame: Option<Quat>,
+    /// Where each side sees the light come out, in the world: see
+    /// [`card_centres`]. `None` for the author's faces.
+    pub centres: Option<[Vec3; 6]>,
+}
+
+/// What a fixture's cards say about its glare: each side's share
+/// ([`card_sides`]), the frame they were taken in, and where on the fixture
+/// each side sees its light, in the world ([`card_centres`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MeasuredGlare {
+    pub sides: [f32; 6],
+    pub frame: Quat,
+    pub centres: [Vec3; 6],
 }
 
 /// Each side's share of a bare lamp's light, from a fixture's cards: card `k`
@@ -81,6 +94,35 @@ pub(crate) fn card_sides(cards: &LoadedCards, half_size: Vec3, luminance: f32) -
         *side = (excess * texel_area / (std::f32::consts::PI * luminance)).min(MAX_SIDE);
     }
     (sides.iter().copied().fold(0.0, f32::max) >= CARRIES_GLOW).then_some(sides)
+}
+
+/// WHERE each side sees the light come out, in the box's frame: the middle of
+/// the light card `k` saw past `BRIGHT`, each texel at the depth it saw it
+/// (`card_point`), weighed by how far past. From below a sconce that is its
+/// open mouth; the bulb hangs up inside the shade, and a veil grown from there
+/// lit the dark shade over the mouth (headset, 2026-09-30). A side that saw no
+/// such light keeps the box's middle; it shows nothing, so nothing weighs it.
+pub(crate) fn card_centres(cards: &LoadedCards, half_size: Vec3) -> [Vec3; 6] {
+    let res = cards.resolution as usize;
+    let mut centres = [Vec3::ZERO; 6];
+    if res == 0 || cards.texels.len() < CARD_FACES * res * res {
+        return centres;
+    }
+    for (k, centre) in centres.iter_mut().enumerate() {
+        let (mut sum, mut weight) = (Vec3::ZERO, 0.0f32);
+        for (i, t) in cards.texels[k * res * res..(k + 1) * res * res].iter().enumerate() {
+            let excess = (Vec3::new(t[0], t[1], t[2]).dot(LUMA) - BRIGHT).max(0.0);
+            if excess > 0.0 {
+                let (u, v) = (((i % res) as f32 + 0.5) / res as f32, ((i / res) as f32 + 0.5) / res as f32);
+                sum += card_point(k, u, v, t[3].clamp(0.0, 1.0), half_size) * excess;
+                weight += excess;
+            }
+        }
+        if weight > 0.0 {
+            *centre = sum / weight;
+        }
+    }
+    centres
 }
 
 /// The author's faces as sides of [`light_frame`]: right and left along +x and
@@ -113,7 +155,7 @@ fn light_luminance(l: &LightDef) -> f32 {
 /// model. `card_sides` holds what [`card_sides`] measured, by object id with
 /// the frame its cards were taken in; a fixture without them takes its
 /// light's authored faces.
-pub(crate) fn fixtures(objects: &[GameObject], measured: &HashMap<String, ([f32; 6], Quat)>) -> HashMap<String, FixtureGlare> {
+pub(crate) fn fixtures(objects: &[GameObject], measured: &HashMap<String, MeasuredGlare>) -> HashMap<String, FixtureGlare> {
     let mut out = HashMap::new();
     for o in objects.iter().filter(|o| o.mesh.is_some()) {
         for (i, l) in o.lights.iter().enumerate() {
@@ -121,8 +163,8 @@ pub(crate) fn fixtures(objects: &[GameObject], measured: &HashMap<String, ([f32;
                 continue;
             }
             let glare = match measured.get(&o.id) {
-                Some((sides, frame)) => FixtureGlare { sides: *sides, frame: Some(*frame) },
-                None => FixtureGlare { sides: authored_sides(&l.glare_faces), frame: None },
+                Some(m) => FixtureGlare { sides: m.sides, frame: Some(m.frame), centres: Some(m.centres) },
+                None => FixtureGlare { sides: authored_sides(&l.glare_faces), frame: None, centres: None },
             };
             out.insert(format!("{}#{i}", o.id), glare);
         }
@@ -132,7 +174,7 @@ pub(crate) fn fixtures(objects: &[GameObject], measured: &HashMap<String, ([f32;
 
 /// [`fixtures`] for a scene file, its transforms resolved to world space as
 /// the proxies' were. Empty when the scene does not load.
-pub(crate) fn load(game_dir: &std::path::Path, scene_name: &str, measured: &HashMap<String, ([f32; 6], Quat)>) -> HashMap<String, FixtureGlare> {
+pub(crate) fn load(game_dir: &std::path::Path, scene_name: &str, measured: &HashMap<String, MeasuredGlare>) -> HashMap<String, FixtureGlare> {
     let path = space_soup_engine::Manifest::scene_path(game_dir, scene_name);
     match space_soup_engine::scene::Scene::load(&path) {
         Ok(mut s) => {
@@ -154,10 +196,10 @@ pub(crate) fn load(game_dir: &std::path::Path, scene_name: &str, measured: &Hash
 /// (`emissive_drive`).
 pub(crate) fn measure(
     objects: &[GameObject],
-    cards: &[(usize, &LoadedCards, Vec3, Quat)],
-) -> HashMap<String, ([f32; 6], Quat)> {
+    cards: &[(usize, &LoadedCards, Vec3, Vec3, Quat)],
+) -> HashMap<String, MeasuredGlare> {
     let mut out = HashMap::new();
-    for &(object, c, half_size, rotation) in cards {
+    for &(object, c, centre, half_size, rotation) in cards {
         let Some(o) = objects.get(object) else { continue };
         let luminance = o
             .lights
@@ -172,7 +214,8 @@ pub(crate) fn measure(
                     o.id,
                     sides.map(|s| (s * 100.0).round() / 100.0),
                 );
-                out.insert(o.id.clone(), (sides, rotation));
+                let centres = card_centres(c, half_size).map(|p| centre + rotation * p);
+                out.insert(o.id.clone(), MeasuredGlare { sides, frame: rotation, centres });
             }
             None if luminance > 0.0 => {
                 log::info!("glare: '{}' cards carry no glow; its lights' authored faces decide", o.id)
@@ -216,6 +259,7 @@ pub(crate) fn sources<'a>(
                 sides: f.sides,
                 rotation: yaw_inv * f.frame.unwrap_or_else(|| light_frame(direction)),
                 cone,
+                centres: f.centres.map(|cs| cs.map(|c| yaw_inv * (c - offset))),
             })
         })
         .collect()
@@ -297,7 +341,7 @@ mod tests {
     #[test]
     fn a_fixtures_lamp_becomes_a_source_in_the_players_frame() {
         let mut fixtures = HashMap::new();
-        fixtures.insert("lamp#0".to_string(), FixtureGlare { sides: [1.0; 6], frame: None });
+        fixtures.insert("lamp#0".to_string(), FixtureGlare { sides: [1.0; 6], frame: None, centres: None });
         let spot = WireRenderLight {
             position: [2.0, 3.0, 0.0],
             direction: [0.0, -1.0, 0.0],
@@ -319,9 +363,61 @@ mod tests {
         assert!((inner - 10f32.to_radians().cos()).abs() < 1e-5);
         // Measured by its cards, the bulb shows wherever they saw it, beam or
         // no beam.
-        fixtures.insert("lamp#0".to_string(), FixtureGlare { sides: [1.0; 6], frame: Some(Quat::IDENTITY) });
+        fixtures.insert("lamp#0".to_string(), FixtureGlare { sides: [1.0; 6], frame: Some(Quat::IDENTITY), centres: None });
         let measured = sources([&spot], &fixtures, Vec3::new(1.0, 0.0, 0.0), yaw_inv);
         assert_eq!(measured[0].cone, None);
+    }
+
+    /// A bright patch on one card puts that side's centre where the card
+    /// saw it -- at its texels' place and depth (`card_point`) -- and the dim
+    /// texels round it weigh nothing.
+    #[test]
+    fn a_sides_centre_is_where_its_card_saw_the_light() {
+        let res = 8u32;
+        let half = Vec3::new(0.2, 0.3, 0.1);
+        let mut cards = blank_cards(res);
+        // Card 3 (from below): texels (2,5) and (3,5) glow, 0.25 of the way in.
+        for x in [2usize, 3] {
+            cards.texels[3 * 64 + 5 * 8 + x] = [20.0, 20.0, 20.0, 0.25];
+        }
+        // A dim shade elsewhere on it counts for nothing.
+        cards.texels[3 * 64] = [1.0, 1.0, 1.0, 0.1];
+        let c = card_centres(&cards, half)[3];
+        let want = card_point(3, 3.0 / 8.0, 5.5 / 8.0, 0.25, half);
+        assert!((c - want).length() < 1e-5, "{c} vs {want}");
+        assert_eq!(card_centres(&cards, half)[2], Vec3::ZERO, "a side that saw no light keeps the middle");
+    }
+
+    /// THE LEVEL'S SCONCES SHOW THEIR LIGHT FROM THEIR MOUTHS: seen from below,
+    /// each one's centre lies below its bulb -- in the opening, not up in the
+    /// shade -- and on the fixture.
+    #[test]
+    fn test_rooms_sconces_glare_from_their_mouths() {
+        let game = Path::new(env!("CARGO_MANIFEST_DIR")).join("../game");
+        let Some(level) = crate::probe_level::ProbeLevel::load(&game, "test_room") else {
+            eprintln!("test_room probes not baked; skipping");
+            return;
+        };
+        let standing = level.scene_proxies(&game, "test_room");
+        let mut scene =
+            space_soup_engine::scene::Scene::load(&space_soup_engine::Manifest::scene_path(&game, "test_room")).unwrap();
+        scene.resolve_world_transforms();
+        for lamp in ["hallway_sconce_south", "hallway_sconce_north"] {
+            let m = standing.glare.get(lamp).unwrap_or_else(|| panic!("{lamp}'s cards carry its bulb"));
+            let o = scene.objects.iter().find(|o| o.id == lamp).unwrap();
+            let l = &o.lights[0];
+            let bulb = space_soup_engine::scene_light::resolve_light_pose(
+                l,
+                o.cuboid.position,
+                o.cuboid.rotation,
+                l.socket.as_deref().and_then(|n| o.socket(n)),
+            )
+            .position;
+            let below = m.centres[3];
+            eprintln!("{lamp}: bulb {bulb}, light from below shows at {below}");
+            assert!(below.y < bulb.y - 0.02, "{lamp}: {below} not below the bulb {bulb}");
+            assert!((below - bulb).length() < 0.25, "{lamp}: {below} is not on the fixture round {bulb}");
+        }
     }
 
     /// THE LEVEL'S OWN: every fixture's cards carry its bulb -- the sconces'
@@ -336,7 +432,7 @@ mod tests {
         };
         let standing = level.scene_proxies(&game, "test_room");
         for lamp in ["hallway_sconce_south", "hallway_sconce_north", "hall_spot_1", "hall_spot_2", "brick_lamp"] {
-            let (sides, _) = standing.glare.get(lamp).unwrap_or_else(|| panic!("{lamp}'s cards carry its bulb"));
+            let sides = standing.glare.get(lamp).unwrap_or_else(|| panic!("{lamp}'s cards carry its bulb")).sides;
             eprintln!("{lamp} sides {sides:?}");
             assert!(sides[3] > 0.1, "{lamp} from below: {sides:?}");
             assert!(sides[2] < 0.25 * sides[3], "{lamp} from above, far less: {sides:?}");
