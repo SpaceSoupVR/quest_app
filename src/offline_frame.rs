@@ -1027,6 +1027,35 @@ mod tests {
         }
     }
 
+    /// THE SAME PICTURE AT ANY TURN. A snap or stick turn changes only the
+    /// rig's yaw, which turns the frame geometry and lights reach the shaders
+    /// in -- the world drawn is the same, so the picture must be. Players turn
+    /// by stick, by snapping and by turning round (user, 2026-10-01). The
+    /// bounce direction a lightmap stores was baked in the world and read
+    /// against the player's normals: the hallway's rock read 1% darker at 180
+    /// degrees on the headset and exactly the same here once fixed. From the
+    /// hall through the hallway door, where rock, marble and both rooms show.
+    #[test]
+    fn a_view_is_the_same_picture_at_any_turn() {
+        let view = View {
+            width: 192,
+            height: 192,
+            linear: true,
+            ..View::headset(Vec3::new(1.5, 1.6, -3.6), Vec3::new(2.8, 1.75, -2.35))
+        };
+        let Some(still) = render_brushes("test_room", view) else {
+            eprintln!("skipping: no GPU or no test_room");
+            return;
+        };
+        for yaw_deg in [90.0, 180.0, -45.0] {
+            let turned = render_brushes("test_room", View { yaw_deg, ..view }).unwrap();
+            let off: Vec<u8> = still.rgba.iter().zip(&turned.rgba).map(|(a, b)| a.abs_diff(*b)).collect();
+            let share = off.iter().filter(|&&d| d > 2).count() as f32 / off.len() as f32;
+            let mean = off.iter().map(|&d| d as f32).sum::<f32>() / off.len() as f32;
+            assert!(share < 0.001 && mean < 0.05, "turned {yaw_deg} degrees: {:.3}% of channels off by more than 2, mean {mean:.3}", share * 100.0);
+        }
+    }
+
     /// THE PILLAR FROM WHERE IT WAS LOOKED AT on the headset (2026-09-25,
     /// screenshot 23:06:10): the floor in front of it should mirror it and,
     /// with SSR off, did not. Adapted, to $OUT/pillar_$TAG.png.
@@ -1093,6 +1122,7 @@ mod tests {
             yaw_deg: num("YAW").unwrap_or(0.0),
             jitter_px: [num("JX").unwrap_or(0.0), num("JY").unwrap_or(0.0)],
             linear,
+            cut: std::env::var("CUT").ok().map(|c| &*Box::leak(c.into_boxed_str())),
             ..v
         };
         let Some(shot) = render_brushes("test_room", View { adapt: !sources && !linear, sources, half_res_reflections, ..v }) else {
