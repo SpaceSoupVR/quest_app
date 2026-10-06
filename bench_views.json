@@ -275,6 +275,125 @@
       "at": [3.0, 0.6, -3.0],
       "sway": 0.6,
       "note": "hall_to_hallway_floor at walking pace: the sconce's reflection in the marble floor."
+    },
+    {
+      "name": "torch_pillar",
+      "eye": [0.3, 1.6, -3.0],
+      "at": [0.0, 0.9, -7.0],
+      "flashlight": {"at": [0.55, 1.25, -3.2], "aim": [0.0, 1.0, -6.4]},
+      "note": "The player's flashlight (right stick click) held at the hip, aimed at the marble pillar from 3.4 m: its pool on the pillar, the pillar's shadow on the floor and wall behind, its highlight on the polished stone and in the floor's reflection. Compare with `pillar`, the same view without it."
+    },
+    {
+      "name": "torch_floor",
+      "eye": [0.0, 1.6, -1.0],
+      "at": [0.0, 0.0, -3.0],
+      "flashlight": {"at": [0.25, 1.2, -1.2], "aim": [0.0, 0.0, -2.6]},
+      "note": "The flashlight aimed down at the polished marble ahead: its hot spot, its sharp highlight in the floor and the beam's edge across the stone."
+    },
+    {
+      "name": "torch_hallway",
+      "eye": [3.4, 1.6, -3.0],
+      "at": [9.0, 1.4, -3.0],
+      "flashlight": {"at": [3.65, 1.25, -2.8], "aim": [8.5, 1.0, -3.2]},
+      "note": "The flashlight down the darker stone hallway past the sconces: the beam on the normal-mapped rock and what eye adaptation makes of it. Compare with `hallway`."
+    },
+    {
+      "name": "torch_wall",
+      "eye": [0.2, 1.6, -9.6],
+      "at": [-2.7, 1.3, -10.6],
+      "flashlight": {"at": [0.0, 1.25, -9.85], "aim": [-2.7, 1.1, -10.4]},
+      "note": "The flashlight on the hall's west wall from 2.7 m, the floor and the ceiling's corner round the pool in view: what the beam's bounce lights round it, in the marble's colour (user, 2026-10-02: the flashlight's light does not bounce). Compare with levers {\"flashlight_bounce\": false}."
+    },
+    {
+      "name": "torch_in_hand",
+      "eye": [0.0, 1.6, -1.0],
+      "at": [0.2, 1.1, -1.6],
+      "flashlight": {"at": [0.2, 1.25, -1.45], "aim": [0.0, 0.3, -4.0], "torch": true},
+      "note": "The torch itself held in view 40 cm from the eye, its glass lit, its beam on the floor beyond: the model as drawn and lit by the room."
+    },
+    {
+      "name": "torch_facing",
+      "eye": [0.0, 1.6, -1.0],
+      "at": [0.0, 1.5, -3.0],
+      "flashlight": {"at": [0.1, 1.45, -3.0], "aim": [0.0, 1.6, -1.0], "torch": true},
+      "note": "A torch 2 m off shone straight at the eye, as another player's would be: its glass's glare, which a flashlight had none of until 2026-10-02 (user: \"the flashlight will need to have the hdr bloom effect on it, at least in reflections or to other players\")."
+    },
+    {
+      "name": "torch_floor_mirror",
+      "eye": [0.0, 1.6, -1.0],
+      "at": [0.1, 0.0, -1.6],
+      "flashlight": {"at": [0.2, 1.3, -1.3], "aim": [0.1, 0.0, -1.5], "torch": true},
+      "note": "The torch drawn and aimed down at the marble just ahead of the feet, looked at: its body and its glowing glass in the floor, and the glass's glare there (user, 2026-10-02: the flashlight \"does not show as a reflection on any surface\"; \"the hdr bloom effect on it, at least in reflections\")."
+    },
+    {
+      "name": "torch_pillar_mirror",
+      "eye": [0.3, 1.6, -3.0],
+      "at": [0.3, 1.3, -6.5],
+      "flashlight": {"at": [0.45, 1.3, -3.2], "aim": [0.3, 1.2, -6.4], "torch": true},
+      "note": "The torch drawn and shone at the marble pillar's face from 3.4 m: the torch and its glass in the pillar, and the glass's glare there."
+    },
+    {
+      "name": "torch_pillar_side",
+      "eye": [-1.6, 1.6, -3.0],
+      "at": [-1.0, 0.6, -9.0],
+      "flashlight": {"at": [1.4, 1.2, -4.0], "aim": [0.0, 1.0, -7.0]},
+      "note": "The flashlight held 3 m right of the eye and shone past the marble pillar, so the pillar's shadow falls behind and left of it -- on the floor and the west wall -- in plain view (user, 2026-10-06: the marble column did not seem to cast a shadow from the flashlight)."
+    },
+    {
+      "name": "torch_pendant",
+      "eye": [0.4, 1.6, -0.5],
+      "at": [0.0, 2.3, 2.5],
+      "flashlight": {"at": [0.65, 1.25, -0.3], "aim": [0.0, 2.1, 1.5]},
+      "note": "The flashlight held at the hip aimed up at the front pendant (hall_spot_2), its shadow on the south wall 2.2 m behind it and the ceiling: the user's 01:41-01:42 screenshots (2026-10-02), where the shade's shadow ended on a straight vertical line."
+    },
+    {
+      "name": "torch_pendant_side",
+      "eye": [-1.3, 1.6, -0.2],
+      "at": [0.4, 2.3, 2.6],
+      "flashlight": {"at": [-1.05, 1.25, 0.0], "aim": [0.0, 2.1, 1.5]},
+      "note": "torch_pendant from 1.7 m to the west: the same lamp's shadow thrown toward the east corner. A cut that stays put on the wall while the light moves is in the geometry; one that moves with the light is in the shadow map."
+    },
+    {
+      "name": "torch_pendant_west",
+      "eye": [2.0, 1.6, 0.6],
+      "at": [-2.7, 2.4, 1.6],
+      "flashlight": {"at": [1.85, 1.25, 0.35], "aim": [0.0, 2.1, 1.5]},
+      "note": "The front pendant lit by a flashlight in the RIGHT hand, facing the west wall with the front door on the left: the layout of the user's 01:41-01:42 screenshots (2026-10-02), where the lamp's shadow on the back wall ended on a straight vertical line."
+    },
+    {
+      "name": "torch_pendant_west_high",
+      "eye": [2.0, 1.95, 0.6],
+      "at": [-2.7, 2.6, 1.6],
+      "flashlight": {"at": [1.85, 1.6, 0.35], "aim": [0.0, 2.1, 1.5]},
+      "note": "torch_pendant_west with the eye and the hand 35 cm higher, as the headset placed them that night (a floor estimated too low): the rims seen nearly edge on."
+    },
+    {
+      "name": "torch_doorway_out",
+      "eye": [-1.6, 1.6, 6.4],
+      "at": [0.7, 0.8, 3.85],
+      "flashlight": {"at": [-1.4, 1.25, 6.2], "aim": [0.45, 0.25, 3.55]},
+      "note": "Outside the hall's front door, the beam into the doorway past its east jamb: the headset's 'magnifying glass' spot low on that jamb (2026-10-02 09:42:34)."
+    },
+    {
+      "name": "torch_corner_out",
+      "eye": [4.6, 1.6, 6.2],
+      "at": [3.0, 1.5, 4.0],
+      "flashlight": {"at": [4.4, 1.25, 6.0], "aim": [3.05, 1.3, 4.05]},
+      "note": "The beam on the hall's front east corner from outside: the bright spot beside the corner's edge (2026-10-02 09:40:00)."
+    },
+    {
+      "name": "torch_hall_long",
+      "eye": [-1.3, 1.6, -1.8],
+      "at": [-0.4, 1.0, -15.0],
+      "flashlight": {"at": [1.0, 1.25, -2.0], "aim": [-0.4, 1.2, -15.7]},
+      "note": "The beam down the hall from 2.3 m right of the eye, so the eye sees round the pillar to its shadow: the shadow's edge splits the hot spot on the back wall at x -0.4, 13.8 m from the glass, and its wedge runs along the floor past 8 m, where every torch shadow used to stop (2026-10-05)."
+    },
+    {
+      "name": "torch_pendant_floor",
+      "eye": [0.4, 1.6, -0.5],
+      "at": [0.15, 0.0, 0.75],
+      "flashlight": {"at": [0.65, 1.25, -0.3], "aim": [0.0, 2.1, 1.5]},
+      "note": "torch_pendant's beam on the front pendant (hall_spot_2), looked at in the floor: its reflection there, at about (0.23, 0, 0.37), should be lit by the torch as the pendant is -- the cards' albedo relit in the fix-up pass (2026-10-05)."
     }
   ]
 }

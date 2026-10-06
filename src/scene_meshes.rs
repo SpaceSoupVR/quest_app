@@ -118,9 +118,16 @@ mod tests {
         std::fs::write(scenes.join("t.json"), body).unwrap();
     }
 
+    /// A folder of the test's own. Not by the clock alone: the tests run in
+    /// parallel and two can read the same time, and then share a folder and
+    /// each other's scene -- the lit lamp read the switched-off one's and
+    /// failed (2026-10-05). The count makes it the test's own.
     fn tmp() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let d = std::env::temp_dir().join(format!(
-            "ss_scene_meshes_{}",
+            "ss_scene_meshes_{}_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

@@ -24,6 +24,15 @@
             android:name="com.oculus.supportedDevices"
             android:value="quest|quest2|questpro|quest3" />
 
+        <!-- NOT USED: CPU-TO-GPU LEVEL TRADING,
+             com.oculus.trade_cpu_for_gpu_amount=1 (Meta, "po-quest-boost").
+             Tested in deploy99 (2026-10-06): the runtime took it and gave GPU
+             level 6, whose clock floor IS the 640 MHz cap (kgsl min_freq =
+             max_freq). A level is only a floor, and under load the governor
+             already ran at 640 MHz at level 4 or 5. So 72 Hz moved within
+             run-to-run spread and SpaceWarp not at all, for one CPU level
+             given up. See docs/frame-budget-plan-2026-10-06.md, A1. -->
+
         <!-- NPU GATE 0, step 3. The FastRPC client to the Hexagon DSP is on the
              device and listed in /vendor/etc/public.libraries.txt, and dlopen
              still refuses it by name AND by absolute path: "not accessible for

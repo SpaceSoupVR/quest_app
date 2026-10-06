@@ -30,7 +30,12 @@ use crate::brush_render::{load_materials, BrushGeometry};
 /// darkening and reflections: `CAPSULE_AT=x,z` (or `x,y,z`) stands one 1.75 m
 /// tall, arms down, feet on the floor there, facing +z. None without it. In the
 /// harness's player frame: the world less `offset`, turned by `yaw_inv`.
-fn offline_capsules(offset: Vec3, yaw_inv: Quat) -> space_soup::renderer::uniforms::CapsuleUpload {
+/// After it, `carried` -- a torch in the reflections.
+fn offline_capsules(
+    offset: Vec3,
+    yaw_inv: Quat,
+    carried: Option<space_soup::renderer::uniforms::CapsuleGroup>,
+) -> space_soup::renderer::uniforms::CapsuleUpload {
     use space_soup::renderer::uniforms::{CapsuleGroup, CapsuleUpload};
     let at = std::env::var("CAPSULE_AT").ok().and_then(|v| {
         let n: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
@@ -40,7 +45,7 @@ fn offline_capsules(offset: Vec3, yaw_inv: Quat) -> space_soup::renderer::unifor
             _ => None,
         }
     });
-    let Some(at) = at else { return CapsuleUpload::default() };
+    let Some(at) = at else { return CapsuleUpload::from_groups(&carried.into_iter().collect::<Vec<_>>()) };
     let p = |x: f32, y: f32, z: f32| yaw_inv * (at + Vec3::new(x, y, z) - offset);
     let capsules = vec![
         (p(0.0, 1.60, 0.0), p(0.0, 1.68, 0.0), 0.10),
@@ -56,7 +61,8 @@ fn offline_capsules(offset: Vec3, yaw_inv: Quat) -> space_soup::renderer::unifor
         (p(-0.1, 0.04, 0.0), p(-0.1, 0.04, 0.16), 0.04),
         (p(0.1, 0.04, 0.0), p(0.1, 0.04, 0.16), 0.04),
     ];
-    CapsuleUpload::from_groups(&[CapsuleGroup { capsules, colour: [0.46, 0.34, 0.27] }])
+    let figure = CapsuleGroup { capsules, colour: [0.46, 0.34, 0.27], surfaces: Vec::new() };
+    CapsuleUpload::from_groups(&std::iter::once(figure).chain(carried).collect::<Vec<_>>())
 }
 
 /// Quest 3 eye buffer at the shipped render scale (2064 x 2208 x 0.7).
@@ -121,6 +127,13 @@ pub struct View {
     /// held still: the crawl test's probe. A band-limited picture resamples
     /// smoothly under it; a hard per-pixel decision flips whole pixels.
     pub jitter_px: [f32; 2],
+    /// The player's flashlight, its glass and the point it is aimed at, as a
+    /// bench view's `flashlight` has them: its beam and the lights of its
+    /// bounce (`flashlight_bounce`). The beam casts no shadow here.
+    pub flashlight: Option<(Vec3, Vec3)>,
+    /// With the flashlight, its torch in the reflections, as its capsules
+    /// (`flashlight::torch_capsules`). The torch itself is not drawn here.
+    pub torch: bool,
 }
 
 impl View {
@@ -144,6 +157,8 @@ impl View {
             roll_deg: 0.0,
             yaw_deg: 0.0,
             jitter_px: [0.0, 0.0],
+            flashlight: None,
+            torch: false,
         }
     }
 }
@@ -213,10 +228,48 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     // the wrong way, and sunlit walls went dark at 90 degrees (2026-10-01).
     let sun = space_soup::renderer::lights::sky_sun_light(sky_sun.as_ref(), &lights, yaw_inv);
     lights.extend(sun);
+    // THE FLASHLIGHT, when the view holds one: its beam, then its bounce off
+    // what the beam lands on, cast against the brushes alone -- the frame
+    // casts the physics scene too, which adds the ground and the models.
+    let mut lit_surfaces: Vec<space_soup::renderer::lights::LitSurface> = Vec::new();
+    if let Some((glass, aim)) = view.flashlight {
+        let (lens, rotation) = crate::flashlight::lens_from_bench(glass, aim);
+        lights.push(crate::flashlight::beam(lens, rotation * Vec3::NEG_Z, offset, yaw_inv));
+        let brushes = BrushGeometry::load(&scene);
+        let albedos: Vec<Vec3> =
+            load_materials(&game, brushes.materials()).colours.iter().map(crate::brush_render::mean_albedo).collect();
+        let land = |o: Vec3, d: Vec3| {
+            brushes.cast(o, d, crate::flashlight::RANGE, &[]).map(|b| crate::flashlight_bounce::Landing {
+                point: b.point,
+                normal: b.normal,
+                albedo: albedos.get(b.material as usize).copied().unwrap_or(Vec3::ONE) * b.tint,
+            })
+        };
+        let rays = crate::flashlight_bounce::beam_rays(crate::flashlight::CONE_DEG, crate::flashlight::HOTSPOT_DEG);
+        let landed = crate::flashlight_bounce::landings(lens, rotation, &rays, land);
+        let patches = landed.patches();
+        // The surfaces its pool shows on in reflections, as the frame names
+        // them (`flashlight_bounce::HeldSurfaces`, freshly found).
+        // `NO_RELIGHT=1`: none, to see what the pool in reflections adds.
+        for s in landed.surfaces() {
+            eprintln!("LIT SURFACE {s:?}");
+            if std::env::var("NO_RELIGHT").as_deref() != Ok("1") {
+                lit_surfaces.push(crate::flashlight_bounce::lit_surface(&s, offset, yaw_inv));
+            }
+        }
+        // `NO_BOUNCE=1`: the beam alone, to see what the bounce adds.
+        if std::env::var("NO_BOUNCE").as_deref() != Ok("1") {
+            for p in &patches {
+                eprintln!("BOUNCE patch {p:?}");
+            }
+            lights.extend(patches.iter().filter_map(|p| crate::flashlight_bounce::light(p, offset, yaw_inv)));
+        }
+    }
     let lights = space_soup::renderer::lights::rank_for_budget(&lights, space_soup::renderer::lights::MAX_LIGHTS);
     let lights_uniform = LightsUniform::new(&device);
     lights_uniform.set_culling(view.light_culling);
     lights_uniform.set_terminator_aa(view.terminator_aa);
+    lights_uniform.set_lit_surfaces(&lit_surfaces);
     lights_uniform.upload_frame(&queue, &lights, &[], sun.is_some());
 
     // Probes, as `set_reflection_probes` binds them.
@@ -305,17 +358,31 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         None => Vec::new(),
     };
     // And their cards, each proxy naming its row as the headset's
-    // `set_reflection_proxies` names it. `NO_CARDS=1`: none, for a
-    // before/after -- the models then take their mean colour.
-    match space_soup::renderer::proxy_cards::atlas(&device, &queue, &cards) {
-        Some((atlas, rows)) if std::env::var("NO_CARDS").as_deref() != Ok("1") => {
-            uniforms.set_proxy_card_atlas(atlas);
-            for p in &mut proxies {
-                p.cards = p.cards.and_then(|i| rows.get(i as usize).copied().flatten());
-            }
+    // `set_reflection_proxies` names it, with the player's rows after them,
+    // under whose cards the torch's pool maps are made (`pool_cards`).
+    // `NO_CARDS=1`: no model's, for a before/after -- the models then take
+    // their mean colour.
+    let card_atlas = space_soup::renderer::proxy_cards::atlas_with_characters(
+        &device,
+        &queue,
+        &cards,
+        space_soup::renderer::proxy_cards::CHARACTER_CARD_SETS,
+    );
+    uniforms.set_proxy_card_atlas(card_atlas.view.clone());
+    if std::env::var("NO_CARDS").as_deref() != Ok("1") {
+        for p in &mut proxies {
+            p.cards = p.cards.and_then(|i| card_atlas.rows.get(i as usize).copied().flatten());
         }
-        _ => proxies.iter_mut().for_each(|p| p.cards = None),
+    } else {
+        proxies.iter_mut().for_each(|p| p.cards = None);
     }
+    // The torch's pool maps, as the headset makes them each frame, and the
+    // lights sent again to name where. See `pool_cards`.
+    let pools = space_soup::renderer::pool_cards::PoolCards::new(&device, &uniforms.layout, card_atlas.resolution);
+    let pool_row = Some(pools.first_row(card_atlas.pool_row));
+    lights_uniform.set_pool_row(pool_row);
+    lights_uniform.upload_frame(&queue, &lights, &[], sun.is_some());
+    let pool_mips = space_soup::renderer::brush_pipeline::probe_pass::MirrorMips::new(&device);
 
     let mut ground_placement = None;
     // THE PROBES' DISTANCES, bound as the headset binds them, so the trace
@@ -410,7 +477,18 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             terrain_detail_distance: std::env::var("TERRAIN_DETAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
             reflection_share: false,
         },
-        &PlayerUpload { offset, yaw, capsules: offline_capsules(offset, yaw_inv) },
+        &PlayerUpload {
+            offset,
+            yaw,
+            capsules: offline_capsules(
+                offset,
+                yaw_inv,
+                view.flashlight.filter(|_| view.torch).map(|(glass, aim)| {
+                    let (lens, rotation) = crate::flashlight::lens_from_bench(glass, aim);
+                    crate::flashlight::torch_capsules(lens, rotation, offset, yaw_inv)
+                }),
+            ),
+        },
         Some(&probes),
     );
 
@@ -440,8 +518,25 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         if inline_lookups {
             (BrushPipeline::new_probe_pass(&device, &uniforms.layout, ViewMode::Mono), target, None)
         } else {
-            let fixups = space_soup::renderer::probe_fixup::ProbeFixups::new(&device, &uniforms.layout, target.width * target.height);
-            let pipeline = BrushPipeline::new_probe_pass_deferred(&device, &uniforms.layout, &fixups);
+            let mut fixups = space_soup::renderer::probe_fixup::ProbeFixups::new(&device, &uniforms.layout, target.width * target.height);
+            // `FIXUP_CUT=<cut>`: the fix-up run with one of its measurement cuts
+            // (`probe_fixup::FIXUP_CUTS`, or `fixup_inlined`), as the `fixup_cut`
+            // lever runs it on the headset.
+            if let Ok(cut) = std::env::var("FIXUP_CUT") {
+                assert!(fixups.set_cut(&device, Some(&cut)), "no fix-up cut {cut}, or it no longer matches the shader");
+            }
+            // `PASS_CUT=<cut>`: the pass drawn with one of its measurement cuts
+            // (`brush_pipeline::DEFERRED_REGISTER_CUTS`), as the `pass_cut`
+            // lever draws it on the headset.
+            // With no lit surface, the poolless twin, as the headset draws it
+            // (`lights::without_pool_maps`); `POOLLESS=0` draws the full pass.
+            let poolless = std::env::var("POOLLESS").as_deref() != Ok("0") && !lights_uniform.reads_pool_maps();
+            let pipeline = match std::env::var("PASS_CUT") {
+                Ok(cut) => BrushPipeline::new_probe_pass_deferred_with_cut(&device, &uniforms.layout, &fixups, &cut)
+                    .unwrap_or_else(|| panic!("no probe pass cut {cut}, or it no longer matches the shader")),
+                Err(_) if poolless => BrushPipeline::new_probe_pass_deferred_poolless(&device, &uniforms.layout, &fixups),
+                Err(_) => BrushPipeline::new_probe_pass_deferred(&device, &uniforms.layout, &fixups),
+            };
             let target_bg = fixups.target_bind_group(&device, &target);
             let pass_bg = fixups.pass_bind_group_for(&device, &target);
             (pipeline, target, Some((fixups, (target_bg, pass_bg))))
@@ -471,7 +566,10 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         &crate::scene_lights::stationary_channels(&game, scene_name),
     );
     let dir = pick(space_soup_engine::lightmaps::SCENE_BRUSH_DIRECTION_ID);
-    let sun_mask = pick(space_soup_engine::lightmaps::SCENE_BRUSH_SUN_MASK_ID);
+    // Filled round its charts as the headset fills it. See
+    // `brush_pipeline::dilate_sun_mask`.
+    let sun_mask = pick(space_soup_engine::lightmaps::SCENE_BRUSH_SUN_MASK_ID)
+        .map(|d| (space_soup::renderer::brush_pipeline::dilate_sun_mask(&d.rgba, d.width, d.height), d.width, d.height));
     let stationary_layers: Vec<&[u8]> = stationary.iter().map(|m| m.rgba.as_slice()).collect();
     let lightmap = space_soup::renderer::mesh::create_lightmap_texture_full(
         &device,
@@ -484,7 +582,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         base.width,
         base.height,
         dir.map(|d| (d.rgba.as_slice(), d.width, d.height)),
-        sun_mask.map(|d| (d.rgba.as_slice(), d.width, d.height)),
+        sun_mask.as_ref().map(|(rgba, w, h)| (rgba.as_slice(), *w, *h)),
         stationary.first().map(|m| (stationary_layers.as_slice(), m.width, m.height)),
     );
 
@@ -525,6 +623,11 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     let mut encoder = device.create_command_encoder(&Default::default());
     // See `FIXUP_STATS` at the fix-up's dispatch.
     let mut fixup_census: Option<(wgpu::Buffer, (u32, u32))> = None;
+    if let (Some(_), Some(row)) = (&probe_pass, pool_row) {
+        if lights_uniform.reads_pool_maps() {
+            pools.record(&device, &mut encoder, &uniforms.bind_group, &pool_mips, &card_atlas.texture, row, None);
+        }
+    }
     if let Some((probe_pipeline, target, fixups)) = &probe_pass {
         if let Some((fixups, _)) = fixups {
             fixups.clear(&mut encoder);
@@ -646,12 +749,24 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         let word = |o: usize| u32::from_le_bytes(data[o..o + 4].try_into().unwrap());
         let capacity = ((data.len() - 16) / 128) as u32;
         let n = word(0).min(capacity) as usize;
-        let (mut subsample, mut retest, mut edge, mut rim, mut mirror) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let (mut subsample, mut retest, mut edge, mut rim, mut mirror, mut recolour) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        // The rims by kind -- through the opening (a point already known),
+        // into the wall beside it (a second trace), at the opening's far end
+        // -- and by the surface's roughness: under 0.2, 0.45, 0.7, and above.
+        let (mut rim_through, mut rim_far) = (0usize, 0usize);
+        let mut rim_rough = [0usize; 4];
         for k in 0..n {
             let b = 16 + k * 128;
             let f = |i: usize| f32::from_bits(word(b + 96 + i * 4));
             let (rim_at, edge_cover) = (f(0), f(2));
             let edge_code = word(b + 116) as i32;
+            if rim_at >= 0.0 {
+                let rim_code = word(b + 112) as i32;
+                rim_through += (rim_code & 1 != 0) as usize;
+                rim_far += (rim_code & 8192 != 0) as usize;
+                let roughness = f32::from_bits(word(b + 60));
+                rim_rough[[0.2f32, 0.45, 0.7].iter().filter(|&&r| roughness >= r).count()] += 1;
+            }
             // `PROBE_RETEST` (-4 less the cover) or `PROBE_SUBSAMPLE` (-cover).
             if edge_code >= 0 && edge_cover < -2.0 {
                 retest += 1;
@@ -662,11 +777,22 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             }
             rim += (rim_at >= 0.0) as usize;
             mirror += (f(7) < 0.0) as usize;
+            // On a model's cards and marked for nothing else: recorded only so
+            // the fix-up colours it (`lights::probe_hit_carded`).
+            recolour += (word(b + 12) != 0 && !(edge_code >= 0 && edge_cover < 0.0)) as usize;
         }
         let texels = (tw * th).max(1) as f32;
         eprintln!(
-            "fixups: {n} records ({:.2}% of the {tw}x{th} pass): outline subsamples {subsample}, card retests {retest}, edges {edge}, rims {rim}, floor mirror {mirror}",
+            "fixups: {n} records ({:.2}% of the {tw}x{th} pass): outline subsamples {subsample}, card retests {retest}, card recolours {recolour}, edges {edge}, rims {rim}, floor mirror {mirror}",
             100.0 * n as f32 / texels
+        );
+        eprintln!(
+            "fixup rims: through {rim_through}, into the wall {}, far end {rim_far}; roughness <0.2 {}, <0.45 {}, <0.7 {}, >=0.7 {}",
+            rim - rim_through,
+            rim_rough[0],
+            rim_rough[1],
+            rim_rough[2],
+            rim_rough[3]
         );
     }
     let slice = readback.slice(..);
@@ -801,19 +927,33 @@ mod tests {
     /// never up close. 139 such pixels in the front junctions of this view
     /// before the fix, none after (2026-09-23).
     /// THE LIGHT LOOP'S CULLING CHANGES NO PIXEL. It skips a lamp past its
-    /// range, or one its baked mask hides from the pixel, and both of those
-    /// multiply the lamp's whole contribution by exactly zero -- so the frame
-    /// with culling must be the frame without it, byte for byte, in views that
-    /// see lamps in other rooms through doorways and across the hall.
+    /// range, outside its cone, or one its baked mask hides from the pixel,
+    /// and each of those multiplies the lamp's whole contribution by exactly
+    /// zero -- so the frame with culling must be the frame without it, byte
+    /// for byte, in views that see lamps in other rooms through doorways and
+    /// across the hall, and with the flashlight's bounce, whose half-space
+    /// cone is culled behind its patch.
     #[test]
     fn light_culling_changes_no_pixel() {
-        for (eye, at) in [
+        for (eye, at, flashlight) in [
             // Across the hall toward the hallway door: lamps in all three rooms.
-            (Vec3::new(-2.45, 1.6, 2.0), Vec3::new(0.0, 0.0, -5.9)),
+            (Vec3::new(-2.45, 1.6, 2.0), Vec3::new(0.0, 0.0, -5.9), None),
             // Down the hallway, its sconces and the brick room beyond.
-            (Vec3::new(3.4, 1.6, -3.0), Vec3::new(9.0, 1.4, -3.0)),
+            (Vec3::new(3.4, 1.6, -3.0), Vec3::new(9.0, 1.4, -3.0), None),
+            // The bench's torch_wall and torch_pillar: the beam on the west
+            // wall, and past the pillar's edge into the room behind it.
+            (
+                Vec3::new(0.2, 1.6, -9.6),
+                Vec3::new(-2.7, 1.3, -10.6),
+                Some((Vec3::new(0.0, 1.25, -9.85), Vec3::new(-2.7, 1.1, -10.4))),
+            ),
+            (
+                Vec3::new(0.3, 1.6, -3.0),
+                Vec3::new(0.0, 0.9, -7.0),
+                Some((Vec3::new(0.55, 1.25, -3.2), Vec3::new(0.0, 1.0, -6.4))),
+            ),
         ] {
-            let v = View::headset(eye, at);
+            let v = View { flashlight, ..View::headset(eye, at) };
             let Some(culled) = render_brushes("test_room", v) else {
                 eprintln!("skipping: no GPU or no test_room");
                 return;
@@ -1305,14 +1445,43 @@ mod bench_views {
         }
     }
 
+    /// Each viewpoint's flashlight, if it carries one: its glass, where it is
+    /// aimed, and whether its torch is drawn.
+    fn bench_flashlights() -> std::collections::HashMap<String, (Vec3, Vec3, bool)> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bench_views.json");
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let v3 = |v: &serde_json::Value| Vec3::from(<[f32; 3]>::try_from(serde_json::from_value::<Vec<f32>>(v.clone()).unwrap()).unwrap());
+        doc["views"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["flashlight"].is_object())
+            .map(|v| {
+                let f = &v["flashlight"];
+                (v["name"].as_str().unwrap().to_string(), (v3(&f["at"]), v3(&f["aim"]), f["torch"].as_bool().unwrap_or(false)))
+            })
+            .collect()
+    }
+
     /// THE BENCHMARK'S VIEWPOINTS, rendered here, so the frame the headset
-    /// measures from each can be looked at: `$OUT/bench_<name>.png`.
+    /// measures from each can be looked at: `$OUT/bench_<name>.png`, each with
+    /// its flashlight and its torch's reflection (not the torch itself, nor
+    /// any glare). `ONLY=a,b` for some of them.
     #[test]
     #[ignore]
     fn render_the_bench_views() {
         let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
+        let only = std::env::var("ONLY").ok();
+        let lights = bench_flashlights();
         for (name, eye, at) in bench_views() {
-            let Some(shot) = render_brushes("test_room", View { adapt: true, ..View::headset(eye, at) }) else {
+            if only.as_ref().is_some_and(|o| !o.split(',').any(|n| n == name)) {
+                continue;
+            }
+            let (flashlight, torch) = match lights.get(&name) {
+                Some(&(glass, aim, torch)) => (Some((glass, aim)), torch),
+                None => (None, false),
+            };
+            let Some(shot) = render_brushes("test_room", View { adapt: true, flashlight, torch, ..View::headset(eye, at) }) else {
                 eprintln!("skipping: no GPU or no test_room");
                 return;
             };

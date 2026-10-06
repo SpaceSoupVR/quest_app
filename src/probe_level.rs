@@ -217,7 +217,12 @@ impl ProbeLevel {
             let cards = match (mesh, object) {
                 (Some(_), Some(o)) => loaded_cards.iter().find(|c| c.object_id == o.id).map(|c| {
                     pictured.push((p.object, c, p.centre, p.half_size, p.rotation));
-                    out.cards.push(ProxyCards { resolution: c.resolution, texels: c.texels.clone(), normals: c.normals.clone() });
+                    out.cards.push(ProxyCards {
+                        resolution: c.resolution,
+                        texels: c.texels.clone(),
+                        normals: c.normals.clone(),
+                        albedo: c.albedo.clone(),
+                    });
                     out.cards.len() as u32 - 1
                 }),
                 _ => None,

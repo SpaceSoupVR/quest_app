@@ -60,6 +60,9 @@ pub(crate) fn to_space_soup_cuboid(rc: &WireRenderCuboid, offset: Vec3, yaw_inv:
 pub(crate) fn to_space_soup_light(rl: &WireRenderLight, offset: Vec3, yaw_inv: Quat) -> Light {
     Light {
         mask_channel: None,
+        shadow_near: None,
+        source_radius: 0.0,
+        in_level_bake: true,
         position: yaw_inv * (Vec3::from(rl.position) - offset),
         direction: yaw_inv * Vec3::from(rl.direction),
         kind: match rl.kind {

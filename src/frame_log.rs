@@ -8,7 +8,15 @@ use crate::avatar;
 use crate::grab_detect;
 use crate::network;
 
-pub(crate) fn send_local_pose(net: &network::NetworkHandle, rig: &PlayerRig) {
+/// The local pose for the other players, with `floor`: the height in the world
+/// of the floor the player stands on (the rig's offset), which their avatar's
+/// height is measured from; and their `flashlight`, while it is lit.
+pub(crate) fn send_local_pose(
+    net: &network::NetworkHandle,
+    rig: &PlayerRig,
+    floor: f32,
+    flashlight: Option<avatar::Flashlight>,
+) {
     let to_avatar_transform = |tf: space_soup_engine::Transform| avatar::Transform {
         position: tf.position,
         rotation: tf.rotation,
@@ -17,6 +25,8 @@ pub(crate) fn send_local_pose(net: &network::NetworkHandle, rig: &PlayerRig) {
         head: to_avatar_transform(rig.head()),
         left_hand: Some(to_avatar_transform(rig.hand_grip(Hand::Left))),
         right_hand: Some(to_avatar_transform(rig.hand_grip(Hand::Right))),
+        floor,
+        flashlight,
     });
 }
 

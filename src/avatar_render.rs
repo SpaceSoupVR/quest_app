@@ -14,9 +14,12 @@ use crate::avatar;
 /// An adult's eyes are about 93% of the way up their standing height.
 const EYE_HEIGHT_FRACTION: f32 = 0.93;
 
+/// Every body to draw: the local player's, standing on `floor` (the rig's
+/// offset in the world), then the remote players' as their updates gave them.
 pub(crate) fn build_bodies(
     local_player: PlayerId,
     rig: &space_soup_engine::PlayerRig,
+    floor: f32,
     remotes: &HashMap<PlayerId, avatar::RemotePlayerState>,
 ) -> Vec<(PlayerId, avatar::RemotePlayerState)> {
     let local_state = avatar::RemotePlayerState {
@@ -32,6 +35,9 @@ pub(crate) fn build_bodies(
             position: rig.hand_grip(space_soup_engine::Hand::Right).position,
             rotation: rig.hand_grip(space_soup_engine::Hand::Right).rotation,
         }),
+        floor,
+        // The local torch is drawn by the frame itself (`flashlight`).
+        flashlight: None,
     };
     std::iter::once((local_player, local_state))
         .chain(remotes.iter().map(|(&id, &state)| (id, state)))
@@ -107,11 +113,35 @@ pub(crate) fn update_avatar_bodies(
         // the headset pose then lifted the whole body until the wearer's own
         // torso rose into their view.
         let raw_bind_eye_height = avatar_ik::bind_eye_height_along(skeleton, up);
+        // THE EYES' HEIGHT ABOVE THE PLAYER'S OWN FLOOR, not their height in
+        // the world. The world height carries whatever the player stands on --
+        // a stair, a ledge, a box they climbed, the top of a jump -- and the
+        // calibrator's ten-second percentile turned every one of those into a
+        // taller avatar with bigger hands. A player's floor is their rig's
+        // offset, which the ground follow keeps on whatever they stand on:
+        // the local player's from here, a remote player's from their update
+        // (the world's from a client that does not send it).
+        let floor_y = state.floor;
+        let eye_above_floor = state.head.position.y - floor_y;
         let calibrated_height = calibrated_heights
             .entry(id)
             .or_default()
-            .observe(state.head.position.y);
+            .observe(eye_above_floor);
         let root_scale = avatar::height_calibrated_scale(calibrated_height, raw_bind_eye_height);
+        // Every ten seconds or so, for the local player: what the headset says
+        // the eyes' height is, where the floor under them is, and what the
+        // avatar was sized to. A floor the headset has wrong shows here as an
+        // eye height no one has (headset, 2026-10-02).
+        if id == local_player {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static FRAMES: AtomicU32 = AtomicU32::new(0);
+            if FRAMES.fetch_add(1, Ordering::Relaxed) % 720 == 0 {
+                log::info!(
+                    "HEIGHTDIAG eye_above_floor={eye_above_floor:.3} floor_y={floor_y:.3} \
+                     calibrated_h={calibrated_height:.3} root_scale={root_scale:.4}",
+                );
+            }
+        }
 
         let to_render = |p: Vec3| yaw_inv * (p - offset);
         // Still the HEAD height: the drop runs from the head joint to the
@@ -261,6 +291,7 @@ pub(crate) fn update_avatar_bodies(
         capsule_groups.push(space_soup::renderer::uniforms::CapsuleGroup {
             capsules: capsules.iter().map(|c| (c.a, c.b, c.radius)).collect(),
             colour: avatar_colour,
+            surfaces: Vec::new(),
         });
 
         if id == local_player {

@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use glam::{Mat3, Quat, Vec3};
-use space_soup::renderer::glare::{GlareBulbRows, GlareSource, GlareTable, GlareTableSplit};
+use space_soup::renderer::glare::{GlareAir, GlareBulbRows, GlareSource, GlareTable, GlareTableSplit};
 use space_soup_engine::reflection_cards::{card_point, LoadedCards, CARD_FACES, GLARE_BRIGHT};
 use space_soup_engine::scene::GameObject;
 use space_soup_engine::scene_light::{GlareFacesDef, LightDef};
@@ -104,12 +104,15 @@ pub(crate) fn glare_table(cards: &LoadedCards, luminance: f32) -> Option<GlareTa
             GlareBulbRows { rows: f.rows, share, centre: f.centre.clone(), whole }
         }),
     });
+    // The air round the bulb, as the bake measured it.
+    let air = t.air.as_ref().map(|a| GlareAir { min: a.min, max: a.max, dims: a.dims, bulb: a.bulb, seen: a.seen.clone(), reach: a.reach });
     (share.iter().copied().fold(0.0, f32::max) >= CARRIES_GLOW).then(|| GlareTable {
         rows: t.rows,
         cols: t.cols,
         share,
         centre: t.centre.clone(),
         split,
+        air,
     })
 }
 
@@ -306,6 +309,8 @@ pub(crate) fn sources<'a>(
                 cone,
                 centres: f.centres.map(|cs| cs.map(|c| yaw_inv * (c - offset))),
                 table: f.table.as_ref().map(|(t, middle)| (t.clone(), yaw_inv * (*middle - offset))),
+                halo_only: false,
+                mirror: None,
             })
         })
         .collect()
@@ -324,6 +329,7 @@ mod tests {
             resolution: res,
             texels: vec![[0.0, 0.0, 0.0, 2.0]; n],
             normals: vec![[0.0; 3]; n],
+            albedo: Vec::new(),
             glare: None,
         }
     }
@@ -475,7 +481,7 @@ mod tests {
     fn the_bakes_glare_directions_are_the_renderers() {
         use space_soup_engine::reflection_cards::{glare_direction, GLARE_COLS, GLARE_ROWS};
         let n = GLARE_ROWS * GLARE_COLS;
-        let t = GlareTable { rows: GLARE_ROWS, cols: GLARE_COLS, share: vec![0.0; n], centre: vec![Vec3::ZERO; n], split: None };
+        let t = GlareTable { rows: GLARE_ROWS, cols: GLARE_COLS, share: vec![0.0; n], centre: vec![Vec3::ZERO; n], split: None, air: None };
         for row in 0..GLARE_ROWS {
             for col in 0..GLARE_COLS {
                 let (bake, render) = (glare_direction(row, col, GLARE_ROWS, GLARE_COLS), t.direction(row, col));
@@ -514,8 +520,20 @@ mod tests {
                     centre: vec![Vec3::new(0.0, -0.12, 0.0); 6],
                 }),
             }),
+            air: Some(space_soup_engine::reflection_cards::GlareAir {
+                min: Vec3::splat(-0.6),
+                max: Vec3::splat(0.6),
+                dims: [2, 2, 2],
+                bulb: Vec3::new(0.0, -0.1, 0.0),
+                seen: vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.5],
+                reach: 0.38,
+            }),
         });
         let t = glare_table(&cards, luminance).expect("it shows");
+        // The air round the bulb comes over as it was measured.
+        let air = t.air.as_ref().expect("the air carried over");
+        assert_eq!((air.min, air.max, air.dims, air.bulb), (Vec3::splat(-0.6), Vec3::splat(0.6), [2, 2, 2], Vec3::new(0.0, -0.1, 0.0)));
+        assert_eq!((air.seen.clone(), air.reach), (vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.5], 0.38));
         // The bulb's finer rows come over as shares too, capped as a side is,
         // the most of them its whole.
         let fine = t.split.as_ref().unwrap().bulb_fine.clone().unwrap();
@@ -554,6 +572,8 @@ mod tests {
                 cone: None,
                 centres: Some(m.centres),
                 table: Some((table, middle)),
+                halo_only: false,
+                mirror: None,
             };
             let blended = GlareSource { table: None, ..s.clone() };
             let around = |elevation: f32, azimuth: f32| {
@@ -600,6 +620,8 @@ mod tests {
                 cone: None,
                 centres: Some(m.centres),
                 table: Some((table, middle)),
+                halo_only: false,
+                mirror: None,
             };
             let at = |elevation: f32| {
                 let e = elevation.to_radians();
@@ -665,6 +687,8 @@ mod tests {
             cone: None,
             centres: Some(m.centres),
             table: Some((table, middle)),
+            halo_only: false,
+            mirror: None,
         };
         eprintln!("bulb {bulb}, box middle {middle}");
         for (name, eye) in [
@@ -700,6 +724,119 @@ mod tests {
                 // Where the core's depth test stands, against the bulb.
                 let plane = l.centre + (eye - l.centre).normalize() * glare::LAMP_RADIUS.max(l.radius);
                 eprintln!("    core tested from {:+.3} m against the bulb", (plane - eye).dot(to.normalize()) - to.length());
+            }
+        }
+    }
+
+    /// DIAGNOSTIC: how much of the glare's drawn area at the bench's glare views
+    /// can show nothing -- cells whose corners all lie in dark air, or wholly
+    /// past the veil's reach -- as shares of the left eye's view, every lamp of
+    /// test_room at exposure `EXPOSURE` (default 3), the torch where the view
+    /// has one.
+    #[test]
+    #[ignore]
+    fn print_the_glare_fill() {
+        let game = Path::new(env!("CARGO_MANIFEST_DIR")).join("../game");
+        let Some(level) = crate::probe_level::ProbeLevel::load(&game, "test_room") else {
+            eprintln!("test_room probes not baked; skipping");
+            return;
+        };
+        let exposure = std::env::var("EXPOSURE").ok().and_then(|e| e.parse().ok()).unwrap_or(3.0f32);
+        let standing = level.scene_proxies(&game, "test_room");
+        let fixtures = load(&game, "test_room", &standing.glare);
+        let lights: Vec<_> = crate::scene_lights::load(&game, "test_room")
+            .into_iter()
+            .chain(crate::scene_lights::load_baked(&game, "test_room"))
+            .collect();
+        let lamps = sources(lights.iter(), &fixtures, Vec3::ZERO, Quat::IDENTITY);
+        // The left eye's frustum in tangents, left/right/down/up (bench logs).
+        let (l, r, d, u) = (1.376f32, 0.839f32, 0.966f32, 1.428f32);
+        let view_area = (l + r) * (d + u);
+        for (name, eye, at, torch) in [
+            ("pendant_close", Vec3::new(0.5, 1.5, -3.6), Vec3::new(0.0, 1.95, -4.5), None),
+            ("pendant_below", Vec3::new(0.35, 1.2, -3.85), Vec3::new(0.0, 1.95, -4.5), None),
+            (
+                "torch_facing",
+                Vec3::new(0.0, 1.6, -1.0),
+                Vec3::new(0.0, 1.5, -3.0),
+                Some((Vec3::new(0.1, 1.45, -3.0), Vec3::new(0.0, 1.6, -1.0))),
+            ),
+        ] {
+            let forward = (at - eye).normalize();
+            let right = forward.cross(Vec3::Y).normalize();
+            let up = right.cross(forward);
+            let eyes = [eye - right * 0.032, eye + right * 0.032];
+            let mut all = lamps.clone();
+            let mut adapted = vec![true; all.len()];
+            if let Some((glass, aim)) = torch {
+                let (lens, rotation) = crate::flashlight::lens_from_bench(glass, aim);
+                all.push(crate::flashlight::glare_source(lens, rotation * Vec3::NEG_Z, Vec3::ZERO, Quat::IDENTITY));
+                adapted.push(false);
+            }
+            let (verts, idx, halos) = glare::build_glare(&all, eyes, right, up, exposure, 1.0, true, &[], &adapted);
+            // On the left eye's tangent plane, clipped to nothing finer than
+            // what is in front of the eye.
+            let tangent = |p: Vec3| {
+                let v = p - eyes[0];
+                let z = v.dot(forward).max(1e-3);
+                Vec3::new(v.dot(right) / z, v.dot(up) / z, 0.0)
+            };
+            // Every cell of every quad, drawn or not: the quads' points come in
+            // square blocks, `cells + 1` a side; a core follows its halo with
+            // the same veil and a smaller reach.
+            let drawn: std::collections::HashMap<usize, bool> =
+                idx.chunks(6).enumerate().map(|(k, c)| (c[0] as usize, 6 * k < halos as usize)).collect();
+            // [halo, core] x [whole grid, drawn now, dark air, past reach].
+            let mut area_of = [[0.0f32; 4]; 2];
+            let (mut base, mut last_halo) = (0usize, None::<[f32; 4]>);
+            while base < verts.len() {
+                let cells = (2.0 / (verts[base + 1].uv[0] + 1.0)).round() as usize;
+                let side = cells + 1;
+                let shape = verts[base].shape;
+                let core = last_halo.is_some_and(|h| h[0] == shape[0] && h[1] == shape[1] && h[3] == shape[3] && shape[2] < h[2]);
+                last_halo = if core { None } else { Some(shape) };
+                let part = usize::from(core);
+                for j in 0..cells {
+                    for i in 0..cells {
+                        let a = base + j * side + i;
+                        let corners = [a, a + 1, a + 1 + side, a + side].map(|k| &verts[k]);
+                        let p = corners.map(|c| tangent(Vec3::from(c.position)));
+                        // Only what lands in the eye's view is drawn.
+                        if !p.iter().any(|q| q.x > -l && q.x < r && q.y > -d && q.y < u) {
+                            continue;
+                        }
+                        let area = 0.5
+                            * (0..4)
+                                .map(|k| {
+                                    let (a, b) = (p[k], p[(k + 1) % 4]);
+                                    a.x * b.y - b.x * a.y
+                                })
+                                .sum::<f32>()
+                                .abs();
+                        let (lo, hi) = (corners[0].uv, corners[2].uv);
+                        let (nu, nv) = (0.0f32.clamp(lo[0], hi[0]), 0.0f32.clamp(lo[1], hi[1]));
+                        area_of[part][0] += area;
+                        if drawn.contains_key(&a) {
+                            assert_eq!(drawn[&a], !core, "cell {a} drawn as the wrong part");
+                            area_of[part][1] += area;
+                        }
+                        if corners.iter().all(|c| c.reach[3] <= 0.0) {
+                            area_of[part][2] += area;
+                        } else if nu * nu + nv * nv >= 1.0 {
+                            area_of[part][3] += area;
+                        }
+                    }
+                }
+                base += side * side;
+            }
+            for (part, a) in ["halo", "core"].iter().zip(area_of) {
+                eprintln!(
+                    "{name} {part}: the whole grid {:.1}% of the view, drawn now {:.1}% (dark air {:.1}%, past reach {:.1}%)",
+                    100.0 * a[0] / view_area,
+                    100.0 * a[1] / view_area,
+                    100.0 * a[2] / view_area,
+                    100.0 * a[3] / view_area,
+                );
             }
         }
     }
