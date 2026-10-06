@@ -41,6 +41,9 @@ mod soundmap_client;
 mod brush_render;
 mod offline_frame;
 mod probe_level;
+mod flashlight;
+mod flashlight_bounce;
+mod mirror_glare;
 mod glare_fixtures;
 mod mesh_masks;
 mod scene_lights;
@@ -91,6 +94,50 @@ fn post_upload_for(post: &space_soup_engine::scene::PostDef)
         // Set per frame by the renderer.
         terrain_detail_distance: 0.0,
         reflection_share: false,
+    }
+}
+
+/// What each eye's hidden-area mesh (`XR_KHR_visibility_mask`) covers, logged
+/// once from the first located views: the share of the eye's pixels, and of
+/// the fragments the scene pass shades at the shipped foveation level -- what
+/// drawing the mask into depth first would save (plan A2). The visible mesh's
+/// share is logged beside it as the check: the two should make 100%.
+///
+/// Runtime v209.91 lists the extension and gives no mask: zero triangles
+/// hidden and visible, for both eyes, at startup and 14 s later, with no
+/// change event (deploy101-102, 2026-10-06).
+#[cfg(target_os = "android")]
+fn log_visibility_mask(session: &openxr::Session<openxr::Vulkan>, views: &[openxr::View], width: u32, height: u32) {
+    use space_soup::renderer::{foveation, visibility_mask};
+    for (eye, view) in views.iter().take(2).enumerate() {
+        let f = view.fov;
+        let fov = [f.angle_left, f.angle_right, f.angle_up, f.angle_down];
+        let mesh = |kind| session.get_visibility_mask_khr(openxr::ViewConfigurationType::PRIMARY_STEREO, eye as u32, kind);
+        match (mesh(openxr::VisibilityMaskTypeKHR::HIDDEN_TRIANGLE_MESH), mesh(openxr::VisibilityMaskTypeKHR::VISIBLE_TRIANGLE_MESH)) {
+            (Ok(hidden), Ok(visible)) if hidden.indices.is_empty() && visible.indices.is_empty() => {
+                info!("VISMASK eye {eye}: the runtime gives no mask (no triangles hidden or visible)");
+            }
+            (Ok(hidden), Ok(visible)) => {
+                let points = |m: &openxr::VisibilityMask| m.vertices.iter().map(|v| [v.x, v.y]).collect::<Vec<_>>();
+                let level = foveation::SHIPPED;
+                let h = visibility_mask::share(&points(&hidden), &hidden.indices, fov, width, height, level);
+                let v = visibility_mask::share(&points(&visible), &visible.indices, fov, width, height, level);
+                info!(
+                    "VISMASK eye {eye}: hidden {:.1}% of pixels, {:.1}% of fragments at foveation {} ({} triangles); \
+                     visible mesh {:.1}% of pixels; fov l/r/u/d {:.1}/{:.1}/{:.1}/{:.1} deg; {width}x{height}",
+                    100.0 * h.pixels,
+                    100.0 * h.fragments,
+                    level.label(),
+                    hidden.indices.len() / 3,
+                    100.0 * v.pixels,
+                    fov[0].to_degrees(),
+                    fov[1].to_degrees(),
+                    fov[2].to_degrees(),
+                    fov[3].to_degrees(),
+                );
+            }
+            (h, v) => info!("VISMASK eye {eye}: not given (hidden {:?}, visible {:?})", h.err(), v.err()),
+        }
     }
 }
 
@@ -193,10 +240,20 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     // draws its terrain, its brushes and its lighting, and none of the objects
     // standing in it. See scene_meshes.
     let mut static_meshes = scene_meshes::load(&dir, &static_scene.scene_name);
+    // Each brush material's mean albedo, by layer: what a wall of it sends back
+    // of the flashlight's beam (`flashlight_bounce`). And its mean roughness,
+    // with the planes of the polished ones, which show the glass's glare
+    // (`mirror_glare`).
+    let mut brush_albedos: Vec<Vec3>;
+    let mut brush_roughness: Vec<f32>;
+    let mut mirror_planes: Vec<mirror_glare::MirrorPlane>;
     {
         // Per scene, from the ids its own brush faces reference.
         let maps = brush_render::load_materials(&dir, brushes.materials());
         renderer.set_brush_materials(&maps.colours, &maps.normals, &maps.roughs, &maps.aos);
+        brush_albedos = maps.colours.iter().map(brush_render::mean_albedo).collect();
+        brush_roughness = maps.roughs.iter().map(|r| brush_render::mean_roughness(r.as_ref())).collect();
+        mirror_planes = mirror_glare::planes_of(&brushes, &brush_roughness);
     }
     // Layer textures are per PROJECT, not per scene -- every level shares the
     // same four materials -- so they load once here rather than on every scene
@@ -516,6 +573,32 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     )> = None;
 
     let (mesh_req_tx, mesh_rx) = loaders::spawn_mesh_loader(&dir, &renderer);
+    // THE PLAYER'S FLASHLIGHT: the right stick's click cycles it (off, beam,
+    // beam and torch). Its torch comes through the mesh loader like any model,
+    // filed under a name no scene object has. See `flashlight`.
+    let mut flashlight_mode = flashlight::FlashlightMode::default();
+    let mut flashlight_torch: Option<(GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform)> = None;
+    // Its bounce off what the beam lands on: the rays across the beam, once,
+    // and the patches from frame to frame. See `flashlight_bounce`.
+    let bounce_rays = flashlight_bounce::beam_rays(flashlight::CONE_DEG, flashlight::HOTSPOT_DEG);
+    let mut bounce = flashlight_bounce::Bounce::default();
+    // The other players' beams bounce the same way, each followed on its own.
+    let mut remote_bounces: HashMap<space_soup_protocol::PlayerId, flashlight_bounce::Bounce> = HashMap::new();
+    // The surfaces every beam lights, for the reflections to show its pool on:
+    // see `flashlight_bounce::Landings::surfaces`.
+    let mut lit_surfaces = flashlight_bounce::HeldSurfaces::default();
+    let mut bounce_clock = std::time::Instant::now();
+    // OTHER PLAYERS' TORCHES: an instance of the model each, up to
+    // `flashlight::REMOTE_TORCH_IDS`, given out by player each frame.
+    let mut remote_torches: [Option<(GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform)>; 4] =
+        Default::default();
+    let torch_ids: Vec<String> = std::iter::once(flashlight::TORCH_ID)
+        .chain(flashlight::REMOTE_TORCH_IDS)
+        .map(String::from)
+        .collect();
+    if mesh_req_tx.send((flashlight::TORCH_MODEL.to_string(), torch_ids)).is_err() {
+        log::warn!("FLASHLIGHT: the mesh loader is gone; the torch will not be drawn");
+    }
     let avatar_mesh_rx = loaders::spawn_avatar_loader(boy_glb_path.clone(), &renderer);
     let mut avatar_master_mesh: Option<GltfMesh> = None;
 
@@ -565,6 +648,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     // every frame (`BenchPose::sway`).
     let mut bench_pose: Option<(space_soup::renderer::bench::BenchPose, std::time::Instant)> = None;
     let mut bench_return: Option<(Vec3, f32)> = None;
+    // The lenses' hidden area is logged from the first located views, and
+    // again whenever the runtime says it changed.
+    let mut visibility_mask_due = xr.has_visibility_mask;
     'main: loop {
         pump_android_events(&mut exit);
         if exit {
@@ -601,6 +687,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     e.from_level(),
                     e.to_level()
                 ),
+                Some(openxr::Event::VisibilityMaskChangedKHR(e)) => {
+                    info!("VISMASK: the runtime says eye {}'s mask changed", e.view_index());
+                    visibility_mask_due = true;
+                }
                 Some(_) => {}
                 None => break,
             }
@@ -625,6 +715,14 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         headset.frame_stream.begin()?;
 
         for (obj_id, mut mesh) in mesh_rx.try_iter() {
+            if obj_id == flashlight::TORCH_ID {
+                flashlight_torch = Some((mesh, renderer.create_model_uniform()));
+                continue;
+            }
+            if let Some(k) = flashlight::remote_torch_slot(&obj_id) {
+                remote_torches[k] = Some((mesh, renderer.create_model_uniform()));
+                continue;
+            }
             if mesh.is_skinned() {
                 mesh.create_skin_bind_group(renderer.device(), renderer.skin_joint_layout());
                 if let Some(bind) = mesh.skin.as_ref().map(|s| s.skin_matrices_blended_multi(&[])) {
@@ -695,6 +793,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             time,
             &headset.stage,
         )?;
+        if visibility_mask_due && eye_views.len() >= 2 {
+            visibility_mask_due = false;
+            log_visibility_mask(&headset.session, &eye_views, renderer.width, renderer.height);
+        }
         // PINNED: the rig stands where the view says, and the head is the
         // pinned one for everything this frame -- the rig, the lights chosen,
         // the audio -- exactly as the renderer will pin it. Released, the
@@ -739,8 +841,16 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
         let cs = &controllers.state;
 
-        // DEBUG A/B: the right stick click CYCLES THREE STATES, on the press
-        // rather than while held, so one click is one step.
+        // THE FLASHLIGHT: the right stick's click, on the press, cycles off ->
+        // beam -> beam and torch -> off. See `flashlight`. The developer build's
+        // SSR cycle below moved to the same click with the right trigger held.
+        if cs.r_stick_click && !prev_r_stick_click && !(DEVELOPER_TOGGLES && cs.r_trigger > 0.5) {
+            flashlight_mode = flashlight_mode.next();
+            info!("FLASHLIGHT -> {} by right stick click", flashlight_mode.label());
+        }
+        // DEBUG A/B: the right stick click with the right trigger held CYCLES
+        // THREE STATES, on the press rather than while held, so one click is
+        // one step.
         //
         //   off -> inline -> buffered -> off
         //
@@ -752,7 +862,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         // One button rather than two because the comparison that matters is
         // between the two reflection paths FROM ONE VIEWPOINT, and reaching for
         // a second control moves your head.
-        if DEVELOPER_TOGGLES && cs.r_stick_click && !prev_r_stick_click {
+        if DEVELOPER_TOGGLES && cs.r_stick_click && !prev_r_stick_click && cs.r_trigger > 0.5 {
             let (on, buffered) =
                 match (renderer.screen_space_reflections(), renderer.buffered_reflections()) {
                     (false, _) => (true, false),
@@ -762,7 +872,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             renderer.set_screen_space_reflections(on);
             renderer.set_buffered_reflections(buffered);
             info!(
-                "SSR -> {} by right stick click",
+                "SSR -> {} by right stick click with the trigger held",
                 match (on, buffered) {
                     (false, _) => "OFF",
                     (true, false) => "ON (inline march)",
@@ -923,6 +1033,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 // paints every wall with an unrelated texture.
                 let maps = brush_render::load_materials(&dir, brushes.materials());
                 renderer.set_brush_materials(&maps.colours, &maps.normals, &maps.roughs, &maps.aos);
+                brush_albedos = maps.colours.iter().map(brush_render::mean_albedo).collect();
+                brush_roughness = maps.roughs.iter().map(|r| brush_render::mean_roughness(r.as_ref())).collect();
+                mirror_planes = mirror_glare::planes_of(&brushes, &brush_roughness);
                 // Per scene, alongside the geometry: a splat map left over from
                 // the previous level would paint this one with its materials.
                 renderer.set_terrain_splat(
@@ -978,7 +1091,18 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        frame_log::send_local_pose(&net, &rig);
+        // The other players see this player's flashlight while it is lit --
+        // its beam, its glass and its glare -- from the right hand's aim, as
+        // it is drawn here. Never a pinned view's: that one is a measurement.
+        let flashlight_out = (frame_bench.is_none() && flashlight_mode.lit() && cs.r_aim_pose.is_some()).then(|| {
+            let aim = rig.hand_aim(space_soup_engine::Hand::Right);
+            let (lens, _) = flashlight::lens_from_aim(aim.position, aim.rotation);
+            avatar::Flashlight {
+                lens: avatar::Transform { position: lens, rotation: aim.rotation },
+                torch: flashlight_mode.shows_torch(),
+            }
+        });
+        frame_log::send_local_pose(&net, &rig, locomotion.player_offset.y, flashlight_out);
         frame_log::log_frame_status(
             frame_count,
             cuboids_src.len(),
@@ -1010,7 +1134,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         let head_pos = rig.head().position;
 
         let remotes = net.remote_players.lock().unwrap().clone();
-        let bodies = avatar_render::build_bodies(local_player, &rig, &remotes);
+        let bodies = avatar_render::build_bodies(local_player, &rig, offset.y, &remotes);
 
         let pull_hands = part_pull::pull_hand_poses(
             &pull_sessions, &static_scene, &live_objects, &part_transforms,
@@ -1045,7 +1169,6 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             };
             capsule_groups[1..].sort_by(|a, b| dist(a).total_cmp(&dist(b)));
         }
-        renderer.set_capsules(&capsule_groups);
 
         lever_tick = lever_tick.wrapping_add(1);
         if lever_tick % 72 == 0 {
@@ -1066,13 +1189,74 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             baked_lights.iter().map(|l| convert::to_space_soup_light(l, offset, yaw_inv)).collect(),
         );
         // Every lamp with a fixture, live or baked: a bulb glares however its
-        // light is shaded.
-        renderer.set_glare_sources(glare_fixtures::sources(
+        // light is shaded. Handed over below, with the flashlight's glass.
+        let mut glare_sources = glare_fixtures::sources(
             lights_src.iter().chain(baked_lights.iter()),
             &lamp_glare,
             offset,
             yaw_inv,
-        ));
+        );
+        // THE FLASHLIGHT this frame: from a pinned view's own, which ignores the
+        // player's switch (a benchmark measures what it names), or from the
+        // right hand's aim. The glass and its turn in the world; the torch is
+        // placed before the render lists borrow it.
+        let flashlight_now: Option<(Vec3, Quat, bool)> = match (&frame_bench, &bench_pose) {
+            (Some(_), Some((pose, _))) => pose.flashlight.as_ref().map(|f| {
+                let (at, rotation) = flashlight::lens_from_bench(Vec3::from(f.at), Vec3::from(f.aim));
+                (at, rotation, f.torch)
+            }),
+            (Some(_), None) => None,
+            (None, _) => (flashlight_mode.lit() && cs.r_aim_pose.is_some()).then(|| {
+                let aim = rig.hand_aim(space_soup_engine::Hand::Right);
+                let (lens, _) = flashlight::lens_from_aim(aim.position, aim.rotation);
+                (lens, aim.rotation, flashlight_mode.shows_torch())
+            }),
+        };
+        if let (Some((lens, rotation, true)), Some((torch, _))) = (flashlight_now, flashlight_torch.as_mut()) {
+            let (position, rotation) = flashlight::torch_pose(lens, rotation, offset, yaw_inv);
+            torch.position = position;
+            torch.rotation = rotation;
+            torch.scale = Vec3::ONE;
+        }
+        // THE OTHER PLAYERS' FLASHLIGHTS this frame, in player order, each
+        // lit one's torch on the next instance of the model.
+        let mut remote_flashlights: Vec<(space_soup_protocol::PlayerId, avatar::Flashlight)> =
+            remotes.iter().filter_map(|(id, r)| r.flashlight.map(|f| (*id, f))).collect();
+        remote_flashlights.sort_by_key(|(id, _)| id.0);
+        for (k, (_, f)) in remote_flashlights.iter().enumerate() {
+            if let (true, Some(Some((torch, _)))) = (f.torch, remote_torches.get_mut(k)) {
+                let (position, rotation) = flashlight::torch_pose(f.lens.position, f.lens.rotation, offset, yaw_inv);
+                torch.position = position;
+                torch.rotation = rotation;
+                torch.scale = Vec3::ONE;
+            }
+        }
+        // THE TORCHES IN REFLECTIONS, each drawn one as capsules of its own:
+        // the player's after theirs, the others' after every character, so a
+        // character is never left out for a torch. See `torch_capsules`.
+        if renderer.frame_levers().torch_reflection {
+            if let (Some((lens, rotation, true)), Some(_)) = (flashlight_now, flashlight_torch.as_ref()) {
+                let at = capsule_groups.len().min(1);
+                capsule_groups.insert(at, flashlight::torch_capsules(lens, rotation, offset, yaw_inv));
+            }
+            capsule_groups.extend(
+                remote_flashlights
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, (_, f))| f.torch && matches!(remote_torches.get(*k), Some(Some(_))))
+                    .map(|(_, (_, f))| flashlight::torch_capsules(f.lens.position, f.lens.rotation, offset, yaw_inv)),
+            );
+        }
+        renderer.set_capsules(&capsule_groups);
+        // The characters' bodies, without what they carry: what a raised hand
+        // takes from a torch's bounce and from its glass's image in a mirror.
+        // A carried torch's own capsules would hide its glass.
+        let shields: Vec<(Vec3, Vec3, f32)> = capsule_groups
+            .iter()
+            .flat_map(|g| {
+                g.capsules.iter().enumerate().filter(|(k, _)| g.surfaces.get(*k).is_none_or(|s| *s == 0.0)).map(|(_, c)| *c)
+            })
+            .collect();
         let (cuboids, lights, mut mesh_instances, mirror_only_mesh_instances, mirror_surface) =
             render_prep::build_render_lists(
                 cuboids_src,
@@ -1100,7 +1284,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             );
         // STATIONARY lamps take their shadows from their mask channel; the
         // list is `lights_src` converted in order, so each pairs with its id.
-        let lights: Vec<space_soup::renderer::Light> = lights
+        let mut lights: Vec<space_soup::renderer::Light> = lights
             .into_iter()
             .zip(lights_src.iter())
             .map(|(mut l, src)| {
@@ -1111,6 +1295,151 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         // A spot fixture's bulb lights its own housing outside the beam: see
         // `render_prep::attach_own_lights`.
         render_prep::attach_own_lights(&mut mesh_instances, lights_src, &lights);
+        // The flashlight's beam rides last, after the pairing above (which
+        // matches lights to `lights_src` by position), as one more live spot.
+        let bounce_dt = bounce_clock.elapsed().as_secs_f32();
+        bounce_clock = std::time::Instant::now();
+        // Its bounce's lights ride after everything else: their count changes
+        // as the beam finds and leaves surfaces, and the spot shadow slots
+        // remember lights by their place in this list.
+        let mut bounce_lights: Vec<space_soup::renderer::Light> = Vec::new();
+        let bouncing = renderer.frame_levers().flashlight_bounce;
+        // ITS BOUNCE: the light a beam throws back off what it lands on, as a
+        // light at each lit patch. A brush is read for its material; anything
+        // nearer that is not one -- the ground, a model -- is a mid grey. See
+        // `flashlight_bounce`.
+        // A HAND HELD UP IN FRONT OF IT stops a ray and bounces it too: the
+        // characters' capsules, in the player's frame as the renderer has
+        // them, the one round the glass left out (`capsule_hit`). Without it
+        // the wall in the hand's shadow still glowed with bounce.
+        let to_world = yaw_inv.inverse();
+        let land = |origin: Vec3, dir: Vec3| -> Option<flashlight_bounce::Landing> {
+            let brush = brushes.cast(origin, dir, flashlight::RANGE, hidden_brushes);
+            let solid = static_scene.physics.raycast(origin, dir, flashlight::RANGE);
+            let hand = flashlight_bounce::capsule_hit(yaw_inv * (origin - offset), yaw_inv * dir, &shields, flashlight::RANGE)
+                .map(|(t, n)| (origin + dir * t, to_world * n));
+            let other = |(point, normal): (Vec3, Vec3)| flashlight_bounce::Landing {
+                point,
+                normal: if normal.dot(dir) > 0.0 { -normal } else { normal },
+                albedo: Vec3::splat(flashlight_bounce::UNKNOWN_ALBEDO),
+            };
+            let far = |p: Option<(Vec3, Vec3)>| p.map_or(f32::INFINITY, |(q, _)| (q - origin).length());
+            if far(hand) < far(solid).min(brush.as_ref().map_or(f32::INFINITY, |b| b.distance)) {
+                return hand.map(other);
+            }
+            match (brush, solid) {
+                (Some(b), Some(s)) if (s.0 - origin).length() + 0.05 < b.distance => Some(other(s)),
+                (Some(b), _) => Some(flashlight_bounce::Landing {
+                    point: b.point,
+                    normal: b.normal,
+                    albedo: brush_albedos.get(b.material as usize).copied().unwrap_or(Vec3::ONE) * b.tint,
+                }),
+                (None, s) => s.map(other),
+            }
+        };
+        // ITS GLASS'S IMAGES in the polished faces it shines on, each a source
+        // of glare of its own, torch drawn or not (see `mirror_glare`).
+        let meet = |from: Vec3, dir: Vec3, max: f32| {
+            brushes.cast(from, dir, max, hidden_brushes).map(|b| mirror_glare::Meeting {
+                distance: b.distance,
+                normal: b.normal,
+                roughness: brush_roughness.get(b.material as usize).copied().unwrap_or(1.0),
+            })
+        };
+        let mirrored = |lens: Vec3, forward: Vec3| -> Vec<space_soup::renderer::glare::GlareSource> {
+            mirror_glare::images(lens, forward, flashlight::cone_cosines(), head_pos, &mirror_planes, meet)
+                .into_iter()
+                .map(|i| {
+                    let mut s = flashlight::glare_source(i.glass, i.forward, offset, yaw_inv);
+                    let mirror = yaw_inv * (i.mirror - offset);
+                    // As much of the glass as the characters leave in view of
+                    // its point on the mirror: a hand raised in front of the
+                    // torch hides the image's glare with the image.
+                    let seen = space_soup::renderer::glare::disc_visibility(
+                        yaw_inv * (lens - offset),
+                        flashlight::GLASS_RADIUS,
+                        mirror,
+                        &shields,
+                    );
+                    s.radiance *= i.reflectance * seen;
+                    s.mirror = Some(mirror);
+                    s
+                })
+                .collect()
+        };
+        // Every beam's lit surfaces this instant. See `lit_surfaces`.
+        let mut surfaces_now: Vec<flashlight_bounce::LitPlane> = Vec::new();
+        if let Some((lens, rotation, torch)) = flashlight_now {
+            lights.push(flashlight::beam(lens, rotation * Vec3::NEG_Z, offset, yaw_inv));
+            let landed = flashlight_bounce::landings(lens, rotation, &bounce_rays, land);
+            surfaces_now.extend(landed.surfaces());
+            if bouncing {
+                bounce_lights.extend(
+                    bounce
+                        .follow(&landed.patches(), bounce_dt)
+                        .iter()
+                        .filter_map(|p| flashlight_bounce::light(p, offset, yaw_inv)),
+                );
+            } else {
+                bounce.clear();
+            }
+            // Its glass glares into its beam, torch drawn or not: the light
+            // comes from something.
+            glare_sources.push(flashlight::glare_source(lens, rotation * Vec3::NEG_Z, offset, yaw_inv));
+            glare_sources.extend(mirrored(lens, rotation * Vec3::NEG_Z));
+            if let (true, Some((mesh, model))) = (torch, flashlight_torch.as_ref()) {
+                mesh_instances.push(space_soup::renderer::MeshInstance {
+                    mesh,
+                    model,
+                    lightmap_key: None,
+                    emissive_drive: flashlight::lens_drive(),
+                    own_light: None,
+                });
+            }
+        } else {
+            bounce.clear();
+        }
+        // ...and the other players': each beam a live spot like this one's,
+        // its glass glaring into it -- the user, 2026-10-02: the flashlight
+        // "will need to have the hdr bloom effect on it, at least in
+        // reflections or to other players" -- and their torch where they show
+        // one.
+        remote_bounces.retain(|id, _| bouncing && remote_flashlights.iter().any(|(r, _)| r == id));
+        for (k, (id, f)) in remote_flashlights.iter().enumerate() {
+            let forward = f.lens.rotation * Vec3::NEG_Z;
+            lights.push(flashlight::beam(f.lens.position, forward, offset, yaw_inv));
+            let landed = flashlight_bounce::landings(f.lens.position, f.lens.rotation, &bounce_rays, land);
+            surfaces_now.extend(landed.surfaces());
+            if bouncing {
+                bounce_lights.extend(
+                    remote_bounces
+                        .entry(*id)
+                        .or_default()
+                        .follow(&landed.patches(), bounce_dt)
+                        .iter()
+                        .filter_map(|p| flashlight_bounce::light(p, offset, yaw_inv)),
+                );
+            }
+            glare_sources.push(flashlight::glare_source(f.lens.position, forward, offset, yaw_inv));
+            glare_sources.extend(mirrored(f.lens.position, forward));
+            if let (true, Some(Some((mesh, model)))) = (f.torch, remote_torches.get(k)) {
+                mesh_instances.push(space_soup::renderer::MeshInstance {
+                    mesh,
+                    model,
+                    lightmap_key: None,
+                    emissive_drive: flashlight::lens_drive(),
+                    own_light: None,
+                });
+            }
+        }
+        lights.extend(bounce_lights);
+        renderer.set_glare_sources(glare_sources);
+        let held: Vec<space_soup::renderer::lights::LitSurface> = lit_surfaces
+            .follow(&surfaces_now, bounce_dt)
+            .iter()
+            .map(|s| flashlight_bounce::lit_surface(s, offset, yaw_inv))
+            .collect();
+        renderer.set_lit_surfaces(&held);
 
         let sounds_src = world.as_ref().map(|w| w.sounds.as_slice()).unwrap_or(&[]);
         let occlusion: HashMap<String, f32> = sounds_src
@@ -1257,6 +1586,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
             let proj_layer =
                 unsafe { openxr::CompositionLayerProjection::<openxr::Vulkan>::from_raw(raw) };
+
+            // DYNAMIC RESOLUTION: the runtime's size for this very layer, asked
+            // before it goes -- asking is what Quest 3 grants GPU level 5 for.
+            // The eyes stay at their size. See `renderer::dynamic_resolution`.
+            renderer.ask_recommended_resolution(proj_layer.as_raw(), time);
 
             headset
                 .frame_stream

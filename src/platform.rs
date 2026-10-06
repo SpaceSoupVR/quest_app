@@ -108,9 +108,15 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
     saved_state: *mut std::ffi::c_void,
     saved_state_size: usize,
 ) {
+    // naga at info and above only: its debug lines -- each overload rule and
+    // type it resolves -- ran to ~200,000 a shader compile, which slowed every
+    // pipeline build enough that the benchmark's pipeline-statistics run, which
+    // builds every measurement cut, timed out before drawing a frame
+    // (2026-10-01).
     android_logger::init_once(
         android_logger::Config::default()
             .with_max_level(log::LevelFilter::Debug)
+            .with_filter(android_logger::FilterBuilder::new().parse("debug,naga=info").build())
             .with_tag("quest_app"),
     );
     info!("ANativeActivity_onCreate started");

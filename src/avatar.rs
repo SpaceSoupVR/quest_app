@@ -1,7 +1,7 @@
 
 pub use avatar_ik::{
     apply_hand_pose, FingerPose, HandPose, FINGER_LIMITS, THUMB_LIMITS,
-    body_root_transform, height_calibrated_scale, load_rig_config, HandCurl, LocalPose,
+    body_root_transform, height_calibrated_scale, load_rig_config, Flashlight, HandCurl, LocalPose,
     RemotePlayerState, RigConfig, Transform,
 };
 

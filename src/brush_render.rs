@@ -70,6 +70,20 @@ pub struct BrushObject {
     pub id: String,
     vertices: Vec<BrushVertex>,
     indices: Vec<u32>,
+    /// The box round its vertices, which a ray [`BrushGeometry::cast`] passes
+    /// by without testing a triangle.
+    bounds: (Vec3, Vec3),
+}
+
+/// Where a ray met the level's brushes: how far along it, the point, the face's
+/// normal (toward the ray), its material's layer and its object's tint.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BrushHit {
+    pub distance: f32,
+    pub point: Vec3,
+    pub normal: Vec3,
+    pub material: u32,
+    pub tint: Vec3,
 }
 
 /// Every brush in the scene, plus the assembled buffer the renderer is handed.
@@ -90,11 +104,153 @@ impl BrushGeometry {
     pub fn materials(&self) -> &[String] {
         &self.materials
     }
+
+    /// The first brush face a ray from `origin` along `dir` (a unit vector)
+    /// meets from its front within `max` metres, in the WORLD, as the objects
+    /// are. `hidden`: objects not drawn this frame, which nothing can meet.
+    /// On the CPU, for the few rays a frame the flashlight's bounce casts: an
+    /// object's box first, its triangles only when the ray passes through it.
+    pub fn cast(&self, origin: Vec3, dir: Vec3, max: f32, hidden: &[String]) -> Option<BrushHit> {
+        // Axes the ray runs along exactly divide by a tiny number instead of
+        // zero, so the slabs' products stay finite.
+        let safe = Vec3::select(dir.abs().cmplt(Vec3::splat(1e-9)), Vec3::splat(1e-9), dir);
+        let inv = safe.recip();
+        let mut best: Option<BrushHit> = None;
+        for o in self.objects.iter().filter(|o| !hidden.iter().any(|h| *h == o.id)) {
+            let reach = best.map_or(max, |b| b.distance);
+            let (near, far) = {
+                let a = (o.bounds.0 - origin) * inv;
+                let b = (o.bounds.1 - origin) * inv;
+                (a.min(b).max_element(), a.max(b).min_element())
+            };
+            if far < near.max(0.0) || near > reach {
+                continue;
+            }
+            for tri in o.indices.chunks_exact(3) {
+                let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| &o.vertices[i as usize]);
+                let normal = Vec3::from(a.normal);
+                // From the front only: the inside of a solid is never seen.
+                if normal.dot(dir) >= 0.0 {
+                    continue;
+                }
+                let Some(t) = ray_triangle(origin, dir, a.position.into(), b.position.into(), c.position.into()) else {
+                    continue;
+                };
+                if t < best.map_or(max, |b| b.distance) {
+                    best = Some(BrushHit {
+                        distance: t,
+                        point: origin + dir * t,
+                        normal,
+                        material: a.material,
+                        tint: Vec3::new(a.tint[0], a.tint[1], a.tint[2]),
+                    });
+                }
+            }
+        }
+        best
+    }
+}
+
+/// Where a ray from `o` along `d` crosses triangle `a b c`, as its distance
+/// along `d`, if ahead of `o` (Moller and Trumbore 1997).
+fn ray_triangle(o: Vec3, d: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let (e1, e2) = (b - a, c - a);
+    let p = d.cross(e2);
+    let det = e1.dot(p);
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let s = o - a;
+    let u = s.dot(p) * inv;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = s.cross(e1);
+    let v = d.dot(q) * inv;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = e2.dot(q) * inv;
+    (t > 1e-4).then_some(t)
+}
+
+/// A colour map's mean diffuse reflectance, in LINEAR light: what a surface
+/// of it sends back of the light falling on it, on average. Averaged as
+/// light, not as sRGB bytes, which would report a surface far darker than it
+/// is (the bake's `probe::image_albedo` does the same). Every fourth texel each
+/// way is plenty for a mean.
+pub fn mean_albedo(img: &TerrainImage) -> Vec3 {
+    let to_linear = |b: u8| {
+        let c = b as f32 / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let (mut sum, mut n) = (Vec3::ZERO, 0u32);
+    for y in (0..img.height).step_by(4) {
+        for x in (0..img.width).step_by(4) {
+            let i = ((y * img.width + x) * 4) as usize;
+            let Some(px) = img.rgba.get(i..i + 3) else { continue };
+            sum += Vec3::new(to_linear(px[0]), to_linear(px[1]), to_linear(px[2]));
+            n += 1;
+        }
+    }
+    if n == 0 {
+        Vec3::ONE
+    } else {
+        sum / n as f32
+    }
+}
+
+/// A material's mean roughness, as the shader reads its map (`rough.jpg`,
+/// after the author's range): 1, fully rough, where it has none.
+pub fn mean_roughness(img: Option<&TerrainImage>) -> f32 {
+    let Some(img) = img else { return 1.0 };
+    let (mut sum, mut n) = (0.0f32, 0u32);
+    for y in (0..img.height).step_by(4) {
+        for x in (0..img.width).step_by(4) {
+            let i = ((y * img.width + x) * 4) as usize;
+            let Some(px) = img.rgba.get(i) else { continue };
+            sum += *px as f32 / 255.0;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        1.0
+    } else {
+        sum / n as f32
+    }
 }
 
 impl BrushGeometry {
     pub fn is_empty(&self) -> bool {
         self.objects.is_empty()
+    }
+
+    /// Every distinct plane the level's faces lie in whose material is no
+    /// rougher than `max` (`roughness` by layer, mean): `(normal, offset,
+    /// roughness)`, the plane `normal . x = offset` facing out of its solid, in
+    /// the WORLD. One entry for a floor however many faces and rooms it spans.
+    pub fn smooth_planes(&self, roughness: &[f32], max: f32) -> Vec<(Vec3, f32, f32)> {
+        let mut out: Vec<(Vec3, f32, f32)> = Vec::new();
+        for o in &self.objects {
+            for tri in o.indices.chunks_exact(3) {
+                let a = &o.vertices[tri[0] as usize];
+                let r = roughness.get(a.material as usize).copied().unwrap_or(1.0);
+                if r > max {
+                    continue;
+                }
+                let n = Vec3::from(a.normal);
+                let d = n.dot(Vec3::from(a.position));
+                if !out.iter().any(|(m, e, q)| m.dot(n) > 0.9999 && (e - d).abs() < 1e-3 && *q == r) {
+                    out.push((n, d, r));
+                }
+            }
+        }
+        out
     }
 
     pub fn object_count(&self) -> usize {
@@ -288,7 +444,10 @@ impl BrushGeometry {
                 log::warn!("brush_render: '{}' produced no geometry", obj.id);
                 continue;
             }
-            objects.push(BrushObject { id: obj.id.clone(), vertices, indices });
+            let bounds = vertices.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), v| {
+                (lo.min(Vec3::from(v.position)), hi.max(Vec3::from(v.position)))
+            });
+            objects.push(BrushObject { id: obj.id.clone(), vertices, indices, bounds });
         }
         if before > 0 {
             if repair_t_junctions {
@@ -747,6 +906,43 @@ mod tests {
         assert!(top >= lm_top + SUN_MASK_SCALE.trailing_zeros());
     }
 
+    /// EVERY BRUSH FACE OF THE SHIPPED LEVEL TAKES A SUN READER THAT FITS THE
+    /// QUEST'S INSTRUCTION CACHE: never reached by the sun, or baked throughout
+    /// -- none left to the full reader, which carries the level's static sun
+    /// map and is over the cliff (`space_soup::renderer::brush_pipeline::SunFaces`).
+    /// A bake that left faces unbaked would cost ~1 ms an eye wherever they are
+    /// seen, with nothing else to show for it. Prints each class's share.
+    #[test]
+    fn every_face_of_the_shipped_level_takes_a_reader_without_the_static_sun_map() {
+        use space_soup::renderer::brush_pipeline::{dilate_sun_mask, FaceSun, SunFaces};
+        let game = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game");
+        let scene =
+            Scene::load(&space_soup_engine::Manifest::scene_path(&game, "test_room")).unwrap();
+        let mut geometry = BrushGeometry::load_with(&scene, true);
+        let (vertices, indices) = geometry.assemble(&[], Vec3::ZERO, Quat::IDENTITY, 0.0).unwrap();
+        let maps = space_soup_engine::lightmaps::load_scene_lightmaps(&game, "test_room");
+        let mask = maps.iter().find(|m| m.object_id == space_soup_engine::lightmaps::SCENE_BRUSH_SUN_MASK_ID).unwrap();
+        let dilated = dilate_sun_mask(&mask.rgba, mask.width, mask.height);
+        let faces = SunFaces::from_mask(&dilated, mask.width, mask.height).unwrap();
+        let mut count = [0usize; 3];
+        let mut area = [0f32; 3];
+        for tri in indices.chunks_exact(3) {
+            let class = faces.class_of(vertices[tri[0] as usize].uv2_rect) as usize;
+            let p = |i: u32| Vec3::from(vertices[i as usize].position);
+            count[class] += 1;
+            area[class] += 0.5 * (p(tri[1]) - p(tri[0])).cross(p(tri[2]) - p(tri[0])).length();
+        }
+        let total: f32 = area.iter().sum();
+        for class in [FaceSun::Never, FaceSun::Baked, FaceSun::Unbaked] {
+            let i = class as usize;
+            println!("{class:?}: {} triangles, {:.1} m2 ({:.1}%)", count[i], area[i], 100.0 * area[i] / total);
+        }
+        assert_eq!(count[FaceSun::Unbaked as usize], 0, "faces left to the full reader");
+        // And the partition the frame draws agrees.
+        let (_, ends) = faces.partition(vertices, indices);
+        assert_eq!(ends, [count[0] as u32 * 3, (count[0] + count[1]) as u32 * 3]);
+    }
+
     /// DIAGNOSTIC (not an assertion): edges of the shipped mesh that no other
     /// triangle shares EXACTLY. A closed surface uses every edge twice, once
     /// each way; an edge used once is a place the rasteriser can leave a gap.
@@ -932,6 +1128,53 @@ mod tests {
         for i in &used {
             assert!((*i as usize) < g.materials().len(), "layer {i} is in range");
         }
+    }
+
+    /// A ray meets the first face it comes to from the front, with that face's
+    /// normal and material -- not the back of one it starts behind, not a
+    /// wall past its reach, not a wall the frame does not draw.
+    #[test]
+    fn a_ray_meets_the_nearest_face_from_its_front() {
+        let mut far = painted_wall("far");
+        if let Some(b) = far.brush.as_mut() {
+            b.solids = vec![space_soup_engine::brush::block_solid([-2.0, 0.0, -3.15], [2.0, 2.0, -2.85], "concrete")];
+        }
+        let g = BrushGeometry::load(&scene_of(vec![painted_wall("near"), far]));
+        let hit = g.cast(Vec3::new(0.3, 1.0, 3.0), Vec3::NEG_Z, 20.0, &[]).expect("the near wall");
+        assert!((hit.distance - 2.85).abs() < 1e-4 && (hit.point.z - 0.15).abs() < 1e-4, "{hit:?}");
+        assert!((hit.normal - Vec3::Z).length() < 1e-5);
+        // The material of the face it met: the one facing +z.
+        let facing: HashSet<u32> = g.objects[0]
+            .vertices
+            .iter()
+            .filter(|v| Vec3::from(v.normal).dot(Vec3::Z) > 0.99)
+            .map(|v| v.material)
+            .collect();
+        assert_eq!(facing, HashSet::from([hit.material]));
+        let c = GameObject::default().cuboid.color;
+        let tint = space_soup::renderer::Color3(c.0, c.1, c.2, c.3).to_linear();
+        assert_eq!(hit.tint, Vec3::new(tint[0], tint[1], tint[2]), "the object's colour");
+        // Started inside the near wall, it meets the far wall's front.
+        let inside = g.cast(Vec3::new(0.3, 1.0, 0.0), Vec3::NEG_Z, 20.0, &[]).unwrap();
+        assert!((inside.point.z + 2.85).abs() < 1e-4, "{inside:?}");
+        // Hidden, the near wall is not there; past the reach, nothing is.
+        let through = g.cast(Vec3::new(0.3, 1.0, 3.0), Vec3::NEG_Z, 20.0, &["near".to_string()]).unwrap();
+        assert!((through.point.z + 2.85).abs() < 1e-4);
+        assert!(g.cast(Vec3::new(0.3, 1.0, 3.0), Vec3::NEG_Z, 2.0, &[]).is_none());
+        assert!(g.cast(Vec3::new(0.3, 1.0, 3.0), Vec3::Z, 20.0, &[]).is_none(), "away from both");
+        assert!(g.cast(Vec3::new(5.0, 1.0, 3.0), Vec3::NEG_Z, 20.0, &[]).is_none(), "past their ends");
+    }
+
+    /// A colour map's mean albedo is taken in linear light.
+    #[test]
+    fn a_colour_maps_albedo_is_its_mean_in_linear_light() {
+        let image = |rgba: Vec<u8>, width: u32, height: u32| TerrainImage { width, height, rgba };
+        let white = image(vec![255; 4 * 16], 4, 4);
+        assert!((mean_albedo(&white) - Vec3::ONE).length() < 1e-5);
+        // Mid grey in sRGB is a fifth of white's light, not a half.
+        let grey = image([128u8, 128, 128, 255].repeat(64), 8, 8);
+        let a = mean_albedo(&grey);
+        assert!((a.x - 0.2158).abs() < 1e-3 && a.x == a.y && a.y == a.z, "{a}");
     }
 
     #[test]

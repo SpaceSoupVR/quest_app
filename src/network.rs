@@ -12,11 +12,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use space_soup_protocol::{
-    ClientMessage, PlayerId, Pose, ServerMessage, WireHand, WireInputFrame, WireLocomotionInput,
+    ClientMessage, PlayerId, Pose, ServerMessage, WireFlashlight, WireHand, WireInputFrame, WireLocomotionInput,
     WirePlayerRig, WireTeleportTarget, WireWorld,
 };
 
-use crate::avatar::{LocalPose, RemotePlayerState, Transform};
+use crate::avatar::{Flashlight, LocalPose, RemotePlayerState, Transform};
 
 pub type RemotePlayers = Arc<Mutex<HashMap<PlayerId, RemotePlayerState>>>;
 pub type LatestWorld = Arc<Mutex<Option<WireWorld>>>;
@@ -69,6 +69,14 @@ fn from_wire(p: Pose) -> Transform {
     }
 }
 
+/// A sender's flashlight as this client draws it: see
+/// `flashlight::remote_lens`.
+fn flashlight_from_wire(f: WireFlashlight) -> Option<Flashlight> {
+    let lens = from_wire(f.lens);
+    crate::flashlight::remote_lens(lens.position, lens.rotation)
+        .map(|(position, rotation)| Flashlight { lens: Transform { position, rotation }, torch: f.torch })
+}
+
 pub fn server_url() -> String {
     let path = "/sdcard/Android/data/com.example.questapp/files/server_url.txt";
     std::fs::read_to_string(path)
@@ -86,6 +94,8 @@ pub fn spawn(server_url: String) -> NetworkHandle {
         },
         left_hand: None,
         right_hand: None,
+        floor: 0.0,
+        flashlight: None,
     });
     let (input_tx, input_rx) = watch::channel(PendingInput::default());
     let remote_players: RemotePlayers = Arc::new(Mutex::new(HashMap::new()));
@@ -172,6 +182,8 @@ async fn run_session(
                     head: to_wire(pose.head),
                     left_hand: pose.left_hand.map(to_wire),
                     right_hand: pose.right_hand.map(to_wire),
+                    floor: Some(pose.floor),
+                    flashlight: pose.flashlight.map(|f| WireFlashlight { lens: to_wire(f.lens), torch: f.torch }),
                 };
                 sink.send(Message::text(serde_json::to_string(&msg)?)).await?;
             }
@@ -213,11 +225,15 @@ fn handle_server_message(text: &str, remote_players: &RemotePlayers, latest_worl
             head,
             left_hand,
             right_hand,
+            floor,
+            flashlight,
         } => {
             let state = RemotePlayerState {
                 head: from_wire(head),
                 left_hand: left_hand.map(from_wire),
                 right_hand: right_hand.map(from_wire),
+                floor: floor.filter(|f| f.is_finite()).unwrap_or(0.0),
+                flashlight: flashlight.and_then(flashlight_from_wire),
             };
             remote_players.lock().unwrap().insert(id, state);
         }

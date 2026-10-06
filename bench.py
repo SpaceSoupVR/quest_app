@@ -76,6 +76,16 @@ SCREENSHOT_DIR = "/sdcard/Oculus/Screenshots"
 # Lets the renderer copy its eye images out (`Levers::eye_capture`); read when
 # the app starts, so setting it means a restart.
 EYE_CAPTURE_PROP = "debug.spacesoup.eyecapture"
+# Every pipeline logs its shader statistics -- registers, instructions,
+# occupancy -- as `PIPESTATS` lines (`xr::vulkan::VkContext::new`). Also read
+# when the app starts: set on a running app, it logs nothing (2026-10-01).
+PIPESTATS_PROP = "debug.spacesoup.pipestats"
+# What each of those reads on a fresh boot. A run restores what it found, but
+# what it found can be an earlier run's leftovers: one killed before its
+# `finally` left the Guardian paused and the clocks locked, the next run read
+# those as "before" and put them back, and the user's own session then ran in
+# bench state (2026-10-02). A value equal to the bench's own goes back to this.
+STOCK = {GUARDIAN_PAUSE_PROP: "0", CPU_LEVEL_PROP: "", GPU_LEVEL_PROP: "", EYE_CAPTURE_PROP: "", PIPESTATS_PROP: ""}
 
 
 class BenchError(Exception):
@@ -140,7 +150,8 @@ def load_views(names: str | None) -> list:
         view = None
         for sep, derive in (("-t", lambda v, q: turned_view(v, q / 100.0, name)),
                             ("-m", lambda v, q: moved_view(v, q / 10000.0, name)),
-                            ("-y", lambda v, q: snap_turned_view(v, q, name))):
+                            ("-y", lambda v, q: snap_turned_view(v, q, name)),
+                            ("-f", lambda v, q: flashlight_moved_view(v, q / 10000.0, name))):
             base, found, q = name.rpartition(sep)
             if found and q.isdigit() and base in by_name:
                 view = derive(by_name[base], int(q))
@@ -198,6 +209,25 @@ def moved_view(view: dict, metres: float, name: str) -> dict:
     return dict(view, name=name, eye=[eye[i] + d[i] for i in range(3)], at=[at[i] + d[i] for i in range(3)],
                 note="%s, moved %g mm right" % (view["name"], metres * 1000.0))
 
+def flashlight_moved_view(view: dict, metres: float, name: str) -> dict:
+    """`view` with its flashlight moved `metres` to the right, glass and aim
+    point together, the head held still -- `NAME-fQ`, Q in tenths of a
+    millimetre (`torch_pillar-f20` is 2 mm). A light that moves moves every
+    shadow and highlight it makes; this measures whether they glide or crawl,
+    as `-m` does for the head."""
+    f = view.get("flashlight")
+    if not f:
+        raise BenchError("%s holds no flashlight to move" % view["name"])
+    eye, at = view["eye"], view["at"]
+    fw = [at[i] - eye[i] for i in range(3)]
+    r = [-fw[2], 0.0, fw[0]]  # forward x up, up = +y
+    n = math.hypot(r[0], r[2]) or 1.0
+    d = [r[0] / n * metres, 0.0, r[2] / n * metres]
+    moved = dict(f, at=[f["at"][i] + d[i] for i in range(3)], aim=[f["aim"][i] + d[i] for i in range(3)])
+    return dict(view, name=name, flashlight=moved,
+                note="%s, the flashlight moved %g mm right" % (view["name"], metres * 1000.0))
+
+
 def snap_turned_view(view: dict, degrees: int, name: str) -> dict:
     """The same eyes looking the same way, with the rig turned `degrees` (0-359)
     as snap or smooth turning leaves it and the head turned back by the rest --
@@ -219,6 +249,9 @@ def levers_for(view: dict, ab: bool, extra: dict, synced: bool = False) -> dict:
     # A head that sways side to side (BenchPose::sway), for watching what moves.
     if "sway" in view:
         levers["bench"]["sway"] = view["sway"]
+    # The player's flashlight held still at a place in the world (BenchPose::flashlight).
+    if "flashlight" in view:
+        levers["bench"]["flashlight"] = view["flashlight"]
     if ab:
         levers["ab_cycle"] = True
     if ab or synced:
@@ -801,6 +834,19 @@ def render_report(run: dict, views: dict, compare: dict | None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def set_prop(dev: Device, changed: list, warnings: list, prop: str, value) -> None:
+    """Set a system property and queue its undo: back to what it was, or to
+    `STOCK` when what it was is the bench's own value -- see `STOCK`."""
+    before = dev.shell("getprop " + prop).strip()
+    if before == str(value) and before != STOCK[prop]:
+        warnings.append("%s was already %s, left by a run that never restored it; it goes back to %r"
+                        % (prop, before, STOCK[prop]))
+        before = STOCK[prop]
+    dev.shell("setprop %s %s" % (prop, value))
+    changed.append(("restore %s to %r" % (prop, before),
+                    lambda: dev.shell("setprop %s '%s'" % (prop, before))))
+
+
 def restore(dev: Device, changed: list, warnings: list) -> None:
     """Undo what was changed, newest first; each step on its own, so one that
     fails does not leave the others undone."""
@@ -826,6 +872,10 @@ def main(argv: list | None = None) -> int:
     ap.add_argument("--eye-capture", action="store_true",
                     help="also both eyes' finished images at each view, from the renderer itself (restarts the app "
                          "with debug.spacesoup.eyecapture set, and afterwards without it)")
+    ap.add_argument("--pipestats", action="store_true",
+                    help="also every pipeline's shader statistics -- registers, instructions, occupancy -- into "
+                         "pipestats.log (restarts the app with debug.spacesoup.pipestats set, and afterwards "
+                         "without it)")
     ap.add_argument("--record", type=float, metavar="SECONDS",
                     help="also record what the headset shows at each view for this long, through the system's "
                          "video capture: SpaceWarp's synthesised frames included (`<view>.mp4`)")
@@ -839,6 +889,12 @@ def main(argv: list | None = None) -> int:
                          "them), e.g. 1,14,18,19,28,36 -- clocks, ALU use, wave occupancy, instruction cache "
                          "misses, fragments and ALU a fragment for every draw call. Some sets come back Clocks "
                          "only; that one is known to work")
+    ap.add_argument("--stage-metrics", metavar="IDS",
+                    help="with --trace, also a render-stage trace with these metric ids for every pass "
+                         "(ovrgpuprofiler -t -s; `-m -t` lists them) -- per PASS, so a pass's counters stay apart "
+                         "from the other passes' and the system's. The SoC takes only some sets: 19,13,18,1,14 "
+                         "returned instruction-cache misses, stalls, ALU use and clocks; 19,13,14,3,1 returned "
+                         "clocks and ALU alone (2026-10-01). Check `Captured N metrics` in stages_<view>.txt")
     ap.add_argument("--out", help="output folder (default ../docs/bench/<date_time>)")
     ap.add_argument("--compare", help="an earlier run's folder, to compare baselines against")
     ap.add_argument("--stall-seconds", type=float, default=120.0, help="give up on a view after this long with no new window")
@@ -863,6 +919,8 @@ def main(argv: list | None = None) -> int:
             raise BenchError("--trace runs in the driver's detailed profiling mode; run --ab separately")
         if args.draws and (not args.trace or not re.fullmatch(r"\d+(,\d+)*", args.draws)):
             raise BenchError("--draws takes comma-separated metric ids, with --trace")
+        if args.stage_metrics and (not args.trace or not re.fullmatch(r"\d+(,\d+)*", args.stage_metrics)):
+            raise BenchError("--stage-metrics takes comma-separated metric ids, with --trace")
     except json.JSONDecodeError as e:
         print("bench: --levers is not JSON: %s" % e, file=sys.stderr)
         return 2
@@ -910,6 +968,8 @@ def main(argv: list | None = None) -> int:
     changed: list = []
     capture = None
     capture_file = None
+    pipestats_capture = None
+    pipestats_file = None
     vrapi_path = out / "vrapi.log"
     failure = None
     try:
@@ -921,10 +981,7 @@ def main(argv: list | None = None) -> int:
         if not args.no_lock:
             props += [(CPU_LEVEL_PROP, args.cpu_level), (GPU_LEVEL_PROP, args.gpu_level)]
         for prop, value in props:
-            before = dev.shell("getprop " + prop).strip()
-            dev.shell("setprop %s %d" % (prop, value))
-            changed.append(("restore %s to %r" % (prop, before),
-                            lambda prop=prop, before=before: dev.shell("setprop %s '%s'" % (prop, before))))
+            set_prop(dev, changed, warnings, prop, value)
         dev.run("logcat", "-G", "16M", check=False)
         if args.trace:
             # The render-stage trace needs the driver's detailed profiling
@@ -943,11 +1000,24 @@ def main(argv: list | None = None) -> int:
             # property is put back, stopped, so the next run is not measured
             # with a copyable swapchain. (Undone newest first.)
             changed.append(("stop the app started for eye captures", lambda: dev.shell("am force-stop " + PACKAGE)))
-            before = dev.shell("getprop " + EYE_CAPTURE_PROP).strip()
-            dev.shell("setprop %s 1" % EYE_CAPTURE_PROP)
-            changed.append(("restore %s to %r" % (EYE_CAPTURE_PROP, before),
-                            lambda before=before: dev.shell("setprop %s '%s'" % (EYE_CAPTURE_PROP, before))))
+            set_prop(dev, changed, warnings, EYE_CAPTURE_PROP, 1)
             dev.shell("am force-stop " + PACKAGE)
+        if args.pipestats:
+            # The same restart, in and out, as the eye captures; the lines are
+            # read back from the moment the app starts.
+            changed.append(("stop the app started for pipeline statistics",
+                            lambda: dev.shell("am force-stop " + PACKAGE)))
+            set_prop(dev, changed, warnings, PIPESTATS_PROP, 1)
+            dev.shell("am force-stop " + PACKAGE)
+            # STREAMED from before the start, not read back at the end: the
+            # app logs every pipeline in one burst, and by the end of a run the
+            # device's shared log buffer had wrapped past the first ten
+            # (2026-10-01).
+            pipestats_file = open(out / "pipestats.log", "wb")
+            pipestats_capture = subprocess.Popen(
+                [ADB, "-s", dev.serial, "logcat", "-v", "time", "-T", "1", "-e", "PIPESTATS"],
+                stdout=pipestats_file, stderr=subprocess.DEVNULL,
+            )
         dev.shell("rm -f " + PERF)
         # Brought to the front whether or not it is running: a process in the
         # background renders nothing. `am start` resumes a running one rather
@@ -1022,6 +1092,11 @@ def main(argv: list | None = None) -> int:
                                         "set (1,14,18,19,28,36 is known to work)" % name)
                 passes, raw = trace(dev, args.trace)
                 (out / ("trace_%s.txt" % name)).write_text(raw)
+                if args.stage_metrics:
+                    # Kept raw: whoever asked for the per-stage metrics reads them.
+                    raw = dev.shell("ovrgpuprofiler -t%d -s%s" % (args.trace, args.stage_metrics),
+                                    check=False, timeout=args.trace + 90)
+                    (out / ("stages_%s.txt" % name)).write_text(raw)
                 if not passes:
                     warnings.append("the trace at %s held no render passes (see trace_%s.txt)" % (name, name))
             # Then the schedule, every phase `passes` times.
@@ -1040,6 +1115,18 @@ def main(argv: list | None = None) -> int:
     except KeyboardInterrupt:
         failure = "interrupted"
     finally:
+        if pipestats_capture is not None:
+            # Stopped before the restore stops the app: pipelines built late --
+            # a lever's measurement variant -- log when they are built.
+            pipestats_capture.terminate()
+            try:
+                pipestats_capture.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pipestats_capture.kill()
+            pipestats_file.close()
+            if not (out / "pipestats.log").read_bytes().strip():
+                warnings.append("no PIPESTATS lines came back (does the driver have "
+                                "VK_KHR_pipeline_executable_properties? see the app's `vulkan:` log)")
         restore(dev, changed, warnings)
         if capture is not None:
             capture.terminate()
