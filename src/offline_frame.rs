@@ -134,6 +134,11 @@ pub struct View {
     /// With the flashlight, its torch in the reflections, as its capsules
     /// (`flashlight::torch_capsules`). The torch itself is not drawn here.
     pub torch: bool,
+    /// The ground drawn too, as the headset draws it: into the probe pass
+    /// after the brushes and in the scene pass after their depth. Only with
+    /// the shipped half-resolution reflections and their deferred lookups.
+    /// See `offline_terrain`.
+    pub terrain: bool,
 }
 
 impl View {
@@ -159,6 +164,7 @@ impl View {
             jitter_px: [0.0, 0.0],
             flashlight: None,
             torch: false,
+            terrain: false,
         }
     }
 }
@@ -447,6 +453,13 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     if view.no_portals {
         probes.portal_count = 0;
     }
+    // `NO_TRACE=1`: the reflection's trace switched off, as the `probe_trace`
+    // lever does on the headset -- every pixel takes the untraced path, the
+    // photographs chosen at the surface and blended through doorways. To put
+    // that path on screen everywhere.
+    if std::env::var("NO_TRACE").as_deref() == Ok("1") {
+        probes.no_trace = true;
+    }
     uniforms.upload_scene_with_probes(
         &queue,
         view_proj,
@@ -598,6 +611,30 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         contents: bytemuck_cast(idx),
         usage: wgpu::BufferUsages::INDEX,
     });
+    // THE GROUND, when the view asks for it. Its reader's twin as the frame
+    // would choose it: no spot casts here, so spotless unless a lit surface's
+    // light is in the list.
+    let terrain = match (&probe_pass, view.terrain) {
+        (Some((_, _, Some((fixups, _)))), true) => offline_terrain(
+            &device,
+            &queue,
+            &game,
+            scene_name,
+            &lm,
+            (offset, yaw_inv, yaw),
+            (format, view.samples),
+            (&uniforms.layout, &probe_layout, fixups),
+            (
+                !lights.iter().any(Light::is_surface_light),
+                std::env::var("POOLLESS").as_deref() != Ok("0") && !lights_uniform.reads_pool_maps(),
+            ),
+        ),
+        (_, true) => {
+            eprintln!("offline frame: the ground is drawn only with half-resolution reflections and deferred lookups");
+            None
+        }
+        _ => None,
+    };
 
     let size = wgpu::Extent3d { width: view.width, height: view.height, depth_or_array_layers: 1 };
     let tex = |label, samples, format, usage| {
@@ -667,6 +704,17 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         pass.set_vertex_buffer(0, vb.slice(..));
         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
+        // The ground's reflection after the brushes', as the headset's pass
+        // draws it.
+        if let (Some(t), Some((_, (_, pass_bg)))) = (&terrain, fixups) {
+            pass.set_pipeline(&t.pass.pipeline);
+            pass.set_bind_group(0, &uniforms.bind_group, &[]);
+            pass.set_bind_group(1, &t.material.bind_group, &[]);
+            pass.set_bind_group(3, pass_bg, &[]);
+            pass.set_vertex_buffer(0, t.vb.slice(..));
+            pass.set_index_buffer(t.ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..t.count, 0, 0..1);
+        }
         drop(pass);
         if let Some((fixups, (target_bg, _))) = fixups {
             fixups.dispatch(&mut encoder, &uniforms.bind_group, target_bg, None);
@@ -713,6 +761,17 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             pass.set_vertex_buffer(0, vb.slice(..));
             pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
+        }
+        // The ground between the brushes' depth and their shading, as the
+        // headset's scene pass draws it.
+        if let (Some(t), Some((_, target, _))) = (&terrain, &probe_pass) {
+            pass.set_pipeline(&t.reader.pipeline);
+            pass.set_bind_group(0, &uniforms.bind_group, &[]);
+            pass.set_bind_group(1, &t.material.bind_group, &[]);
+            pass.set_bind_group(3, &target.bind_group, &[]);
+            pass.set_vertex_buffer(0, t.vb.slice(..));
+            pass.set_index_buffer(t.ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..t.count, 0, 0..1);
         }
         pass.set_pipeline(&pipeline.pipeline);
         pass.set_bind_group(0, &uniforms.bind_group, &[]);
@@ -805,6 +864,136 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         rgba.extend_from_slice(&data[start..start + (view.width * 4) as usize]);
     }
     Some(Shot { width: view.width, height: view.height, rgba })
+}
+
+/// The ground as [`render_brushes`] draws it. See [`offline_terrain`].
+struct OfflineTerrain {
+    vb: wgpu::Buffer,
+    ib: wgpu::Buffer,
+    count: u32,
+    material: space_soup::renderer::terrain_pipeline::TerrainMaterial,
+    /// Its probe pass, and its scene reader.
+    pass: space_soup::renderer::terrain_pipeline::TerrainPipeline,
+    reader: space_soup::renderer::terrain_pipeline::TerrainPipeline,
+}
+
+/// THE GROUND, as the headset draws it in the shipped single-eye path: its
+/// geometry in the player's frame, its material with the level's ground map
+/// and the lamps' masks after it (as `run_inner` hands them to the renderer),
+/// its probe pass, poolless when `poolless`, and its reader's twin as the
+/// frame chooses it -- spotless when `spotless`, baked where the ground map is
+/// (`XrRenderer::terrain_reader`). `TERRAIN_READER=full|spotless|baked|
+/// baked_spotless` draws that reader instead, `inlined` the
+/// `terrain_reader` lever's inlined pass and reader. `None` for a level
+/// without terrain.
+#[allow(clippy::too_many_arguments)]
+fn offline_terrain(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    game: &std::path::Path,
+    scene_name: &str,
+    lm: &[space_soup_engine::lightmaps::LoadedLightmap],
+    (offset, yaw_inv, yaw): (Vec3, Quat, f32),
+    (format, samples): (wgpu::TextureFormat, u32),
+    (uniform_layout, probe_layout, fixups): (
+        &wgpu::BindGroupLayout,
+        &wgpu::BindGroupLayout,
+        &space_soup::renderer::probe_fixup::ProbeFixups,
+    ),
+    (spotless, poolless): (bool, bool),
+) -> Option<OfflineTerrain> {
+    use space_soup::renderer::terrain_pipeline::{self as tp, TerrainImage, TerrainPipeline};
+    use wgpu::util::DeviceExt;
+    let (mut geometry, splat) = crate::load_scene_terrain(game, scene_name)?;
+    let image = |m: &space_soup_engine::lightmaps::LoadedLightmap| TerrainImage {
+        width: m.width,
+        height: m.height,
+        rgba: m.rgba.clone(),
+    };
+    let sky = lm.iter().find(|m| m.object_id == space_soup_engine::lightmaps::SCENE_TERRAIN_SKY_ID).map(image);
+    let found: Vec<&space_soup_engine::lightmaps::LoadedLightmap> = (0..space_soup_engine::stationary::MAX_STATIONARY_LAYERS)
+        .map(space_soup_engine::lightmaps::scene_terrain_stationary_id)
+        .map_while(|id| lm.iter().find(|m| m.object_id == id))
+        .collect();
+    let masks: Vec<TerrainImage> = if found.is_empty() {
+        Vec::new()
+    } else {
+        crate::scene_lights::usable_stationary_masks(found, &crate::scene_lights::stationary_channels(game, scene_name))
+            .into_iter()
+            .map(image)
+            .collect()
+    };
+    let ground = sky.as_ref().map(|map| {
+        map.with_stationary_masks(&masks)
+            .unwrap_or_else(|| TerrainImage { width: map.width, height: map.height, rgba: map.rgba.clone() })
+    });
+    let sun_baked = sky.as_ref().is_some_and(TerrainImage::sun_baked_everywhere);
+    let choice = std::env::var("TERRAIN_READER").ok();
+    eprintln!(
+        "offline frame: the ground, its map {} everywhere, {} mask layer(s), reader {}",
+        if sun_baked { "baked" } else { "not baked" },
+        masks.len(),
+        choice.as_deref().unwrap_or("as shipped"),
+    );
+    let (reader, pass) = match choice.as_deref() {
+        Some("inlined") => {
+            let [read, pass, poolless_pass] =
+                TerrainPipeline::new_inlined(device, format, uniform_layout, samples, probe_layout, fixups);
+            (read, if poolless { poolless_pass } else { pass })
+        }
+        other => {
+            let (spotless, sun_baked) = match other {
+                None => (spotless, sun_baked),
+                Some("full") => (false, false),
+                Some("spotless") => (true, false),
+                Some("baked") => (false, true),
+                Some("baked_spotless") => (true, true),
+                Some(x) => panic!("TERRAIN_READER={x}: not full, spotless, baked, baked_spotless or inlined"),
+            };
+            let reader =
+                TerrainPipeline::new_probe_reader_twin(device, format, uniform_layout, samples, probe_layout, spotless, sun_baked);
+            // `TERRAIN_PASS_CUT=<cut>`: the pass drawn with one of its
+            // measurement cuts (`terrain_pipeline::PROBE_PASS_REGISTER_CUTS`),
+            // as the `pass_cut` lever draws it on the headset.
+            let pass = match std::env::var("TERRAIN_PASS_CUT") {
+                Ok(cut) => TerrainPipeline::new_probe_pass_with_cut(device, uniform_layout, fixups, &cut)
+                    .unwrap_or_else(|| panic!("no ground probe pass cut {cut}, or it no longer matches the shader")),
+                Err(_) if poolless => TerrainPipeline::new_probe_pass_poolless(device, uniform_layout, fixups),
+                Err(_) => TerrainPipeline::new_probe_pass(device, uniform_layout, fixups),
+            };
+            (reader, pass)
+        }
+    };
+    let dir = game.join("textures").join("terrain");
+    let material = tp::TerrainMaterial::from_layers_with(
+        device,
+        queue,
+        &reader.material_layout,
+        &tp::load_terrain_layers(&dir),
+        &tp::load_terrain_normals(&dir),
+        &tp::load_terrain_rough(&dir),
+        &tp::load_terrain_ao(&dir),
+        splat.as_ref(),
+        ground.as_ref(),
+        tp::load_terrain_settings(&dir),
+    );
+    let (verts, idx) = geometry.assemble(offset, yaw_inv, yaw)?;
+    Some(OfflineTerrain {
+        vb: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("offline_terrain_vb"),
+            contents: bytemuck_cast(verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        }),
+        ib: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("offline_terrain_ib"),
+            contents: bytemuck_cast(idx),
+            usage: wgpu::BufferUsages::INDEX,
+        }),
+        count: idx.len() as u32,
+        material,
+        pass,
+        reader,
+    })
 }
 
 /// THE GROUND MAP, built as `XrRenderer::ensure_ground_map` builds it on the
@@ -1466,12 +1655,16 @@ mod bench_views {
     /// THE BENCHMARK'S VIEWPOINTS, rendered here, so the frame the headset
     /// measures from each can be looked at: `$OUT/bench_<name>.png`, each with
     /// its flashlight and its torch's reflection (not the torch itself, nor
-    /// any glare). `ONLY=a,b` for some of them.
+    /// any glare), and the ground (`TERRAIN=0` leaves it out). `ONLY=a,b` for
+    /// some of them, `CUT=<scene register cut>` for the brushes' scene shader
+    /// with one of its measurement cuts.
     #[test]
     #[ignore]
     fn render_the_bench_views() {
         let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
         let only = std::env::var("ONLY").ok();
+        let terrain = std::env::var("TERRAIN").as_deref() != Ok("0");
+        let cut = std::env::var("CUT").ok().map(|c| &*Box::leak(c.into_boxed_str()));
         let lights = bench_flashlights();
         for (name, eye, at) in bench_views() {
             if only.as_ref().is_some_and(|o| !o.split(',').any(|n| n == name)) {
@@ -1481,12 +1674,38 @@ mod bench_views {
                 Some(&(glass, aim, torch)) => (Some((glass, aim)), torch),
                 None => (None, false),
             };
-            let Some(shot) = render_brushes("test_room", View { adapt: true, flashlight, torch, ..View::headset(eye, at) }) else {
+            let Some(shot) = render_brushes("test_room", View { adapt: true, flashlight, torch, terrain, cut, ..View::headset(eye, at) }) else {
                 eprintln!("skipping: no GPU or no test_room");
                 return;
             };
             shot.save(&out.join(format!("bench_{name}.png")));
         }
+    }
+
+    /// ONE VIEWPOINT from the environment, to look again at something seen on
+    /// the headset: `EYE=x,y,z` looking at `AT=x,y,z`, a flashlight held at
+    /// `TORCH_AT` and aimed at `TORCH_AIM` if both are set, `CUT` and
+    /// `TERRAIN=0` as for the bench views. `$OUT/$NAME.png` (`view`).
+    #[test]
+    #[ignore]
+    fn render_one_view() {
+        let v3 = |key: &str| {
+            std::env::var(key).ok().map(|s| {
+                let v: Vec<f32> = s.split(',').map(|x| x.trim().parse().unwrap()).collect();
+                Vec3::new(v[0], v[1], v[2])
+            })
+        };
+        let (Some(eye), Some(at)) = (v3("EYE"), v3("AT")) else { panic!("set EYE and AT") };
+        let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
+        let name = std::env::var("NAME").unwrap_or_else(|_| "view".into());
+        let terrain = std::env::var("TERRAIN").as_deref() != Ok("0");
+        let cut = std::env::var("CUT").ok().map(|c| &*Box::leak(c.into_boxed_str()));
+        let flashlight = v3("TORCH_AT").zip(v3("TORCH_AIM"));
+        let Some(shot) = render_brushes("test_room", View { adapt: true, flashlight, terrain, cut, ..View::headset(eye, at) }) else {
+            eprintln!("skipping: no GPU or no test_room");
+            return;
+        };
+        shot.save(&out.join(format!("{name}.png")));
     }
 }
 
