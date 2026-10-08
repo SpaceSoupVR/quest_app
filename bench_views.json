@@ -148,6 +148,18 @@
       "note": "From the hallway toward the marble hall's doorway: its marble border reflected the sky and the grass (faces whose middle lay outdoors, 2026-10-01)."
     },
     {
+      "name": "hall_to_doors",
+      "eye": [-1.0, 1.6, -3.4],
+      "at": [3.0, 1.2, -3.0],
+      "note": "From the marble hall at the hallway's double doors (2026-10-07): the leaves as models, their tiles from the hallway's south sconce, and with the doors shut, the hallway's spill gone and the outdoors beyond culled. A/B with door_shadows / door_culling."
+    },
+    {
+      "name": "hallway_to_brick_doors",
+      "eye": [5.5, 1.6, -3.0],
+      "at": [10.2, 1.2, -3.0],
+      "note": "Down the hallway at the brick hall's double doors (2026-10-07): both sconces hold door tiles, with the player's own. A/B with door_shadows."
+    },
+    {
       "name": "corner_spot_self",
       "eye": [2.35, 1.6, -14.35],
       "at": [3.0, 1.25, -14.5],
@@ -394,6 +406,78 @@
       "at": [0.15, 0.0, 0.75],
       "flashlight": {"at": [0.65, 1.25, -0.3], "aim": [0.0, 2.1, 1.5]},
       "note": "torch_pendant's beam on the front pendant (hall_spot_2), looked at in the floor: its reflection there, at about (0.23, 0, 0.37), should be lit by the torch as the pendant is -- the cards' albedo relit in the fix-up pass (2026-10-05)."
+    },
+    {
+      "name": "fire_close",
+      "eye": [14.3, 1.6, -4.7],
+      "at": [14.0, 0.35, -6.4],
+      "note": "Close on the brick hall's campfire from 2.3 m: its flames, coals, smoke and embers, and the eye adapted to it (effects, 2026-10-07)."
+    },
+    {
+      "name": "fire_and_smoke",
+      "eye": [15.5, 1.6, -3.0],
+      "at": [14.0, 1.0, -6.4],
+      "note": "The campfire from 4 m with its smoke rising toward the ceiling (effects, 2026-10-07)."
+    },
+    {
+      "name": "beach_south",
+      "eye": [0.0, 1.7, 24.0],
+      "at": [0.0, 0.4, 60.0],
+      "note": "Down the cove's beach to the open sea: shallows over sand, breakers and swash, the sea out to the horizon (water, 2026-10-07)."
+    },
+    {
+      "name": "shore",
+      "eye": [-3.0, 1.6, 27.0],
+      "at": [1.0, -1.3, 33.0],
+      "note": "Down at the waterline: the swash running up the sand, the bed through the shallows (water, 2026-10-07)."
+    },
+    {
+      "name": "pond",
+      "eye": [-18.0, 1.6, -17.0],
+      "at": [-25.0, -0.6, -26.0],
+      "note": "Across the pond from its bank: the bed through the clear edge, the sky in its deep middle (water, 2026-10-07)."
+    },
+    {
+      "name": "rain_field",
+      "eye": [-12.0, 1.6, 6.0],
+      "at": [-20.0, 0.3, -4.0],
+      "note": "Standing in the rain (test_room's rain_demo, the west lawn): streaks, splashes, wet ground and its puddles. The ground's weather twins and the particles; compare with levers {\"weather\": false} or the no_weather phase (weather, 2026-10-07)."
+    },
+    {
+      "name": "rain_puddles_down",
+      "eye": [-17.0, 1.65, 0.0],
+      "at": [-17.5, 0.0, -2.5],
+      "note": "Looking down at the puddles at your feet in the rain: their rings and the sky in them (weather, 2026-10-07)."
+    },
+    {
+      "name": "snow_hills",
+      "eye": [3.0, 1.6, -22.5],
+      "at": [6.0, 2.5, -40.0],
+      "note": "In the snow (test_room's snow_demo): falling flakes, the snow lying on the hills, gone from the steep crest (weather, 2026-10-07)."
+    },
+    {
+      "name": "snow_down",
+      "eye": [2.0, 1.65, -24.0],
+      "at": [2.3, 0.0, -26.0],
+      "note": "Looking down at the snow at your feet: its sparkle and its cover over the grass (weather, 2026-10-07)."
+    },
+    {
+      "name": "weather_edge",
+      "eye": [-4.0, 1.7, 0.0],
+      "at": [-16.0, 0.6, 0.0],
+      "note": "From dry ground into the rain area's edge: the rain and the wet ground fading in over three metres (weather, 2026-10-07)."
+    },
+    {
+      "name": "under_cove",
+      "eye": [0.0, -2.4, 45.0],
+      "at": [0.0, -1.9, 55.0],
+      "note": "A metre under the cove, looking out and a little up: the veil with the sun's shafts, the sand under the caustics, the surface's underside with Snell's window above (underwater, 2026-10-08)."
+    },
+    {
+      "name": "under_pond",
+      "eye": [-26.0, -0.75, -26.0],
+      "at": [-20.0, -0.85, -26.0],
+      "note": "Under the murky pond, looking across it: the veil at its thickest, the window bright overhead (underwater, 2026-10-08)."
     }
   ]
 }

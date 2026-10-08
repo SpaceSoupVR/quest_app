@@ -1,64 +1,20 @@
 //! Turning a scene's `WaterDef` into something the renderer can draw.
 //!
-//! The two things this does that the engine crate cannot: sample the loaded
-//! terrain for depth, and carry the surface into the PLAYER's frame every time
-//! the player moves -- the same treatment brushes and terrain get, and for the
-//! same reason. Geometry left in world space stays glued to the player while
-//! everything else slides past.
+//! The thing this does that the engine crate cannot: sample the loaded terrain
+//! for depth. The surface stays in the WORLD -- the water's vertex shader poses
+//! it into the player's frame -- so it is built once and never re-uploaded as
+//! the player walks.
 
-use glam::{Quat, Vec3};
-use space_soup::renderer::water_pipeline::{WaterUniform, WaterVertex};
-use space_soup_engine::water::WaterDef;
+use space_soup::renderer::water_pipeline::{WaterOptics, WaterUniform, WaterVertex};
+use space_soup::renderer::water_waves::WaveParams;
+use space_soup_engine::water::{WaterDef, OPEN_WATER_DEPTH};
 
-/// One body's world-space surface, plus the optics the shader needs.
+/// One body's world-space surface, plus its optics and the sea it raises.
 pub struct WaterBody {
-    world: Vec<WaterVertex>,
+    pub world: Vec<WaterVertex>,
     pub indices: Vec<u32>,
     pub uniform: WaterUniform,
-    posed: Vec<WaterVertex>,
-    built_for: Option<(Vec3, f32)>,
-}
-
-impl WaterBody {
-    /// The surface in the player's frame, or `None` if it has not changed.
-    ///
-    /// `None` rather than the unchanged slice, so the caller cannot accidentally
-    /// re-upload a lake's worth of vertices every frame for a player standing
-    /// still. Water is large, static and cheap to leave alone -- the only thing
-    /// that moves is the frame it is expressed in.
-    pub fn assemble(
-        &mut self,
-        offset: Vec3,
-        yaw_inv: Quat,
-        player_yaw: f32,
-    ) -> Option<&[WaterVertex]> {
-        let key = (offset, player_yaw);
-        if self.built_for == Some(key) {
-            return None;
-        }
-        self.posed.clear();
-        self.posed.reserve(self.world.len());
-        for v in &self.world {
-            let p = yaw_inv * (Vec3::from(v.position) - offset);
-            self.posed.push(WaterVertex { position: p.to_array(), depth: v.depth });
-        }
-        self.built_for = Some(key);
-        Some(&self.posed)
-    }
-
-    /// The most recent player-frame surface, whether or not it was just rebuilt.
-    pub fn posed(&self) -> &[WaterVertex] {
-        &self.posed
-    }
-
-    /// The surface in WORLD space, as it was tessellated.
-    ///
-    /// What the renderer's buffers are sized and seeded from: `posed` is empty
-    /// until the first frame, and a zero-length upload would have the body
-    /// dropped as if the level had no water in it.
-    pub fn world(&self) -> &[WaterVertex] {
-        &self.world
-    }
+    pub waves: WaveParams,
 }
 
 fn srgb_to_linear(c: u8) -> f32 {
@@ -66,18 +22,32 @@ fn srgb_to_linear(c: u8) -> f32 {
     if s <= 0.040_45 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
 }
 
+/// The sea a body's wind raises: its own seed, so two bodies never wave in
+/// step, and its typical depth for how fast the waves run.
+fn wave_params(def: &WaterDef, depth: f32, seed: u64) -> WaveParams {
+    WaveParams {
+        wind_speed: def.wind_speed.max(0.0),
+        wind_dir: def.wind_direction.to_radians(),
+        fetch: def.fetch.max(1.0),
+        depth,
+        choppiness: def.choppiness.clamp(0.0, 1.5),
+        seed: WaveParams::default().seed ^ seed.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+        ..WaveParams::default()
+    }
+}
+
 /// Build every body of water in a scene.
 ///
 /// Colours are converted to LINEAR here. They are authored as sRGB bytes,
-/// because that is what a colour picker produces, and the shader mixes and
-/// tonemaps in linear -- feeding it the raw bytes makes shallow water far too
-/// bright and the depth gradient the wrong shape.
+/// because that is what a colour picker produces, and the shader works in
+/// linear -- feeding it the raw bytes makes the water far too clear and too
+/// bright.
 pub fn build(
     defs: &[WaterDef],
     terrain: Option<&dyn space_soup_engine::terrain::TerrainSource>,
 ) -> Vec<WaterBody> {
     let mut out = Vec::new();
-    for def in defs {
+    for (index, def) in defs.iter().enumerate() {
         let ground = |x: f32, z: f32| terrain.and_then(|t| t.height_at(x, z));
         let Some((verts, indices)) = space_soup_engine::water::build_surface(def, ground) else {
             log::info!(
@@ -90,34 +60,54 @@ pub fn build(
             .iter()
             .map(|v| WaterVertex { position: v.position, depth: v.depth })
             .collect();
-        let lin = |c: [u8; 3]| {
-            [srgb_to_linear(c[0]), srgb_to_linear(c[1]), srgb_to_linear(c[2]), 1.0]
-        };
+        // The waves' dispersion depth: the water's typical depth where it is
+        // over known ground, as a wave feels the bottom a few metres down.
+        let known: Vec<f32> = verts.iter().map(|v| v.depth).filter(|&d| d > 0.0 && d < OPEN_WATER_DEPTH).collect();
+        let depth = if known.is_empty() { 30.0 } else { (known.iter().sum::<f32>() / known.len() as f32).clamp(0.5, 30.0) };
+        let waves = wave_params(def, depth, index as u64);
+        let lin = |c: [u8; 3]| [srgb_to_linear(c[0]), srgb_to_linear(c[1]), srgb_to_linear(c[2])];
+        let uniform = WaterUniform::new(
+            &WaterOptics {
+                height: def.height,
+                shallow: lin(def.shallow),
+                deep: lin(def.deep),
+                depth_scale: def.depth_scale,
+                shore_fade: def.shore_fade,
+                swash: def.swash,
+                swell: def.swell,
+            },
+            &waves,
+        );
         log::info!(
-            "water at y={:.2}: {} vertices, {} triangles",
+            "water at y={:.2}: {} vertices, {} triangles; {:.1} m/s over {:.0} m, waves {:.2} m high, {:.1} m deep",
             def.height,
             world.len(),
             indices.len() / 3,
+            waves.wind_speed,
+            waves.fetch,
+            waves.significant_height(),
+            depth,
         );
-        out.push(WaterBody {
-            posed: Vec::with_capacity(world.len()),
-            world,
-            indices,
-            uniform: WaterUniform {
-                shallow: lin(def.shallow),
-                deep: lin(def.deep),
-                params: [def.depth_scale, def.shore_fade, def.wave_scale, def.wave_strength],
-                anim: [0.0, def.wave_speed, def.opacity, 0.0],
-            },
-            built_for: None,
-        });
+        out.push(WaterBody { world, indices, uniform, waves });
     }
     out
+}
+
+/// WET SAND: the line below which the ground is wet, world y, and the damp
+/// band above it -- from the bodies whose waves wash a shore (a lake's still
+/// edge leaves no band): their surface plus the wash's run-up, which reaches
+/// further up a beach than the wash rises, and the highest of them.
+pub fn wet_shore(defs: &[WaterDef]) -> Option<(f32, f32)> {
+    defs.iter()
+        .filter(|d| d.swash > 0.0)
+        .map(|d| (d.height + 1.3 * d.swash, 0.25))
+        .reduce(|a, b| if a.0 >= b.0 { a } else { b })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use space_soup::renderer::water_pipeline::LIGHT_PATH;
 
     fn def() -> WaterDef {
         serde_json::from_str(r#"{"height": 1.0, "bounds": [-4, -4, 4, 4]}"#).unwrap()
@@ -136,46 +126,41 @@ mod tests {
 
     #[test]
     fn colours_are_converted_out_of_srgb() {
+        // sRGB 188 is linear ~0.5: a white bed through `depth_scale` metres
+        // must come out at half, not at 0.737, which is what reading the byte
+        // unconverted would make it -- water far too clear.
         let mut d = def();
         d.shallow = [188, 188, 188];
-        let bodies = build(&[d], None);
-        let r = bodies[0].uniform.shallow[0];
-        // sRGB 188 is linear ~0.5. Passing the byte through unconverted would
-        // give 0.737, which is why unconverted water reads as far too bright.
-        assert!(
-            (r - 0.5).abs() < 0.02,
-            "sRGB 188 must land near linear 0.5, got {r}",
-        );
+        let bodies = build(&[d.clone()], None);
+        let k = bodies[0].uniform.extinction[0];
+        let seen = (-k * d.depth_scale * (1.0 + LIGHT_PATH)).exp();
+        assert!((seen - 0.5).abs() < 0.02, "sRGB 188 must see through to linear ~0.5, got {seen}");
     }
 
     #[test]
-    fn the_surface_moves_into_the_players_frame() {
-        let mut bodies = build(&[def()], None);
-        let body = &mut bodies[0];
-        let offset = Vec3::new(10.0, 0.0, -5.0);
-        let posed = body.assemble(offset, Quat::IDENTITY, 0.0).expect("first call rebuilds").to_vec();
-        for (w, p) in body.world.iter().zip(posed.iter()) {
-            let expect = Vec3::from(w.position) - offset;
-            assert!(
-                (Vec3::from(p.position) - expect).length() < 1e-5,
-                "vertex was not carried into the player frame",
-            );
-            assert_eq!(p.depth, w.depth, "depth is a measurement, not a coordinate");
-        }
+    fn the_waves_follow_the_authored_wind() {
+        let mut d = def();
+        d.wind_speed = 9.0;
+        d.wind_direction = 90.0;
+        d.fetch = 3000.0;
+        let w = build(&[d], None).remove(0).waves;
+        assert_eq!((w.wind_speed, w.fetch), (9.0, 3000.0));
+        assert!((w.wind_dir - std::f32::consts::FRAC_PI_2).abs() < 1e-6, "degrees must become radians: {}", w.wind_dir);
     }
 
     #[test]
-    fn standing_still_reuses_the_last_assembly() {
-        let mut bodies = build(&[def()], None);
-        let body = &mut bodies[0];
-        assert!(body.assemble(Vec3::ZERO, Quat::IDENTITY, 0.0).is_some(), "first call must build");
-        assert!(
-            body.assemble(Vec3::ZERO, Quat::IDENTITY, 0.0).is_none(),
-            "a stationary player must not re-pose the surface",
-        );
-        assert!(
-            body.assemble(Vec3::new(1.0, 0.0, 0.0), Quat::IDENTITY, 0.0).is_some(),
-            "moving must re-pose it",
-        );
+    fn only_a_washing_shore_leaves_wet_sand() {
+        let lake = def();
+        assert_eq!(wet_shore(&[lake.clone()]), None);
+        let mut sea = def();
+        sea.swash = 0.2;
+        let (line, band) = wet_shore(&[lake, sea]).unwrap();
+        assert!((line - 1.26).abs() < 1e-5 && band > 0.0);
+    }
+
+    #[test]
+    fn two_bodies_do_not_wave_in_step() {
+        let bodies = build(&[def(), def()], None);
+        assert_ne!(bodies[0].waves.seed, bodies[1].waves.seed);
     }
 }

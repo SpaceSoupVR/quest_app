@@ -73,6 +73,9 @@ pub struct StaticScene {
     /// reading it twice is how the two would eventually disagree about which
     /// room a probe describes.
     pub reflection_probes: Vec<(String, glam::Vec3, glam::Vec3, glam::Vec3)>,
+    /// The scene's doors: where each leaf is drawn, collided and shadowed this
+    /// frame. See `client_doors`.
+    pub doors: crate::client_doors::ClientDoors,
 }
 
 impl StaticScene {
@@ -84,9 +87,11 @@ impl StaticScene {
         let mut water = Vec::new();
         let mut terrain = None;
         let mut reflection_probes = Vec::new();
+        let mut doors = crate::client_doors::ClientDoors::default();
         let (grip_points, part_animations) = match Scene::load(&path) {
             Ok(scene) => {
                 physics.rebuild(&scene, game_dir);
+                doors = crate::client_doors::ClientDoors::from_scene(&scene);
                 sky = scene.sky.clone();
                 post = scene.post;
                 water = scene.water.clone();
@@ -148,6 +153,7 @@ impl StaticScene {
             water,
             terrain,
             reflection_probes,
+            doors,
         }
     }
 }

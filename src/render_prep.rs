@@ -89,6 +89,14 @@ pub(crate) fn build_render_lists<'a>(
             mesh.scale = Vec3::from(rm.scale);
         }
     }
+    // THE DOORS where this headset draws them: the server's pose, turned by
+    // any local hand pushing the leaf. See `client_doors`.
+    for (id, position, rotation) in static_scene.doors.poses() {
+        if let Some((mesh, _)) = mesh_cache.get_mut(id) {
+            mesh.position = yaw_inv * (position - offset);
+            mesh.rotation = yaw_inv * rotation;
+        }
+    }
 
     for hand in [Hand::Left, Hand::Right] {
         let held: Option<&WireHeldGrip> = world.as_ref().and_then(|w| match hand {
@@ -230,6 +238,7 @@ pub(crate) fn build_render_lists<'a>(
                     lightmap_key: Some(rm.id.as_str()),
                     emissive_drive: rm.emissive_drive,
                     own_light: None,
+                    tile_caster: false,
                 });
             }
             let (mesh, model) = mesh_cache.get(&rm.id)?;
@@ -239,6 +248,9 @@ pub(crate) fn build_render_lists<'a>(
                 lightmap_key: Some(rm.id.as_str()),
                 emissive_drive: rm.emissive_drive,
                 own_light: None,
+                // A door's leaf shadows the lamps reaching it from their
+                // moving casters' tiles. See `space_soup::renderer::doors`.
+                tile_caster: static_scene.doors.is_door(&rm.id),
             })
         })
         .chain(
@@ -252,6 +264,7 @@ pub(crate) fn build_render_lists<'a>(
                     // An avatar is not a fixture.
                     emissive_drive: 0.0,
                     own_light: None,
+                    tile_caster: false,
                 }),
         )
         .chain(
@@ -263,6 +276,7 @@ pub(crate) fn build_render_lists<'a>(
                     lightmap_key: None,
                     emissive_drive: 0.0,
                     own_light: None,
+                    tile_caster: false,
                 }),
         )
         .collect();
@@ -275,6 +289,7 @@ pub(crate) fn build_render_lists<'a>(
             lightmap_key: None,
             emissive_drive: 0.0,
             own_light: None,
+            tile_caster: false,
         })
         .into_iter()
         .collect();
