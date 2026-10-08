@@ -1104,10 +1104,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         {
             let yaw = Quat::from_rotation_y(locomotion.player_yaw);
             let offset = locomotion.player_offset;
-            let hands: Vec<Vec3> = [space_soup_engine::Hand::Left, space_soup_engine::Hand::Right]
-                .iter()
-                .filter_map(|h| rig.get(space_soup_engine::JointId::HandGrip(*h)).map(|t| yaw * t.position + offset))
-                .collect();
+            // Every part of each hand that can push: grip and palm, and a
+            // tracked hand's finger tips, in the world.
+            let hands = client_doors::hand_spheres(|j| rig.get(j).map(|t| yaw * t.position + offset));
             let head = yaw * rig.head().position + offset;
             static_scene.doors.update(object_bounds_src.iter().map(|b| (b.id.as_str(), Quat::from_array(b.rotation))), &hands, Some(head), dt);
             let poses: Vec<(String, Vec3, Quat)> = static_scene.doors.poses().map(|(id, p, r)| (id.to_string(), p, r)).collect();
