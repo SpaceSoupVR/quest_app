@@ -579,7 +579,9 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     probes.fill_volumes(&rooms);
     let resident_rooms = probes.volumes();
     probes.set_portals(&portals, view.eye, &resident_rooms);
-    probes.set_proxies(&proxies, view.eye, &resident_rooms);
+    // The doors' proxies turned with their leaves, as the headset turns them.
+    let posed = space_soup::renderer::doors::posed_proxies(&proxies, doors.as_ref().map_or(&[][..], |d| &d.views));
+    probes.set_proxies(&posed, view.eye, &resident_rooms);
     probes.set_proxy_fields(&field_slots);
     // The outdoors, as the headset carries it every frame.
     probes.set_outdoors(
@@ -1347,8 +1349,15 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                 // Along a waterline, the twin that leaves the view under the
                 // line to the underwater one.
                 let line = under_body == Some((b, space_soup::renderer::underwater::EyeWater::Waterline));
+                // `WATER_CUT=<cut>`: the ringless water with one of its
+                // measurement cuts (`water_pipeline::WATER_CUTS`).
+                let cut = std::env::var("WATER_CUT").ok().map(|c| {
+                    pipeline.with_cut(&device, &c).unwrap_or_else(|| panic!("no water cut {c}, or it no longer matches"))
+                });
                 pass.set_pipeline(if line {
                     &pipeline.waterline
+                } else if let Some(cut) = cut.as_ref() {
+                    cut
                 } else if std::env::var("SPLASH").is_ok() {
                     &pipeline.pipeline
                 } else {
@@ -1374,6 +1383,10 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         // The falling rain and snow last, lit by the ground's baked sky and sun.
         if let (Some((pipeline, counts)), Some((_, maps, _)), Some(t)) = (&weather_particles, &weather, &terrain) {
             pipeline.draw(&mut pass, &uniforms.bind_group, &t.material.bind_group, &maps.bind_group, *counts);
+            // And the areas' columns seen from afar, ended by the probe pass's depth.
+            if let Some((_, target, _)) = &probe_pass {
+                pipeline.draw_veils(&mut pass, &uniforms.bind_group, &t.material.bind_group, &maps.bind_group, &target.bind_group);
+            }
         }
         // The wet film after surfacing, over everything.
         if let (Some((pipes, groups, _, group)), Some((_, target, _)), Some((_, bodies, _))) = (&film, &probe_pass, &water) {
@@ -1498,6 +1511,8 @@ struct OfflineDoors {
     leaves: Vec<(space_soup::renderer::mesh::GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform)>,
     lightmap: space_soup::renderer::mesh::LoadedTexture,
     tiles: Vec<(usize, Mat4)>,
+    /// The leaves as the renderer takes them, for their reflection proxies.
+    views: Vec<space_soup::renderer::doors::DoorView>,
 }
 
 impl OfflineDoors {
@@ -1590,7 +1605,7 @@ impl OfflineDoors {
             "offline frame: door tiles for lamps {:?}",
             tiles.iter().map(|(i, _)| (*i, (Quat::from_rotation_y(yaw) * lights[*i].position + offset).to_array().map(|v| (v * 10.0).round() / 10.0))).collect::<Vec<_>>()
         );
-        Some(Self { pipeline, leaves, lightmap, tiles })
+        Some(Self { pipeline, leaves, lightmap, tiles, views: doors.views() })
     }
 
     fn tile_lamps(&self) -> Vec<usize> {

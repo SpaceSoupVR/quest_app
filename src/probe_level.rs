@@ -169,7 +169,11 @@ impl ProbeLevel {
                 rooms[d.volume as usize] = (d.min, d.max);
             }
         }
-        let standing = space_soup_engine::reflection_proxy::reflection_proxies(game_dir, objects, &rooms);
+        let mut standing = space_soup_engine::reflection_proxy::reflection_proxies(game_dir, objects, &rooms);
+        // The doors' leaves, after everything else, so the shaped models'
+        // numbers the baker gives the rest are unchanged. Turned with their
+        // leaves each frame: see `space_soup::renderer::doors::posed_proxies`.
+        standing.extend(space_soup_engine::reflection_proxy::door_proxies(game_dir, objects, &rooms));
         // WHICH MODELS ARE TRACED BY THEIR OWN SHAPE: the baker's rule, so
         // the models it left out of the photographs are exactly the ones
         // given a field here. See `shaped_models`.
@@ -299,7 +303,12 @@ mod tests {
     use super::*;
 
     /// test_room's rooms hold the pillar, three hanging lamps and two wall
-    /// sconces -- and nothing of the rooms' own shells. Each lamp's box is the
+    /// sconces -- and nothing of the rooms' own shells -- and the four door
+    /// leaves, each once for both rooms of its doorway: a shut leaf stands in
+    /// the wall between two boxes, and the trace meets it from either side
+    /// only as a proxy of the room it is entering (`door_proxies`). Without
+    /// them the marble showed the lit hallway through a shut door (headset,
+    /// 2026-10-08). Each lamp's box is the
     /// MODEL's, hanging below its ceiling mount, not the 20 cm handle the
     /// editor gives the object.
     #[test]
@@ -314,7 +323,10 @@ mod tests {
             eprintln!("proxy room {} centre {:?} half {:?}", p.volume, p.centre, p.half_size);
             assert!(p.half_size.max_element() < 2.0, "a room's shell became a proxy: {p:?}");
         }
-        assert_eq!(proxies.len(), 6, "pillar + 3 hanging lamps + 2 sconces");
+        assert_eq!(proxies.len(), 6 + 8, "pillar + 3 hanging lamps + 2 sconces + 4 leaves x 2 rooms");
+        let leaves: Vec<_> = proxies[6..].iter().collect();
+        assert!(leaves.iter().all(|p| p.half_size.min_element() < 0.05 && !p.solid), "a door's proxy is its thin leaf: {leaves:?}");
+        let fixtures = &proxies[..6];
         let pillar = proxies.iter().find(|p| (p.centre - Vec3::new(0.0, 1.55, -7.0)).length() < 1e-3).expect("the pillar");
         assert!((pillar.half_size - Vec3::new(0.45, 1.55, 0.45)).length() < 1e-3);
         // Hanging lamps: mounted at y = 3.1, the shade below it.
@@ -327,14 +339,15 @@ mod tests {
         // scale -- the three hanging lamps share one, the two sconces another
         // -- and the pillar, a brush, is its box.
         assert!(pillar.field.is_none(), "the pillar is a brush: {pillar:?}");
-        let models: Vec<_> = proxies.iter().filter(|p| !p.solid).collect();
+        let models: Vec<_> = fixtures.iter().filter(|p| !p.solid).collect();
         assert_eq!(models.len(), 5);
+        assert!(leaves.iter().all(|p| p.field.is_some()), "a leaf without a field: {leaves:?}");
         assert!(models.iter().all(|p| p.field.is_some()), "a fixture without a field: {models:?}");
-        let mut distinct: Vec<u32> = models.iter().filter_map(|p| p.field).collect();
+        let mut distinct: Vec<u32> = models.iter().chain(&leaves).filter_map(|p| p.field).collect();
         distinct.sort();
         distinct.dedup();
         assert_eq!(distinct.len(), fields.len(), "a field no proxy uses, or a proxy naming no field");
-        assert!(fields.len() <= 3, "{} fields for test_room's two or three fixture models", fields.len());
+        assert!(fields.len() <= 5, "{} fields for test_room's two or three fixture models and two leaves", fields.len());
         for f in &fields {
             assert_eq!(f.distances.len() as u32, f.dims.iter().product::<u32>());
         }

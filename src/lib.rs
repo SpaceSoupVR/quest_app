@@ -1108,7 +1108,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .filter_map(|h| rig.get(space_soup_engine::JointId::HandGrip(*h)).map(|t| yaw * t.position + offset))
                 .collect();
-            static_scene.doors.update(object_bounds_src.iter().map(|b| (b.id.as_str(), Quat::from_array(b.rotation))), &hands, dt);
+            let head = yaw * rig.head().position + offset;
+            static_scene.doors.update(object_bounds_src.iter().map(|b| (b.id.as_str(), Quat::from_array(b.rotation))), &hands, Some(head), dt);
             let poses: Vec<(String, Vec3, Quat)> = static_scene.doors.poses().map(|(id, p, r)| (id.to_string(), p, r)).collect();
             for (id, p, r) in &poses {
                 static_scene.physics.set_door_pose(id, *p, *r);
