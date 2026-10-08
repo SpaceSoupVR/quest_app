@@ -46,10 +46,15 @@ mod flashlight_bounce;
 mod mirror_glare;
 mod glare_fixtures;
 mod mesh_masks;
+mod scene_effects;
 mod scene_lights;
 mod scene_meshes;
+mod client_doors;
 mod terrain_render;
 mod water_render;
+mod weather_render;
+mod splashes;
+mod time_of_day;
 #[cfg(target_os = "android")]
 mod to_wire;
 
@@ -94,6 +99,7 @@ fn post_upload_for(post: &space_soup_engine::scene::PostDef)
         // Set per frame by the renderer.
         terrain_detail_distance: 0.0,
         reflection_share: false,
+        night_vision: 0.0,
     }
 }
 
@@ -270,9 +276,12 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     // scene editor -- without this the headset renders every terrain at the
     // engine's built-in tile sizes no matter what the editor previewed, which
     // is a difference nobody can see until they put the headset on.
-    renderer.set_terrain_settings(
-        space_soup::renderer::terrain_pipeline::load_terrain_settings(&texture_dir),
-    );
+    let mut terrain_settings = space_soup::renderer::terrain_pipeline::load_terrain_settings(&texture_dir);
+    if let Some((line, band)) = water_render::wet_shore(&static_scene.water) {
+        terrain_settings.wet_line = line;
+        terrain_settings.wet_band = band;
+    }
+    renderer.set_terrain_settings(terrain_settings);
     renderer.set_terrain_splat(loaded_terrain.as_ref().and_then(|(_, s)| s.as_ref()));
     // The ground reflections land on. See `space_soup::renderer::ground_map`.
     renderer.set_terrain_heights(
@@ -280,14 +289,15 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // WATER. Built once here rather than per frame: the surface is static world
-    // geometry whose depth comes from the terrain, so the only thing that
-    // changes at runtime is the frame it is expressed in and the wave clock.
+    // geometry whose depth comes from the terrain, posed into the player's
+    // frame by its vertex shader, so the only thing that changes at runtime is
+    // the wave clock.
     //
     // Loaded through `terrain::load` again rather than reusing the render
     // geometry: that copy has been decimated to a render LOD and rebased into
     // the player's frame, and a shoreline measured against it would be wrong by
     // however much the LOD smoothed the ground.
-    let mut water_bodies = {
+    let water_bodies = {
         let source = static_scene
             .terrain
             .as_ref()
@@ -296,8 +306,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     };
     renderer.set_water(
         &water_bodies
-            .iter()
-            .map(|b| (b.world().to_vec(), b.indices.clone(), b.uniform))
+            .into_iter()
+            .map(|b| (b.world, b.indices, b.uniform, b.waves))
             .collect::<Vec<_>>(),
     );
     // The sky: the background, and the ambient inside the level. Projecting its
@@ -311,6 +321,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             sky.as_ref().map_or(1.0, |(_, _, i)| *i),
         );
         renderer.set_post(post_upload_for(&static_scene.post));
+        // THE TIME OF DAY the level authors, if any, over that sky. See
+        // `space_soup::renderer::time_of_day`.
+        renderer.set_time_of_day(time_of_day::scene_params(static_scene.sky.as_ref(), renderer.sun_toward().map(|v| v.to_array())));
     }
     let mut live_objects = grab_detect::LiveObjects::default();
     let mut client_audio = client_audio::ClientAudio::new();
@@ -381,6 +394,17 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             // The buildings' outsides, for reflections that leave a building.
             let buildings = level.buildings(&dir, &static_scene.scene_name);
             info!("STARTUP probes: {} building outside(s)", buildings.len());
+            // The same photographs by the lamps alone, which the time of day
+            // relights the probes, the buildings and the eye from. See
+            // `time_of_day::lamps_probe_level`.
+            let lamps = time_of_day::lamps_probe_level(&dir, &static_scene.scene_name)
+                .filter(|l| l.descs.len() == level.descs.len() && l.resolution == level.resolution);
+            let lamps_dir = space_soup_engine::daylight::daylight_dir(&dir, &static_scene.scene_name);
+            info!("STARTUP probes: lamps-only photographs {}", if lamps.is_some() { "found" } else { "none" });
+            renderer.set_probe_lamps(
+                lamps.as_ref().map(|l| l.source()),
+                lamps.as_ref().map(|l| l.buildings(&lamps_dir, &static_scene.scene_name).into_iter().map(|b| b.2).collect()).unwrap_or_default(),
+            );
             renderer.set_building_outsides(buildings);
             renderer.set_reflection_probes_with_depth(level.descs, level.resolution, level.portals, source, Some(depth));
             renderer.set_reflection_proxies(standing.proxies, standing.fields, standing.cards);
@@ -395,6 +419,18 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+    // THE LEVEL'S EFFECTS -- fire, smoke, embers, dust -- from its scene file,
+    // as its lights are. See `scene_effects`.
+    let mut level_effects = scene_effects::load(&dir, &static_scene.scene_name);
+    scene_effects::find_ceilings(&mut level_effects, |p| static_scene.physics.raycast(p, Vec3::Y, 40.0).map(|(hit, _)| hit.y));
+    renderer.set_effects(level_effects.clone());
+    // THE LEVEL'S WEATHER: rain and snow over its areas, and what they leave
+    // on the ground, its ground found through the physics scene. Nothing is
+    // built for a level without. See `weather_render`.
+    let mut weather = weather_render::WeatherClient::load(&dir, &static_scene.scene_name, &static_scene.physics);
+    renderer.set_weather(&weather.texels(), weather.chunk_firsts(loaded_terrain.as_ref().map(|(t, _)| t)));
+    // SPLASHES: feet, hands and things striking the water. See `splashes`.
+    let mut splash_watch = splashes::SplashWatch::default();
     // WHICH LAMPS GLARE, from which sides. See `glare_fixtures`.
     let mut lamp_glare = glare_fixtures::load(&dir, &static_scene.scene_name, &glare_measured);
 
@@ -470,6 +506,13 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     &stationary_maps.iter().map(|m| m.rgba.as_slice()).collect::<Vec<_>>(),
                     stationary_maps.first().map_or((1, 1), |m| (m.width, m.height)),
                 );
+                // Its daylight layers, for a moving sun, when they are this
+                // bake's. See `time_of_day::daylight_layers`.
+                renderer.set_daylight_layers(time_of_day::daylight_layers(
+                    &dir,
+                    &static_scene.scene_name,
+                    m.linear.as_deref().map(|l| (l, m.width, m.height)),
+                ));
                 continue;
             }
             // The stationary lamps' masks on the ground travel as terrain maps
@@ -1019,6 +1062,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 // the glare is measured from, are the first scene's.
                 lamp_glare = glare_fixtures::load(&dir, &w.scene_name, &HashMap::new());
                 static_meshes = scene_meshes::load(&dir, &w.scene_name);
+                level_effects = scene_effects::load(&dir, &w.scene_name);
+                scene_effects::find_ceilings(&mut level_effects, |p| static_scene.physics.raycast(p, Vec3::Y, 40.0).map(|(hit, _)| hit.y));
+                renderer.set_effects(level_effects.clone());
+                weather = weather_render::WeatherClient::load(&dir, &w.scene_name, &static_scene.physics);
+                renderer.set_weather(&weather.texels(), weather.chunk_firsts(loaded_terrain.as_ref().map(|(t, _)| t)));
                 {
                     let sky = loaders::load_scene_sky(&dir, static_scene.sky.as_ref());
                     renderer.set_sky(
@@ -1027,6 +1075,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                         sky.as_ref().map_or(1.0, |(_, _, i)| *i),
                     );
                     renderer.set_post(post_upload_for(&static_scene.post));
+                    renderer.set_time_of_day(time_of_day::scene_params(static_scene.sky.as_ref(), renderer.sun_toward().map(|v| v.to_array())));
                 }
                 // Alongside the geometry: the previous level's materials would
                 // otherwise be bound against this one's layer numbering, which
@@ -1048,6 +1097,53 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         live_objects.update(object_bounds_src);
+        // THE DOORS: each leaf where the server put it, turned by this
+        // headset's own hands where they push it; the walk then collides with
+        // them where they are drawn, and the renderer shadows them and culls
+        // through the doorways they leave open. See `client_doors`.
+        {
+            let yaw = Quat::from_rotation_y(locomotion.player_yaw);
+            let offset = locomotion.player_offset;
+            let hands: Vec<Vec3> = [space_soup_engine::Hand::Left, space_soup_engine::Hand::Right]
+                .iter()
+                .filter_map(|h| rig.get(space_soup_engine::JointId::HandGrip(*h)).map(|t| yaw * t.position + offset))
+                .collect();
+            static_scene.doors.update(object_bounds_src.iter().map(|b| (b.id.as_str(), Quat::from_array(b.rotation))), &hands, dt);
+            let poses: Vec<(String, Vec3, Quat)> = static_scene.doors.poses().map(|(id, p, r)| (id.to_string(), p, r)).collect();
+            for (id, p, r) in &poses {
+                static_scene.physics.set_door_pose(id, *p, *r);
+            }
+            renderer.set_doors(static_scene.doors.views());
+        }
+        // THE WEATHER, on the same clock: each area's numbers every frame,
+        // its map a few times a second, and the player's own wetness.
+        {
+            let head_world = Quat::from_rotation_y(locomotion.player_yaw) * rig.head().position + locomotion.player_offset;
+            let (areas, maps) = weather.step(sim_time as f64, dt, head_world);
+            if !areas.is_empty() {
+                renderer.update_weather(sim_time as f64, &areas, &maps);
+            }
+        }
+        // SPLASHES, from where the feet, hands and moving things are now.
+        if renderer.water_body_count() > 0 {
+            let yaw = Quat::from_rotation_y(locomotion.player_yaw);
+            let offset = locomotion.player_offset;
+            let world = |p: Vec3| yaw * p + offset;
+            let head = rig.head();
+            let floor = Vec3::new(world(head.position).x, offset.y, world(head.position).z);
+            let facing = yaw * (head.rotation * Vec3::NEG_Z);
+            let hands = [space_soup_engine::Hand::Left, space_soup_engine::Hand::Right]
+                .map(|h| rig.get(space_soup_engine::JointId::HandGrip(h)).map(|t| world(t.position)));
+            let physics = &static_scene.physics;
+            let surface = |x: f32, z: f32| physics.water_depth_at(x, z, 0.0);
+            let sun = renderer.sun_toward();
+            let sunlit = |p: Vec3| sun.map_or(0.0, |d| if physics.raycast(p, d, 300.0).is_some() { 0.0 } else { 1.0 });
+            let things = live_objects.by_id.iter().map(|(id, c)| (id.as_str(), c.position, c.half_size));
+            let ground = |p: Vec3| physics.raycast_down(p + Vec3::Y * 0.01, 40.0).map(|(hit, _)| hit.y);
+            for s in splash_watch.step(sim_time as f64, dt, &surface, &ground, &sunlit, Some((floor, facing)), hands, things) {
+                renderer.add_splash(s);
+            }
+        }
         queue_new_meshes(meshes_src, &mesh_cache, &mut requested_mesh_ids, &mesh_req_tx);
 
         let input = part_pull::handle_input(
@@ -1160,6 +1256,14 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &mut capsule_groups,
             avatar_colour,
         );
+        // THE PLAYER WET IN THE RAIN: their body and hands, as `weather`
+        // soaked them. See `ModelUniform::set_wetness`.
+        if let Some((_, model)) = local_direct_mesh.as_ref() {
+            model.set_wetness(renderer.queue(), weather.body_wet);
+        }
+        if let Some((_, model)) = avatar_mesh_cache.get(&local_player) {
+            model.set_wetness(renderer.queue(), weather.body_wet);
+        }
         // The local player first, then everyone else nearest first: the
         // shaders take the first few. See `CapsuleUpload`.
         if capsule_groups.len() > 2 {
@@ -1295,6 +1399,18 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         // A spot fixture's bulb lights its own housing outside the beam: see
         // `render_prep::attach_own_lights`.
         render_prep::attach_own_lights(&mut mesh_instances, lights_src, &lights);
+        // THE FIRES' LIGHT, flickering with their flames, after the level's
+        // lamps and before the flashlight: one more live light each, with
+        // the effects. See `space_soup::renderer::effects::fire_light`.
+        if renderer.frame_levers().effects {
+            lights.extend(
+                level_effects
+                    .iter()
+                    // On the effects' own clock, the frame's display time: the
+                    // light pulses with the flames drawn (`fire_glow`).
+                    .filter_map(|e| space_soup::renderer::effects::fire_light(e, time.as_nanos() as f64 * 1e-9, offset, yaw_inv)),
+            );
+        }
         // The flashlight's beam rides last, after the pairing above (which
         // matches lights to `lights_src` by position), as one more live spot.
         let bounce_dt = bounce_clock.elapsed().as_secs_f32();
@@ -1370,7 +1486,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         // Every beam's lit surfaces this instant. See `lit_surfaces`.
         let mut surfaces_now: Vec<flashlight_bounce::LitPlane> = Vec::new();
         if let Some((lens, rotation, torch)) = flashlight_now {
-            lights.push(flashlight::beam(lens, rotation * Vec3::NEG_Z, offset, yaw_inv));
+            let beam = flashlight::beam(lens, rotation * Vec3::NEG_Z, offset, yaw_inv);
+            // The rain and snow in its cone catch its light. See `weather`.
+            renderer.set_weather_torch(Some(beam));
+            lights.push(beam);
             let landed = flashlight_bounce::landings(lens, rotation, &bounce_rays, land);
             surfaces_now.extend(landed.surfaces());
             if bouncing {
@@ -1394,10 +1513,12 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     lightmap_key: None,
                     emissive_drive: flashlight::lens_drive(),
                     own_light: None,
+                    tile_caster: false,
                 });
             }
         } else {
             bounce.clear();
+            renderer.set_weather_torch(None);
         }
         // ...and the other players': each beam a live spot like this one's,
         // its glass glaring into it -- the user, 2026-10-02: the flashlight
@@ -1429,10 +1550,17 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     lightmap_key: None,
                     emissive_drive: flashlight::lens_drive(),
                     own_light: None,
+                    tile_caster: false,
                 });
             }
         }
         lights.extend(bounce_lights);
+        // The fires' flames glare as a lamp's bulb does, from their middle as
+        // wide as they are. See `space_soup::renderer::effects::fire_glare`.
+        if renderer.frame_levers().effects {
+            let now = time.as_nanos() as f64 * 1e-9;
+            glare_sources.extend(level_effects.iter().filter_map(|e| space_soup::renderer::effects::fire_glare(e, now, offset, yaw_inv)));
+        }
         renderer.set_glare_sources(glare_sources);
         let held: Vec<space_soup::renderer::lights::LitSurface> = lit_surfaces
             .follow(&surfaces_now, bounce_dt)
@@ -1474,13 +1602,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         // world-space vertices left the ground glued to the player: walking
         // moved every other object past you while the terrain came along, which
         // reads as "the room is sliding around" rather than as a terrain bug.
-        // Water follows the player's frame exactly as brushes and terrain do,
-        // and is re-uploaded ONLY when that frame actually changed.
-        for (i, body) in water_bodies.iter_mut().enumerate() {
-            if let Some(posed) = body.assemble(offset, yaw_inv, locomotion.player_yaw) {
-                renderer.update_water_surface(i, posed);
-            }
-        }
+        // (Water poses itself, in its vertex shader.)
 
         // Assembled once for its side effect, so the chunk bounds are rebuilt
         // into the player's frame, then read as an OWNED list before the slices

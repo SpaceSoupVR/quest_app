@@ -232,6 +232,25 @@ impl TerrainGeometry {
         (lo, hi)
     }
 
+    /// Each chunk's first index and its WORLD bounds, from the unposed
+    /// vertices: what a weather area is tested against
+    /// (`weather_render::chunk_flags`).
+    pub fn chunk_world_bounds(&self) -> Vec<(u32, (Vec3, Vec3))> {
+        self.chunk_ranges
+            .iter()
+            .map(|&(first, count)| {
+                let mut lo = Vec3::splat(f32::INFINITY);
+                let mut hi = Vec3::splat(f32::NEG_INFINITY);
+                for &i in &self.indices[first as usize..(first + count) as usize] {
+                    let p = Vec3::from(self.vertices[i as usize].position);
+                    lo = lo.min(p);
+                    hi = hi.max(p);
+                }
+                (first, (lo, hi))
+            })
+            .collect()
+    }
+
     pub fn caster_chunks(&self) -> Vec<space_soup::renderer::shadow::CasterChunk> {
         self.chunk_ranges
             .iter()
