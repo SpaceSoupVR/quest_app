@@ -26,6 +26,9 @@ android_logger = "0.14"
 ndk-glue       = { version = "0.7" }
 ndk            = { version = "0.7" }
 
+avatar_pose         = { path = "../avatar_pose" }
+hand_menu_core      = { path = "../hand_menu_core" }
+prop_core           = { path = "../prop_core" }
 space_soup_protocol = { path = "../space_soup_protocol" }
 tokio               = { version = "1", features = ["rt", "net", "sync", "time", "macros"] }
 tokio-tungstenite   = "0.29"

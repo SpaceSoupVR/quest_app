@@ -24,7 +24,7 @@ pub(crate) fn step_locomotion(
     prev_r_trigger: bool,
     input: &InputFrame,
     net: &network::NetworkHandle,
-) {
+) -> LocomotionInput {
     let locomotion_input = LocomotionInput {
         move_stick: (cs.l_stick.x, cs.l_stick.y),
         turn_stick_x: cs.r_stick.x,
@@ -71,4 +71,6 @@ pub(crate) fn step_locomotion(
         rig: to_wire::player_rig_to_wire(rig),
         teleport_target: teleport_target.map(to_wire::teleport_target_to_wire),
     });
+
+    locomotion_input
 }
