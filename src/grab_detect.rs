@@ -48,16 +48,32 @@ pub struct StaticScene {
     // and ground collision for player movement without depending on the server (see
     // movement::step_locomotion) -- the same PhysicsWorld type and rebuild() call the
     // server uses, so client and server never disagree about where geometry is.
-    pub physics: PhysicsWorld,
+    //
+    // `None` when loaded via `load_without_physics`: local mode's `local_sim`
+    // already owns a `PhysicsWorld` for the whole scene, and PhysX allows only
+    // one Foundation per process, so collision there reads local_sim's instead
+    // of standing up a second, conflicting one (see lib.rs).
+    pub physics: Option<PhysicsWorld>,
 }
 
 impl StaticScene {
     pub fn load(game_dir: &Path, scene_name: &str) -> Self {
+        Self::load_impl(game_dir, scene_name, true)
+    }
+
+    /// For local mode -- see the `physics` field doc above.
+    pub fn load_without_physics(game_dir: &Path, scene_name: &str) -> Self {
+        Self::load_impl(game_dir, scene_name, false)
+    }
+
+    fn load_impl(game_dir: &Path, scene_name: &str, build_physics: bool) -> Self {
         let path = Manifest::scene_path(game_dir, scene_name);
-        let mut physics = PhysicsWorld::new();
+        let mut physics = if build_physics { Some(PhysicsWorld::new()) } else { None };
         let (grip_points, part_animations) = match Scene::load(&path) {
             Ok(scene) => {
-                physics.rebuild(&scene, game_dir);
+                if let Some(physics) = physics.as_mut() {
+                    physics.rebuild(&scene, game_dir);
+                }
 
                 let mut grip_points = HashMap::new();
                 let mut part_animations = HashMap::new();

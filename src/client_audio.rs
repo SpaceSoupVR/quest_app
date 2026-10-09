@@ -32,6 +32,8 @@ pub struct ClientAudio {
     listener: Option<ListenerHandle>,
     clips: HashMap<String, StaticSoundData>,
     playing: HashMap<String, ActiveClip>,
+    /// One-shot sounds still playing (kept so their tracks live until done).
+    shots: Vec<(SpatialTrackHandle, StaticSoundHandle)>,
 }
 
 fn to_mint_vec3(v: Vec3) -> mint::Vector3<f32> {
@@ -78,6 +80,7 @@ impl ClientAudio {
             listener,
             clips: HashMap::new(),
             playing: HashMap::new(),
+            shots: Vec::new(),
         }
     }
 
@@ -140,6 +143,40 @@ impl ClientAudio {
 
         self.playing
             .insert(sound.object_id.clone(), ActiveClip { track, handle, filter });
+    }
+
+    /// Play a sound file once at a point in the world (a prop's gunshot,
+    /// click, slide...).
+    pub fn play_once(&mut self, file: &Path, volume: f32, at: Vec3) {
+        self.shots.retain(|(_, h)| h.state() != PlaybackState::Stopped);
+        let key = file.to_string_lossy().to_string();
+        let data = match self.clips.get(&key) {
+            Some(d) => d.clone(),
+            None => match StaticSoundData::from_file(file) {
+                Ok(d) => {
+                    self.clips.insert(key, d.clone());
+                    d
+                }
+                Err(e) => {
+                    log::warn!("ClientAudio: failed to load '{}': {e}", file.display());
+                    return;
+                }
+            },
+        };
+        let (Some(manager), Some(listener)) = (self.manager.as_mut(), &self.listener) else {
+            return;
+        };
+        let mut track = match manager.add_spatial_sub_track(listener.id(), to_mint_vec3(at), SpatialTrackBuilder::new().distances((1.0, 40.0))) {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("ClientAudio: no track for '{}': {e}", file.display());
+                return;
+            }
+        };
+        match track.play(data.volume(linear_to_decibels(volume))) {
+            Ok(h) => self.shots.push((track, h)),
+            Err(e) => log::warn!("ClientAudio: could not play '{}': {e}", file.display()),
+        }
     }
 
     pub fn update(

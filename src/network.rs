@@ -78,6 +78,28 @@ pub fn server_url() -> String {
         .unwrap_or_else(|| "ws://127.0.0.1:9001".to_string())
 }
 
+/// A handle with no background thread: `latest_world` stays `None` and
+/// `remote_players` stays empty forever, with no connection attempt ever made.
+/// Used when multiplayer is turned off, so local mode has zero droplet
+/// dependency instead of silently retrying a server the player disabled.
+pub fn spawn_offline() -> NetworkHandle {
+    let (local_pose_tx, _) = watch::channel(LocalPose {
+        head: Transform {
+            position: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+        },
+        left_hand: None,
+        right_hand: None,
+    });
+    let (input_tx, _) = watch::channel(PendingInput::default());
+    NetworkHandle {
+        local_pose_tx,
+        input_tx,
+        remote_players: Arc::new(Mutex::new(HashMap::new())),
+        latest_world: Arc::new(Mutex::new(None)),
+    }
+}
+
 pub fn spawn(server_url: String) -> NetworkHandle {
     let (local_pose_tx, local_pose_rx) = watch::channel(LocalPose {
         head: Transform {

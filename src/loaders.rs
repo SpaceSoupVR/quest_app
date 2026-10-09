@@ -48,7 +48,9 @@ pub(crate) fn spawn_avatar_loader(path: PathBuf, renderer: &XrRenderer) -> Recei
     let layout = renderer.skinned_mesh_texture_layout().clone();
     std::thread::Builder::new()
         .name("avatar_loader".into())
-        .spawn(move || match GltfMesh::load(&device, &queue, &layout, &path) {
+        // Avatars force every material opaque: BLEND-mode clothing on a
+        // double-sided skin otherwise reads as see-through.
+        .spawn(move || match GltfMesh::load_all_opaque(&device, &queue, &layout, &path) {
             Ok(mesh) => {
                 info!("Avatar mesh loaded: '{}'", path.display());
                 let _ = tx.send(mesh);

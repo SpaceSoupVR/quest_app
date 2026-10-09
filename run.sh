@@ -211,7 +211,7 @@ fi
 wait_for_remote_path() {
     local path="$1"
     local tries=0
-    until adb shell "[ -e '$path' ] && echo exists" 2>/dev/null | grep -q exists; do
+    until adb shell "[ -e '$path' ] && echo exists" </dev/null 2>/dev/null | grep -q exists; do
         tries=$((tries + 1))
         if [ "$tries" -ge 20 ]; then
             fail "timed out waiting for $path to exist on device."
@@ -246,7 +246,7 @@ wait_for_app_data_dir() {
 # True if the remote file exists and is non-empty. Pure predicate — never exits.
 verify_remote_file() {
     local path="$1" size
-    size=$(adb shell "stat -c %s '$path' 2>/dev/null || echo 0" | tr -d '\r')
+    size=$(adb shell "stat -c %s '$path' 2>/dev/null || echo 0" </dev/null | tr -d '\r')
     [ "${size:-0}" -ge 1 ] 2>/dev/null
 }
 
@@ -258,11 +258,19 @@ PUSH_FAILURES=()
 # `set -e` + verify_remote_file's `exit 1`, silently leaving every later asset (other
 # models, the editor's external .bin animation buffers) off the headset. Always
 # returns 0 so `set -e` can never trip on it.
+#
+# Every `adb` call in here (and in wait_for_remote_path/verify_remote_file) is
+# redirected from /dev/null: `adb shell` forwards local stdin to the device by
+# default, and the models loop below drives this through `while read -d ''
+# ... done < <(find ... -print0)` -- without the redirect, the first `adb
+# shell` call drains bytes straight out of that NUL-delimited stream, and the
+# loop silently stops after its first file. That is why only one model (of
+# 46) was ever reaching the headset before this fix.
 push_file() {
     local src="$1" dst="$2" attempt size
     for attempt in 1 2; do
-        if adb push "$src" "$dst" >/dev/null 2>&1 && verify_remote_file "$dst"; then
-            size=$(adb shell "stat -c %s '$dst' 2>/dev/null || echo 0" | tr -d '\r')
+        if adb push "$src" "$dst" </dev/null >/dev/null 2>&1 && verify_remote_file "$dst"; then
+            size=$(adb shell "stat -c %s '$dst' 2>/dev/null || echo 0" </dev/null | tr -d '\r')
             ok "OK: ${dst#"$REMOTE_GAME_DIR"/} ($size bytes)"
             return 0
         fi
@@ -368,6 +376,15 @@ if $WANT_DEPLOY; then
     if [ -f "$GAME_DIR/avatar_rig.json" ]; then
         push_file "$GAME_DIR/avatar_rig.json" "$REMOTE_GAME_DIR/avatar_rig.json"
     fi
+    # The bodies and hands players can wear (selection pads, hand menu).
+    if [ -f "$GAME_DIR/avatars.json" ]; then
+        push_file "$GAME_DIR/avatars.json" "$REMOTE_GAME_DIR/avatars.json"
+    fi
+    if [ -d "$GAME_DIR/fonts" ]; then
+        for f in "$GAME_DIR"/fonts/*; do
+            push_file "$f" "$REMOTE_GAME_DIR/fonts/$(basename "$f")"
+        done
+    fi
 
     if [ -d "$GAME_DIR/scenes" ]; then
         adb shell mkdir -p "$REMOTE_GAME_DIR/scenes"
@@ -381,7 +398,7 @@ if $WANT_DEPLOY; then
     if [ -d "$GAME_DIR/models" ]; then
         while IFS= read -r -d '' d; do
             rel="${d#"$GAME_DIR"/models}"
-            adb shell mkdir -p "$REMOTE_GAME_DIR/models$rel"
+            adb shell mkdir -p "$REMOTE_GAME_DIR/models$rel" </dev/null
         done < <(find "$GAME_DIR/models" -type d -print0)
 
         # -type f pulls in EVERYTHING: .glb meshes AND their sidecar .bin animation

@@ -35,6 +35,8 @@ pub(crate) fn build_render_lists<'a>(
     hidden_cache: &'a mut HashMap<String, (Vec<String>, GltfMesh, ModelUniform)>,
     avatar_mesh_cache: &'a HashMap<PlayerId, (GltfMesh, ModelUniform)>,
     local_direct_mesh: &'a Option<(GltfMesh, ModelUniform)>,
+    // The local player's gloves, when they're wearing them.
+    gloves: &'a Option<crate::avatar_render::Gloves>,
     local_player: PlayerId,
     world: &Option<WireWorld>,
     static_scene: &StaticScene,
@@ -226,6 +228,12 @@ pub(crate) fn build_render_lists<'a>(
             local_direct_mesh
                 .iter()
                 .map(|(mesh, model)| MeshInstance { mesh, model, lightmap_key: None }),
+        )
+        .chain(
+            gloves
+                .iter()
+                .filter(|g| g.shown)
+                .flat_map(|g| g.parts.iter().map(|(mesh, model, _)| MeshInstance { mesh, model, lightmap_key: None })),
         )
         .collect();
 
