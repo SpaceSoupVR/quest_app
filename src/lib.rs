@@ -208,6 +208,12 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
+    // THE GROUND'S SHADERS ARE BUILT FOR THE LEVEL'S GROUND, painted or not,
+    // and the renderer builds them before any level is loaded: say what the
+    // entry level is first, so they are built once. See
+    // `space_soup::renderer::terrain_pipeline::GROUND_PAINTED`.
+    space_soup::renderer::terrain_pipeline::expect_painted_ground(entry_level_is_painted(&game_dir()));
+
     let platform::XrSetup {
         xr,
         mut headset,
@@ -1126,6 +1132,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
         // SPLASHES, from where the feet, hands and moving things are now.
         if renderer.water_body_count() > 0 {
+            // THINGS are told of by the server, with the speed and the mass
+            // physics had for them; only for a server that does not tell are
+            // they worked out here from how they are seen to move.
+            let told = world.as_ref().and_then(|w| w.water_entries.as_deref());
             let yaw = Quat::from_rotation_y(locomotion.player_yaw);
             let offset = locomotion.player_offset;
             let world = |p: Vec3| yaw * p + offset;
@@ -1138,9 +1148,12 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             let surface = |x: f32, z: f32| physics.water_depth_at(x, z, 0.0);
             let sun = renderer.sun_toward();
             let sunlit = |p: Vec3| sun.map_or(0.0, |d| if physics.raycast(p, d, 300.0).is_some() { 0.0 } else { 1.0 });
-            let things = live_objects.by_id.iter().map(|(id, c)| (id.as_str(), c.position, c.half_size, c.rotation));
+            let things = live_objects.by_id.iter().filter(|_| told.is_none()).map(|(id, c)| (id.as_str(), c.position, c.half_size, c.rotation));
             let ground = |p: Vec3| physics.raycast_down(p + Vec3::Y * 0.01, 40.0).map(|(hit, _)| hit.y);
             for s in splash_watch.step(sim_time as f64, dt, &surface, &ground, &sunlit, Some((floor, facing)), hands, things) {
+                renderer.add_splash(s);
+            }
+            for s in splash_watch.told(sim_time as f64, told.unwrap_or(&[]), &ground, &sunlit) {
                 renderer.add_splash(s);
             }
         }
@@ -1762,6 +1775,22 @@ fn load_scene_brushes(
 }
 
 // And the offline harness, which builds the ground map from it as the headset does.
+/// Whether the game's entry level declares a splat map for its ground: what
+/// the renderer's ground shaders are first built for
+/// (`terrain_pipeline::expect_painted_ground`). Read from the level's own
+/// file, as `load_scene_terrain` reads it later; `false` for a game or level
+/// that cannot be read -- a wrong answer costs one rebuild of the ground's
+/// pipelines when the level loads (`XrRenderer::set_terrain_splat`), not a
+/// wrong picture.
+#[cfg(any(target_os = "android", test))]
+fn entry_level_is_painted(game_dir: &std::path::Path) -> bool {
+    let Ok(manifest) = space_soup_engine::Manifest::load(game_dir) else { return false };
+    space_soup_engine::scene::Scene::load(&manifest.entry_scene_path(game_dir))
+        .ok()
+        .and_then(|scene| scene.terrain)
+        .is_some_and(|terrain| terrain.splat.is_some())
+}
+
 #[cfg(any(target_os = "android", test))]
 fn load_scene_terrain(
     game_dir: &std::path::Path,
@@ -1833,5 +1862,24 @@ fn streamed_light(u: &lightmap_client::LightmapUpdate) -> space_soup::renderer::
     match &u.linear {
         Some(l) => space_soup::renderer::mesh::LightmapLight::Linear(l),
         None => space_soup::renderer::mesh::LightmapLight::Srgb8(&u.rgba),
+    }
+}
+
+#[cfg(test)]
+mod ground_build_tests {
+    /// The shipped game's entry level is painted, so the renderer's first
+    /// build of the ground's shaders is the one it keeps; a game that cannot
+    /// be read is taken as unpainted, the build that is right for any level.
+    #[test]
+    fn the_shipped_entry_level_is_painted_and_an_unreadable_game_is_not() {
+        let game = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game");
+        if !game.join("manifest.json").is_file() {
+            eprintln!("skipping: no game folder");
+            return;
+        }
+        assert!(super::entry_level_is_painted(&game));
+        let (_, splat) = super::load_scene_terrain(&game, "test_room").expect("test_room's terrain");
+        assert!(splat.is_some(), "the peek and the load disagree");
+        assert!(!super::entry_level_is_painted(&game.join("no_such_game")));
     }
 }
