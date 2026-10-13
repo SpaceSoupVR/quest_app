@@ -1,19 +1,29 @@
 //! SPLASHES: where something strikes the water, seen by the client and handed
-//! to the renderer (`XrRenderer::add_splash`), which throws the drops and
-//! spray and spreads the rings (`space_soup::renderer::effects::Splash`).
+//! to the renderer (`XrRenderer::add_splash`), which works out from how fast,
+//! at what angle, how wide and how heavy it was everything the splash is
+//! (`space_soup::renderer::effects::splash_shape`).
 //!
 //! Three things strike water here:
-//! - FEET, wading: a splash a stride, from alternate feet, as hard as the
-//!   walk and strongest in shallows -- deep water swallows a step's kick.
+//! - FEET, wading: a splash a stride, from alternate feet, each foot swung
+//!   forward and down into the water at a shallow angle, as fast as the walk
+//!   -- and slower in deep water, which a leg pushes through rather than
+//!   steps into.
 //! - HANDS, slapped down through the surface, and pulled out of it fast.
-//! - THINGS, a level's moving objects, falling in: as hard as they fall, as
-//!   big as they are.
+//! - THINGS, a level's moving objects, falling in: as fast as they fall, as
+//!   wide and as heavy as they are. Seen by the engine's own rule
+//!   (`space_soup_engine::water::WaterWatch`), so one floating at the
+//!   waterline does not go in again each time it bobs. The server knows their
+//!   true speed and mass (`PhysicsWorld::take_water_entries`); until its
+//!   snapshot carries them, the headset takes the speed from how the thing
+//!   moved and the mass from its size, as physics does for a body with none
+//!   authored.
 //!
 //! Everything is in the WORLD's frame, on the water's clock. Only the still
 //! surface is known here (the footprints' height); the waves move it a hand
 //! or so, which a splash's look does not need.
-use glam::Vec3;
+use glam::{Quat, Vec3};
 use space_soup::renderer::effects::Splash;
+use space_soup_engine::water::{world_half_extents, WaterWatch};
 use std::collections::HashMap;
 
 /// A stride, metres: a splash each, alternate feet.
@@ -27,10 +37,17 @@ const JUMP: f32 = 1.5;
 /// The slowest hand that splashes going in, and coming out, m/s.
 const SLAP_IN: f32 = 0.5;
 const PULL_OUT: f32 = 1.0;
-/// The slowest falling thing that splashes, m/s.
-const DROP_IN: f32 = 0.6;
-/// No source splashes twice within this, seconds.
+/// No hand splashes twice within this, seconds.
 const COOLDOWN: f64 = 0.15;
+/// A FOOT, as the water meets it: as wide as a disc of this radius, metres;
+/// with the shank that drives it, this heavy, kilograms; and coming down
+/// into the water this far below level, a wading step's shallow angle.
+const FOOT_RADIUS: f32 = 0.05;
+const FOOT_MASS: f32 = 3.0;
+const FOOT_ENTRY_DEG: f32 = 25.0;
+/// A HAND, likewise, with the forearm behind it.
+const HAND_RADIUS: f32 = 0.045;
+const HAND_MASS: f32 = 0.6;
 
 #[derive(Default)]
 pub struct SplashWatch {
@@ -39,8 +56,11 @@ pub struct SplashWatch {
     left_foot: bool,
     hands: [Option<(Vec3, f64)>; 2],
     hand_last: [f64; 2],
-    /// Each object's bottom when it last moved, and when.
-    things: HashMap<String, (Vec3, f64, f64)>,
+    /// Each object's centre when it last moved, when, and how fast it was
+    /// going then.
+    things: HashMap<String, (Vec3, f64, Vec3)>,
+    /// Which of them are in the water.
+    water: WaterWatch,
     count: u64,
 }
 
@@ -50,7 +70,7 @@ impl SplashWatch {
     /// off the water), `ground` the height of what lies under a point;
     /// `sunlit` how much sun reaches a point. `feet` is the
     /// floor under the head and the way the player faces, `hands` the grips,
-    /// `things` each moving object's id, centre and half size.
+    /// `things` each moving object's id, centre, half size and rotation.
     #[allow(clippy::too_many_arguments)]
     pub fn step<'a>(
         &mut self,
@@ -61,20 +81,23 @@ impl SplashWatch {
         sunlit: &dyn Fn(Vec3) -> f32,
         feet: Option<(Vec3, Vec3)>,
         hands: [Option<Vec3>; 2],
-        things: impl Iterator<Item = (&'a str, Vec3, Vec3)>,
+        things: impl Iterator<Item = (&'a str, Vec3, Vec3, Quat)>,
     ) -> Vec<Splash> {
         let mut out = Vec::new();
         let dt = dt.max(1e-3);
-        let mut emit = |position: Vec3, depth: Option<f32>, speed: f32, size: f32, count: &mut u64| {
+        let mut emit = |position: Vec3, depth: Option<f32>, velocity: Vec3, size: f32, mass: f32, count: &mut u64| {
             *count += 1;
             out.push(Splash {
                 position,
                 born: now,
-                speed,
+                velocity,
                 size,
+                mass,
                 sunlit: sunlit(position + Vec3::Y * 0.05),
                 // Off anything known, as deep as the open sea.
                 depth: depth.or_else(|| ground(position).map(|g| position.y - g)).unwrap_or(30.0).max(0.0),
+                // The renderer finds how still the water was (`effects::strike`).
+                calm: 1.0,
                 seed: count.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (now.to_bits()),
             });
         };
@@ -96,10 +119,12 @@ impl SplashWatch {
                         let at = floor + side + ahead * 0.25;
                         let water = surface(at.x, at.z).unwrap_or(floor.y + depth);
                         // A foot swings at about twice the walk; a deep step
-                        // pushes water aside more than it throws it.
+                        // pushes water aside more than it steps into it.
                         let walk = (moved / dt).min(3.0);
                         let kick = 1.0 - 0.6 * smoothstep(0.25, 0.7, depth);
-                        emit(Vec3::new(at.x, water, at.z), Some(water - floor.y), 2.0 * walk * kick, 0.07, &mut self.count);
+                        let swing = 2.0 * walk * kick;
+                        let (down, along) = FOOT_ENTRY_DEG.to_radians().sin_cos();
+                        emit(Vec3::new(at.x, water, at.z), Some(water - floor.y), ahead * (swing * along) - Vec3::Y * (swing * down), FOOT_RADIUS, FOOT_MASS, &mut self.count);
                     }
                 }
                 self.feet = Some(floor);
@@ -119,13 +144,15 @@ impl SplashWatch {
             if let Some((was, _)) = self.hands[i] {
                 if was.distance(p) < JUMP && now - self.hand_last[i] > COOLDOWN {
                     if let Some(s) = surface(p.x, p.z) {
-                        let v = (p - was) / dt;
+                        let v = ((p - was) / dt).clamp_length_max(8.0);
                         let into = was.y > s && p.y <= s && -v.y >= SLAP_IN;
                         let out_of = was.y <= s && p.y > s && v.y >= PULL_OUT;
                         if into || out_of {
                             self.hand_last[i] = now;
-                            let speed = if into { v.length() } else { 0.5 * v.length() };
-                            emit(Vec3::new(p.x, s, p.z), None, speed.min(8.0), 0.06, &mut self.count);
+                            // A hand pulled out drags water up after it and
+                            // lets it fall back: as one going in half as fast.
+                            let velocity = if into { v } else { Vec3::new(v.x, -v.y, v.z) * 0.5 };
+                            emit(Vec3::new(p.x, s, p.z), None, velocity, HAND_RADIUS, HAND_MASS, &mut self.count);
                         }
                     }
                 }
@@ -136,32 +163,28 @@ impl SplashWatch {
         // THINGS. A networked object moves when an update arrives, not every
         // frame: its speed is the move over the time since it last moved.
         let mut seen: Vec<String> = Vec::new();
-        for (id, centre, half) in things {
-            let bottom = centre - Vec3::Y * half.y.abs();
+        for (id, centre, half, rotation) in things {
             seen.push(id.to_string());
-            match self.things.get(id).copied() {
-                Some((was, moved_at, last)) if was != bottom => {
+            let velocity = match self.things.get(id).copied() {
+                Some((was, _, velocity)) if was == centre => velocity,
+                Some((was, moved_at, _)) => {
                     let since = (now - moved_at).max(dt as f64) as f32;
-                    let v = (bottom - was) / since;
-                    if was.distance(bottom) < JUMP * 4.0 && now - last > COOLDOWN {
-                        if let Some(s) = surface(bottom.x, bottom.z) {
-                            if was.y > s && bottom.y <= s && -v.y >= DROP_IN {
-                                let size = half.x.abs().max(half.z.abs()).clamp(0.03, 1.5);
-                                emit(Vec3::new(bottom.x, s, bottom.z), None, v.length().min(15.0), size, &mut self.count);
-                                self.things.insert(id.to_string(), (bottom, now, now));
-                                continue;
-                            }
-                        }
-                    }
-                    self.things.insert(id.to_string(), (bottom, now, last));
+                    let velocity = if was.distance(centre) < JUMP * 4.0 { ((centre - was) / since).clamp_length_max(60.0) } else { Vec3::ZERO };
+                    self.things.insert(id.to_string(), (centre, now, velocity));
+                    velocity
                 }
-                Some(_) => {}
                 None => {
-                    self.things.insert(id.to_string(), (bottom, now, f64::MIN));
+                    self.things.insert(id.to_string(), (centre, now, Vec3::ZERO));
+                    Vec3::ZERO
                 }
+            };
+            let mass = space_soup_engine::rigid_physics::default_mass(half);
+            if let Some(e) = self.water.see(id, centre, world_half_extents(half, rotation), velocity, mass, surface(centre.x, centre.z)) {
+                emit(e.position, None, e.velocity, e.radius.clamp(0.01, 2.0), e.mass, &mut self.count);
             }
         }
         self.things.retain(|id, _| seen.contains(id));
+        self.water.keep(|id| seen.iter().any(|s| s == id));
         out
     }
 }
@@ -188,7 +211,7 @@ mod tests {
         Some(-0.4)
     }
 
-    fn none() -> std::iter::Empty<(&'static str, Vec3, Vec3)> {
+    fn none() -> std::iter::Empty<(&'static str, Vec3, Vec3, Quat)> {
         std::iter::empty()
     }
 
@@ -204,7 +227,9 @@ mod tests {
         }
         assert!((9..=11).contains(&steps.len()), "{} splashes over ten strides", steps.len());
         assert!(steps.windows(2).all(|p| (p[0].position.x - 5.0).signum() != (p[1].position.x - 5.0).signum()), "alternate feet");
-        assert!(steps.iter().all(|s| s.position.y == 0.0 && s.speed > 1.5), "on the surface, kicked");
+        assert!(steps.iter().all(|s| s.position.y == 0.0 && s.velocity.length() > 1.5), "on the surface, kicked");
+        // Swung forward and down at a shallow angle, by a foot.
+        assert!(steps.iter().all(|s| s.velocity.z > 2.0 * -s.velocity.y && s.velocity.y < -0.5 && s.size == FOOT_RADIUS && s.mass == FOOT_MASS), "{:?}", steps[0]);
         // On land, nothing.
         let mut w = SplashWatch::default();
         let dry: usize = (0..360)
@@ -242,7 +267,7 @@ mod tests {
         };
         let slap = run(2.0);
         assert_eq!(slap.len(), 1);
-        assert!((slap[0].speed - 2.0).abs() < 0.1 && slap[0].position.y == 0.0);
+        assert!((slap[0].velocity.y + 2.0).abs() < 0.1 && slap[0].position.y == 0.0);
         assert!(run(0.2).is_empty());
     }
 
@@ -255,10 +280,30 @@ mod tests {
         for k in 0..60 {
             let t = (k / 3 * 3) as f32 * dt;
             let y = (2.0 - 0.5 * 9.81 * t * t).max(-0.5);
-            let things = std::iter::once(("crate", Vec3::new(4.0, y + 0.2, 0.0), Vec3::splat(0.2)));
+            let things = std::iter::once(("crate", Vec3::new(4.0, y + 0.2, 0.0), Vec3::splat(0.2), Quat::IDENTITY));
             out.extend(w.step(k as f64 * dt as f64, dt, &sea, &bed, &sun, None, [None, None], things));
         }
         assert_eq!(out.len(), 1, "{out:?}");
-        assert!(out[0].speed > 4.0 && (out[0].size - 0.2).abs() < 1e-6, "{:?}", out[0]);
+        // As fast as it fell, as wide as a disc its footprint's size, as heavy
+        // as physics makes a box that size.
+        assert!(-out[0].velocity.y > 4.0 && (out[0].size - 0.2257).abs() < 1e-3 && (out[0].mass - 32.0).abs() < 1e-3, "{:?}", out[0]);
+    }
+
+    /// Floating at the waterline, bobbing: it went in once, and that was all.
+    #[test]
+    fn a_thing_bobbing_at_the_waterline_does_not_splash_again() {
+        let dt = 1.0 / 72.0;
+        let mut w = SplashWatch::default();
+        let mut n = 0;
+        for k in 0..720 {
+            let t = k as f32 * dt;
+            // Dropped in over the first third of a second, then bobbing 8 cm
+            // either side of afloat at 1.5 Hz -- fast enough, each time down,
+            // to have splashed by the old rule.
+            let y = if t < 0.37 { 0.6 - 0.5 * 9.81 * t * t } else { 0.08 * (t * 9.4).sin() };
+            let things = std::iter::once(("buoy", Vec3::new(4.0, y + 0.2, 0.0), Vec3::splat(0.2), Quat::IDENTITY));
+            n += w.step(k as f64 * dt as f64, dt, &sea, &bed, &sun, None, [None, None], things).len();
+        }
+        assert_eq!(n, 1);
     }
 }
