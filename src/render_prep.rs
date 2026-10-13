@@ -32,7 +32,7 @@ use crate::part_pull::PullSession;
 use space_soup::renderer::mesh::ClipBlendMode;
 use space_soup_engine::ClipBlendMode as EngineBlendMode;
 
-const MAX_RENDER_DIST: f32 = 40.0;
+use crate::draw_range::drawn_at;
 
 /// Updates mesh transforms in-place (world-driven meshes, plus the one
 /// currently held per hand with its part-animation blend), then builds the
@@ -71,9 +71,11 @@ pub(crate) fn build_render_lists<'a>(
     // next frame. See the comment at the write site.
     part_transforms_out: &mut HashMap<String, HashMap<String, ([f32; 3], [f32; 4])>>,
 ) -> (Vec<Cuboid>, Vec<Light>, Vec<MeshInstance<'a>>, Vec<MeshInstance<'a>>, Option<MirrorSurface>) {
+    // How far a big thing is drawn, in its own radii (`Levers::size_reach`).
+    let size_reach = renderer.levers().size_reach as f32;
     let cuboids: Vec<Cuboid> = cuboids_src
         .iter()
-        .filter(|rc| Vec3::from(rc.position).distance(head_pos) < MAX_RENDER_DIST)
+        .filter(|rc| drawn_at(head_pos, Vec3::from(rc.position), Vec3::from(rc.half_size).length(), size_reach))
         .map(|rc| to_space_soup_cuboid(rc, offset, yaw_inv))
         .collect();
 
@@ -229,9 +231,16 @@ pub(crate) fn build_render_lists<'a>(
 
     let mesh_instances: Vec<MeshInstance> = meshes_src
         .iter()
-        .filter(|rm| Vec3::from(rm.position).distance(head_pos) < MAX_RENDER_DIST)
         .filter_map(|rm| {
+            // By its bounding sphere, as the mesh holds it -- its farthest
+            // vertex from its origin, at its largest scale. See `drawn_at`.
+            let seen = |mesh: &space_soup::renderer::mesh::GltfMesh| {
+                drawn_at(head_pos, Vec3::from(rm.position), mesh.bounding_radius * Vec3::from(rm.scale).abs().max_element(), size_reach)
+            };
             if let Some((_, mesh, model)) = hidden_cache.get(&rm.id) {
+                if !seen(mesh) {
+                    return None;
+                }
                 return Some(MeshInstance {
                     mesh,
                     model,
@@ -242,6 +251,9 @@ pub(crate) fn build_render_lists<'a>(
                 });
             }
             let (mesh, model) = mesh_cache.get(&rm.id)?;
+            if !seen(mesh) {
+                return None;
+            }
             Some(MeshInstance {
                 mesh,
                 model,

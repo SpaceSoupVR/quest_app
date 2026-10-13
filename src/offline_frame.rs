@@ -449,6 +449,20 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         .iter()
         .map(|f| space_soup::renderer::uniforms::probe_mean_radiance(f, resolution))
         .collect();
+    // Under the time of day, how bright each photograph is now over how bright
+    // it was photographed: what the effects' ambient follows
+    // (`effects::room_ambient_now`). `EFFECTS_AMBIENT=baked` for the bake's.
+    let relit: Vec<f32> = match (tod_daylight, std::env::var("EFFECTS_AMBIENT").as_deref()) {
+        (Some(_), Ok("baked")) | (None, _) => Vec::new(),
+        (Some(_), _) => photographs
+            .iter()
+            .zip(&brightness)
+            .map(|((full, _), now)| {
+                let was = space_soup::renderer::uniforms::probe_mean_radiance(full, resolution);
+                if was > 0.0 { now / was } else { 1.0 }
+            })
+            .collect(),
+    };
 
     // THE SUN'S SHADOW FROM THE CAVES, as the headset's static sun map has
     // it: the level's own shadows are baked masks, but a cave is lit live and
@@ -677,6 +691,10 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             None => space_soup::renderer::exposure::exposure_for(m),
         };
         metered = Some(m);
+        // `EXPOSURE=x`: the eye that far open whatever the probes meter -- for
+        // a torch's pool on open ground at night, which the meter here does
+        // not see and the headset's eye closes down for.
+        let e = std::env::var("EXPOSURE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(e);
         eprintln!("offline frame: metered {m:.4}, exposure x{e:.2}");
         e
     } else {
@@ -840,6 +858,28 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     );
 
     let (verts, idx) = geometry.assemble(&[], offset, yaw_inv, 0.0)?;
+    // `BRUSH_CLASSES=1`: DIAGNOSTIC -- the brushes' triangles by what the
+    // reflection pass could draw them with were they the ground
+    // (`outdoor_pass::LevelGround`): how many, and how much area facing this
+    // eye within 20 m, are out of doors or nowhere to the lookup.
+    if std::env::var("BRUSH_CLASSES").is_ok() {
+        let level = space_soup::renderer::outdoor_pass::LevelGround::of_table(&probes);
+        let eye = to_player(view.eye);
+        let (mut count, mut area, mut near) = ([0u32; 3], [0f32; 3], [0f32; 3]);
+        for t in idx.chunks_exact(3) {
+            let c = [0, 1, 2].map(|k| verts[t[k] as usize].position);
+            let class = level.class_of_posed(offset, yaw, c);
+            let [a, b, d] = c.map(Vec3::from);
+            let n = (b - a).cross(d - a);
+            let mid = (a + b + d) / 3.0;
+            count[class] += 1;
+            area[class] += n.length() * 0.5;
+            if n.dot(eye - mid) > 0.0 && mid.distance(eye) < 20.0 {
+                near[class] += n.length() * 0.5 * n.normalize().dot((eye - mid).normalize()) / mid.distance_squared(eye).max(0.25);
+            }
+        }
+        eprintln!("offline frame: brush triangles [full, outdoors, nowhere] {count:?}, area {area:.0?} m2, solid angle facing the eye {near:.2?}");
+    }
     use wgpu::util::DeviceExt;
     let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("offline_brush_vb"),
@@ -855,18 +895,50 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     // areas' ground through the physics scene, as the headset finds it, at
     // `WEATHER_TIME`.
     let weather_layout = space_soup::renderer::weather::bind_group_layout(&device);
-    let mut weather = match (view.weather, scene.weather.is_empty()) {
+    // A shore the sea washes is a layer of the same maps (`Shore`), at the
+    // waves' clock: a level with one draws its ground by the weather's twin
+    // with no weather in it at all.
+    let washed = crate::water_render::sea_line(&scene.water).is_some();
+    // `RAIN_AT=x0,z0,x1,z1`: a soaking rain over that footprint as well, in
+    // place of the level's own areas -- to see any ground of the level wet
+    // (the hall's doorway, the cave's mouth, the beach, a cliff).
+    let rain_at: Option<Vec<f32>> = std::env::var("RAIN_AT").ok().map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect()).filter(|v: &Vec<f32>| v.len() == 4);
+    let mut weather = match (view.weather, scene.weather.is_empty() && !washed && rain_at.is_none()) {
         (true, false) => {
             let mut physics = space_soup_engine::rigid_physics::PhysicsWorld::new();
             physics.rebuild(&scene, &game);
-            let mut field = crate::weather_render::field(&scene, &physics);
+            let mut field = match &rain_at {
+                Some(b) => {
+                    let def: space_soup_engine::weather::WeatherDef =
+                        serde_json::from_value(serde_json::json!({ "name": "RAIN_AT", "bounds": [b[0], b[1], b[2], b[3]], "start": { "wetness": 1.0 } })).expect("a rain area");
+                    space_soup_engine::weather::WeatherField::new(&[def], |x, z| physics.raycast_down(Vec3::new(x, 400.0, z), 800.0).map(|(hit, _)| hit.y))
+                }
+                None => crate::weather_render::field(&scene, &physics),
+            };
             let time: f64 = std::env::var("WEATHER_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(600.0);
             field.set_time(time);
+            // `WEATHER_WET=0..1`, `WEATHER_FILL=metres`: every area that wet
+            // and its hollows that full, whatever its clock says -- ground
+            // half dried, or soaked with its puddles gone.
+            let forced = |key: &str| std::env::var(key).ok().and_then(|v| v.parse::<f32>().ok());
+            for (_, _, st) in &mut field.areas {
+                if let Some(w) = forced("WEATHER_WET") {
+                    st.wet = w.clamp(0.0, 1.0);
+                }
+                if let Some(f) = forced("WEATHER_FILL") {
+                    st.fill = f.max(0.0);
+                }
+            }
             for (d, _, st) in &field.areas {
                 eprintln!("offline frame: weather {:?} at {time} s: {st:?}", d.name);
             }
-            let mut maps = crate::weather_render::maps(&device, &weather_layout, &field);
-            crate::weather_render::upload(&queue, &mut maps, &field);
+            let shores = crate::weather_render::shores(&scene.water, &physics, field.areas.len());
+            let waves_time: f64 = std::env::var("WATER_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(30.0);
+            for s in &shores {
+                eprintln!("offline frame: shore at y={:.2}: {}x{} texels of {:.2} m, {} with sand in the wash", s.sea, s.nx, s.nz, s.cell[0], s.active());
+            }
+            let mut maps = crate::weather_render::maps(&device, &weather_layout, &field, &shores);
+            crate::weather_render::upload(&queue, &mut maps, &field, &shores, waves_time as f32);
             Some((field, maps, time))
         }
         _ => None,
@@ -890,6 +962,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             ),
             weather.as_ref().map(|_| &weather_layout),
             &probes,
+            std::env::var("HORIZON").is_ok_and(|v| v == "1").then_some(view.eye),
         ),
         (_, true) => {
             eprintln!("offline frame: the ground is drawn only with half-resolution reflections and deferred lookups");
@@ -1039,7 +1112,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                 let turn = Quat::from_rotation_y(yaw);
                 let reaches =
                     |e: &effects::EffectEmitter, i: usize| effects::lamp_in_room(&descs, e.position, turn * lights[i].position + offset);
-                let ambient = |w: Vec3| effects::room_ambient(&descs, w);
+                let ambient = |w: Vec3| effects::room_ambient_now(&descs, w, &relit);
                 let at = effects::Surroundings {
                     head: eye_p,
                     offset,
@@ -1080,9 +1153,57 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             let source = scene.terrain.as_ref().and_then(|def| space_soup_engine::terrain::load(def, &game).ok());
             let pipeline = space_soup::renderer::water_pipeline::WaterPipeline::new(&device, format, &uniforms.layout, view.samples);
             let time: f64 = std::env::var("WATER_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(30.0);
+            // `HORIZON=1`: a body the ground hides from this eye draws nothing,
+            // as on the headset under `Levers::ground_horizon`.
+            let water_caves = if std::env::var("HORIZON_CAVES").as_deref() == Ok("0") { Vec::new() } else { crate::terrain_render::plugging_caves(&scene, &game) };
+            let mut horizon = std::env::var("HORIZON").is_ok_and(|v| v == "1").then(|| {
+                let (geometry, _) = crate::load_scene_terrain(&game, scene_name)?;
+                let (_, ground, horizon) = geometry.behind_the_ground(scene.terrain.as_ref(), view.eye, &water_caves)?;
+                Some((ground, horizon))
+            }).flatten();
+            // `WATER_RUNS=1`: the runs of each body this eye cannot see -- out
+            // of its view, or behind the ground under `HORIZON=1` -- left out
+            // in place, as the headset leaves them out of its draws under
+            // `Levers::water_runs`.
+            let water_runs = std::env::var("WATER_RUNS").as_deref() == Ok("1");
+            let world_planes = {
+                let up = glam::Quat::from_axis_angle((view.at - view.eye).normalize(), view.roll_deg.to_radians()) * Vec3::Y;
+                [space_soup::renderer::shadow::frustum_planes(shift * proj * Mat4::look_at_rh(view.eye, view.at, up))]
+            };
             let bodies: Vec<_> = crate::water_render::build(&scene.water, source.as_deref())
                 .into_iter()
                 .map(|mut b| {
+                    let bounds = space_soup::renderer::water_pipeline::water_bounds(&b.world, &b.waves);
+                    let whole = space_soup::renderer::water_runs::lifted(bounds, &[view.eye]);
+                    let hidden = horizon.as_mut().is_some_and(|(g, h)| h.hides(g, whole.0, whole.1));
+                    if hidden {
+                        // (In place: an empty buffer cannot be bound.)
+                        eprintln!("offline frame: a body of water behind the ground, not drawn");
+                        for tri in b.indices.chunks_mut(3) {
+                            tri.copy_from_slice(&[tri[0]; 3]);
+                        }
+                    }
+                    if water_runs && !hidden {
+                        use space_soup::renderer::water_runs;
+                        let raw = b.world.iter().fold(f32::INFINITY, |lo, v| lo.min(v.position[0]));
+                        let runs = water_runs::runs(|i| Vec3::from(b.world[i as usize].position), &b.indices, raw - bounds.0.x);
+                        let seen = water_runs::seen_ranges(&runs, |_, r| {
+                            let (lo, hi) = water_runs::bounds_for(r, &[view.eye]);
+                            let clear = !water_caves.iter().any(|(clo, chi)| lo.cmple(*chi + 2.0).all() && hi.cmpge(*clo - 2.0).all());
+                            space_soup::renderer::water_pipeline::water_seen((lo, hi), &world_planes, None)
+                                && !horizon.as_mut().is_some_and(|(g, h)| if clear { h.hides_ground(g, lo, hi) } else { h.hides(g, lo, hi) })
+                        });
+                        let mut kept = 0;
+                        for (t, tri) in b.indices.chunks_mut(3).enumerate() {
+                            let at = t as u32 * 3;
+                            if seen.iter().any(|r| r.start <= at && at < r.end) {
+                                kept += 1;
+                            } else {
+                                tri.copy_from_slice(&[tri[0]; 3]);
+                            }
+                        }
+                        eprintln!("offline frame: water in runs, {kept} of {} triangles in {} draw(s)", b.indices.len() / 3, seen.len());
+                    }
                     let waves = space_soup::renderer::water_waves::WaveField::new(&device, &queue, b.waves);
                     b.uniform.set_time(time, b.waves.loop_seconds);
                     b.uniform.set_rings(&space_soup::renderer::effects::splash_rings(&splash_at(time), time, view.eye));
@@ -1180,9 +1301,13 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         // The level's own casters only for the time of day's map: the caves'
         // map is theirs alone, as before.
         let level = tod_sun.is_some();
-        let solid = terrain.as_ref().filter(|_| level).map(|t| (&t.vb, &t.ib, t.count));
+        let solid = terrain.as_ref().filter(|_| level).map(|t| match &t.caster_ib {
+            Some((ib, count)) => (&t.vb, ib, *count),
+            None => (&t.vb, &t.ib, t.count),
+        });
         let brushes = level.then_some((&vb, &ib, idx.len() as u32));
         shadows.upload_light(&queue, ShadowKind::Sun, m);
+        shadows.set_solid_world(terrain.as_ref().and_then(|t| t.world_model.as_ref()).map(|m| &m.bind_group), true);
         let drawn = shadows.record(&mut encoder, ShadowKind::Sun, solid, brushes, &casters, &[], &[], m);
         if level {
             eprintln!("offline frame: static sun map {TOD_STATIC_SUN_SIZE}^2 recorded ({drawn} indices)");
@@ -1200,6 +1325,9 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             pools.record(&device, &mut encoder, &uniforms.bind_group, &pool_mips, &card_atlas.texture, row, None);
         }
     }
+    let probe_prepass = (std::env::var("PROBE_PREPASS").as_deref() == Ok("1")
+        && probe_pass.as_ref().is_some_and(|(_, _, fixups)| fixups.is_some()))
+    .then(|| BrushPipeline::new_probe_depth_prepass(&device, &uniforms.layout));
     if let Some((probe_pipeline, target, fixups)) = &probe_pass {
         if let Some((fixups, _)) = fixups {
             fixups.clear(&mut encoder);
@@ -1229,6 +1357,16 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             }),
             ..Default::default()
         });
+        // `PROBE_PREPASS=1`: the brushes' depth first, as the headset lays it
+        // under `Levers::probe_prepass`.
+        if let Some(prepass) = &probe_prepass {
+            pass.set_pipeline(&prepass.pipeline);
+            pass.set_bind_group(0, &uniforms.bind_group, &[]);
+            pass.set_bind_group(1, &materials.bind_group, &[]);
+            pass.set_vertex_buffer(0, vb.slice(..));
+            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
+        }
         pass.set_pipeline(&probe_pipeline.pipeline);
         pass.set_bind_group(0, &uniforms.bind_group, &[]);
         pass.set_bind_group(1, &materials.bind_group, &[]);
@@ -1250,7 +1388,9 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             }
             pass.set_bind_group(3, pass_bg, &[]);
             pass.set_vertex_buffer(0, t.vb.slice(..));
-            pass.set_index_buffer(t.ib.slice(..), wgpu::IndexFormat::Uint32);
+            // (`HORIZON_PASS=scene`: this pass with every triangle. DIAGNOSTIC.)
+            let whole = t.caster_ib.as_ref().filter(|_| std::env::var("HORIZON_PASS").as_deref() == Ok("scene"));
+            pass.set_index_buffer(whole.map_or(&t.ib, |w| &w.0).slice(..), wgpu::IndexFormat::Uint32);
             match &t.classes {
                 // Each ground class's runs by its twin, as the headset draws
                 // a chunk's triangles (`GROUND_CLASSES=1`).
@@ -1314,6 +1454,12 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
         }
+        // `CAVE_FIRST=1`: the baked caves before the ground, as the headset
+        // draws one the eye is inside under `Levers::cave_first`.
+        let cave_first = (std::env::var("CAVE_FIRST").as_deref() == Ok("1")).then_some(eye_p);
+        if let (Some(eye), Some(b), Some(t)) = (cave_first, &baked_caves, &terrain) {
+            b.draw(&mut pass, &uniforms.bind_group, &t.material.bind_group, Some((eye, true)));
+        }
         // The ground between the brushes' depth and their shading, as the
         // headset's scene pass draws it.
         if let (Some(t), Some((_, target, _))) = (&terrain, &probe_pass) {
@@ -1325,7 +1471,9 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             }
             pass.set_bind_group(3, &target.bind_group, &[]);
             pass.set_vertex_buffer(0, t.vb.slice(..));
-            pass.set_index_buffer(t.ib.slice(..), wgpu::IndexFormat::Uint32);
+            // (`HORIZON_PASS=probe`: this pass with every triangle. DIAGNOSTIC.)
+            let whole = t.caster_ib.as_ref().filter(|_| std::env::var("HORIZON_PASS").as_deref() == Ok("probe"));
+            pass.set_index_buffer(whole.map_or(&t.ib, |w| &w.0).slice(..), wgpu::IndexFormat::Uint32);
             match &t.gentle {
                 Some((gentle, g, steep)) => {
                     let st = steep.as_ref().map_or(0, |s| s.1);
@@ -1368,7 +1516,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             }
         }
         if let (Some(b), Some(t)) = (&baked_caves, &terrain) {
-            b.draw(&mut pass, &uniforms.bind_group, &t.material.bind_group);
+            b.draw(&mut pass, &uniforms.bind_group, &t.material.bind_group, cave_first.map(|eye| (eye, false)));
         }
         // UNDER THE WATER: the veil over everything opaque, then the body's
         // underside -- before its own surface, which keeps only what is seen
@@ -1810,7 +1958,15 @@ impl OfflineBakedCaves {
         Some(Self { pipelines, caves })
     }
 
-    fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, uniform: &'a wgpu::BindGroup, material: &'a wgpu::BindGroup) {
+    /// `only`: the caves that hold the eye (`true`) or the others, as
+    /// `BakedCavePipelines::draw_scene` takes it; `None`, every cave.
+    fn draw<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        uniform: &'a wgpu::BindGroup,
+        material: &'a wgpu::BindGroup,
+        only: Option<(Vec3, bool)>,
+    ) {
         let draws: Vec<_> = self
             .caves
             .iter()
@@ -1826,7 +1982,7 @@ impl OfflineBakedCaves {
                 bounds: space_soup::renderer::cave_twins::placed_box(c.placed, c.primitive.bounds),
             })
             .collect();
-        self.pipelines.draw_scene(pass, uniform, material, &draws, None, false, false);
+        self.pipelines.draw_scene(pass, uniform, material, &draws, None, false, false, only);
     }
 }
 
@@ -1923,6 +2079,12 @@ struct OfflineTerrain {
     vb: wgpu::Buffer,
     ib: wgpu::Buffer,
     count: u32,
+    /// `HORIZON=1`: every triangle, for the shadow maps, where `ib` has only
+    /// those the horizon leaves the eye.
+    caster_ib: Option<(wgpu::Buffer, u32)>,
+    /// The player's frame from the world, for the shadow passes, when `vb`
+    /// holds world vertices (`WORLD_GROUND`, the default).
+    world_model: Option<space_soup::renderer::mesh_pipeline::ModelUniform>,
     material: space_soup::renderer::terrain_pipeline::TerrainMaterial,
     /// Its probe pass, and its scene reader.
     pass: space_soup::renderer::terrain_pipeline::TerrainPipeline,
@@ -1971,15 +2133,46 @@ fn offline_terrain(
     (spotless, poolless): (bool, bool),
     weather: Option<&wgpu::BindGroupLayout>,
     probes: &space_soup::renderer::uniforms::ProbeUpload,
+    horizon_eye: Option<Vec3>,
 ) -> Option<OfflineTerrain> {
     use space_soup::renderer::terrain_pipeline::{self as tp, TerrainImage, TerrainPipeline};
     use wgpu::util::DeviceExt;
     let (mut geometry, splat) = crate::load_scene_terrain(game, scene_name)?;
+    // `HORIZON=1`: the chunks the ground hides from this eye left out, as the
+    // headset leaves them out under `Levers::ground_horizon` -- to prove the
+    // picture is the same without them.
+    let behind: Vec<(u32, u32)> = horizon_eye
+        .and_then(|eye| {
+            let scene = space_soup_engine::scene::Scene::load(&space_soup_engine::Manifest::scene_path(game, scene_name)).ok()?;
+            // `HORIZON_CAVES=0`: the first rule alone (`Levers::ground_horizon_caves` off).
+            let caves = if std::env::var("HORIZON_CAVES").as_deref() == Ok("0") { Vec::new() } else { crate::terrain_render::plugging_caves(&scene, game) };
+            let (runs, _, horizon) = geometry.behind_the_ground(scene.terrain.as_ref(), eye, &caves)?;
+            eprintln!("offline frame: the horizon's second rule (the caves' rock) is {}", if horizon.plugged() { "in force" } else { "not in force" });
+            // (`HORIZON_ONLY=k`: only the k-th of them left out. DIAGNOSTIC.)
+            let runs: Vec<(u32, u32)> = match std::env::var("HORIZON_ONLY").ok().and_then(|k| k.parse::<usize>().ok()) {
+                Some(k) => runs.into_iter().skip(k).take(1).collect(),
+                None => runs,
+            };
+            eprintln!("offline frame: {} chunk(s) of the ground behind the ground, {} indices not drawn", runs.len(), runs.iter().map(|r| r.1).sum::<u32>());
+            Some(runs)
+        })
+        .unwrap_or_default();
     // THE GROUND'S SHADERS AS THE HEADSET BUILDS THEM FOR THIS LEVEL: for a
     // painted one, without the slope-driven weights (`tp::GROUND_PAINTED`).
     // `GROUND_BUILD=generic` keeps the build with the choice in it, to show
     // the two draw the same picture.
     tp::expect_painted_ground(splat.is_some() && std::env::var("GROUND_BUILD").as_deref() != Ok("generic"));
+    // `OPAQUE_GROUND=0`: the scene's ground WITH blending, as it was drawn
+    // until 2026-10-13 (`terrain_pipeline::OPAQUE_GROUND`). On the Mac a
+    // blended pixel keeps a rounding's trace of what lay under it, so the
+    // two differ by a level in a few pixels a view here.
+    tp::OPAQUE_GROUND.store(std::env::var("OPAQUE_GROUND").as_deref() != Ok("0"), std::sync::atomic::Ordering::Relaxed);
+    // `WORLD_GROUND=0`: the ground posed on the CPU, vertex by vertex, as the
+    // app handed it until 2026-10-13; otherwise in the world, posed by its
+    // vertex shaders, as the headset draws it (`terrain_pipeline::
+    // WORLD_GROUND`) -- to show the two are one picture.
+    let world_ground = std::env::var("WORLD_GROUND").as_deref() != Ok("0");
+    tp::WORLD_GROUND.store(world_ground, std::sync::atomic::Ordering::Relaxed);
     // `SHEER_ROCK=0`: the painted map as painted, without bare rock on sheer
     // ground (`SplatMap::bare_rock_on_sheer_ground`) -- the picture before
     // 2026-10-08, to set beside the one the headset now draws.
@@ -2117,10 +2310,64 @@ fn offline_terrain(
                 settings.wet_line = line;
                 settings.wet_band = band;
             }
+            if let Some(sea) = crate::water_render::sea_line(&water) {
+                settings.sea_line = sea;
+            }
+            // `WET_POROSITY=a,b,c,d`, `WET_FILM=a,b,c,d`: each layer's response
+            // to water in place of the project's, to see what any ground would
+            // look like wet as another kind of ground.
+            for (key, into) in [("WET_POROSITY", &mut settings.porosity), ("WET_FILM", &mut settings.film)] {
+                if let Ok(v) = std::env::var(key) {
+                    for (slot, n) in into.iter_mut().zip(v.split(',').filter_map(|n| n.trim().parse::<f32>().ok())) {
+                        *slot = n.clamp(0.0, 1.0);
+                    }
+                }
+            }
             settings
         },
     );
-    let (verts, idx) = geometry.assemble(offset, yaw_inv, yaw)?;
+    let (verts, idx) = match world_ground {
+        true => geometry.assemble_world(offset, yaw_inv, yaw)?,
+        false => geometry.assemble(offset, yaw_inv, yaw)?,
+    };
+    // What poses it in the shadow passes, where its vertices are the world's.
+    let world_model = world_ground.then(|| {
+        let model = space_soup::renderer::mesh_pipeline::MeshPipeline::new(device, format, uniform_layout).create_model_uniform(device);
+        model.upload(queue, Mat4::from_quat(yaw_inv) * Mat4::from_translation(-offset));
+        model
+    });
+    // Every chunk still casts its shadow, as on the headset: the horizon
+    // leaves ground out of the eye's passes alone.
+    let caster_ib = (!behind.is_empty()).then(|| {
+        (
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("offline_terrain_caster_ib"),
+                contents: bytemuck_cast(idx),
+                usage: wgpu::BufferUsages::INDEX,
+            }),
+            idx.len() as u32,
+        )
+    });
+    // Left out IN PLACE: each such triangle with no area, so every other
+    // triangle keeps its place in the buffer. (Taking them out of the list
+    // moves the triangles after them, and that alone changes a few hundred
+    // pixels by a level -- as `GROUND_CLASSES=order` shows of any reordering
+    // -- which is nothing the headset does: there a chunk left out is a draw
+    // not made, and every other draw is the one it was.)
+    let kept: Vec<u32>;
+    let idx: &[u32] = if behind.is_empty() {
+        idx
+    } else {
+        kept = idx
+            .chunks_exact(3)
+            .enumerate()
+            .flat_map(|(t, tri)| {
+                let hidden = behind.iter().any(|&(first, n)| (t as u32 * 3) >= first && (t as u32 * 3) < first + n);
+                if hidden { [tri[0], tri[0], tri[0]] } else { [tri[0], tri[1], tri[2]] }
+            })
+            .collect();
+        &kept
+    };
     // `TERRAIN_GENTLE=1`: the gentle triangles drawn by the ground's slope
     // twin (`ground_twins`), as the headset draws them -- to prove the twin
     // draws the same picture.
@@ -2135,17 +2382,30 @@ fn offline_terrain(
     let order_only = std::env::var("GROUND_CLASSES").is_ok_and(|v| v == "order");
     let by_class = order_only || std::env::var("GROUND_CLASSES").is_ok_and(|v| v == "1");
     let level_ground = space_soup::renderer::outdoor_pass::LevelGround::of_table(probes);
-    let class_of = |corners: [[f32; 3]; 3]| if by_class { level_ground.class_of_posed(offset, yaw, corners) } else { 0 };
+    // (World vertices are their own world positions.)
+    let (class_offset, class_yaw) = if world_ground { (Vec3::ZERO, 0.0) } else { (offset, yaw) };
+    let class_of = |corners: [[f32; 3]; 3]| if by_class { level_ground.class_of_posed(class_offset, class_yaw, corners) } else { 0 };
     let classed = |verts: &[space_soup::renderer::cuboid::SolidVertex], idx: &[u32]| {
         space_soup::renderer::ground_twins::SlopeSplit::classed(verts, idx, &[], threshold, by_class as u64, &class_of)
     };
     let class_draws = |split: &space_soup::renderer::ground_twins::SlopeSplit| {
         by_class.then(|| {
-            let open = probes.open_ground && !probes.no_trace;
+            // The weather's ground beyond the outdoor volume takes the
+            // open-ground twin on the headset (`Levers::wet_reflections`); here
+            // the whole ground is the weather's when the view has weather, so
+            // dry cliffs take it too, which the headset's do not. `WET_OPEN=0`
+            // for the nowhere twin.
+            let wet_open = weather.is_some() && std::env::var("WET_OPEN").as_deref() != Ok("0");
+            let open = (probes.open_ground || wet_open) && !probes.no_trace;
             let outdoors = (!order_only).then(|| TerrainPipeline::new_probe_pass_outdoors(device, uniform_layout, fixups, weather)).flatten();
             let nowhere = (!order_only)
                 .then(|| match open {
-                    true => TerrainPipeline::new_probe_pass_open(device, uniform_layout, fixups, weather),
+                    // `PUDDLE_SKY=1`: the sky alone in the weather's water, as
+                    // `Levers::wet_sky` draws the chunks that hold a film or a puddle.
+                    true => match weather.filter(|_| std::env::var("PUDDLE_SKY").as_deref() == Ok("1")) {
+                        Some(layout) => TerrainPipeline::new_probe_pass_puddle(device, uniform_layout, fixups, layout),
+                        None => TerrainPipeline::new_probe_pass_open(device, uniform_layout, fixups, weather),
+                    },
                     false => TerrainPipeline::new_probe_pass_nowhere(device, uniform_layout, fixups, weather),
                 })
                 .flatten();
@@ -2165,10 +2425,22 @@ fn offline_terrain(
         })
     };
     let mut classes = None;
+    let mut wet_mixed: Option<TerrainPipeline> = None;
     let (idx, gentle) = if std::env::var("TERRAIN_GENTLE").is_ok_and(|v| v == "1") {
         let split = classed(&verts, &idx);
         classes = class_draws(&split);
-        let kinds = weather.map(|l| (l, space_soup::renderer::weather::WeatherKinds::Both));
+        // `WEATHER_KINDS=wet|snowless|waterless`: the gentle twin without the
+        // standing water's code, the snow's, or both, as the headset draws a
+        // chunk that holds none -- to prove each is the same picture there.
+        use space_soup::renderer::weather::WeatherKinds;
+        let kinds = weather.map(|l| {
+            (l, match std::env::var("WEATHER_KINDS").as_deref() {
+                Ok("wet") => WeatherKinds::WetOnly,
+                Ok("snowless") => WeatherKinds::Snowless,
+                Ok("waterless") => WeatherKinds::Waterless,
+                _ => WeatherKinds::Both,
+            })
+        });
         let readers = space_soup::renderer::ground_twins::gentle_readers(device, format, uniform_layout, samples, probe_layout, kinds)
             .expect("the ground's gentle twins");
         let [full, spotless_r, baked, baked_spotless] = readers;
@@ -2179,7 +2451,26 @@ fn offline_terrain(
             (true, true) => baked_spotless,
         };
         // The steep ones by the steep twin, dry ground only, as the headset
-        // draws them.
+        // draws them -- and with `WEATHER_KINDS=wet`, the mixed and the steep
+        // ones by the weather's wet-only twins of those readers, as the
+        // headset draws a chunk that holds no standing water and no snow
+        // (`ground_twins::wet_readers`, `Levers::wet_steep_twins`).
+        let pick = |[full, spotless_r, baked, baked_spotless]: [TerrainPipeline; 4]| match (spotless, sun_baked) {
+            (false, false) => full,
+            (true, false) => spotless_r,
+            (false, true) => baked,
+            (true, true) => baked_spotless,
+        };
+        let wet_twins = weather.filter(|_| std::env::var("WEATHER_KINDS").as_deref() == Ok("wet")).map(|layout| {
+            let [mixed, steep] = space_soup::renderer::ground_twins::wet_readers(device, format, uniform_layout, samples, probe_layout, layout)
+                .expect("the ground's wet-only mixed and steep twins");
+            (pick(mixed), pick(steep))
+        });
+        let (wet_mixed_twin, wet_steep_twin) = match wet_twins {
+            Some((m, s)) => (Some(m), Some(s)),
+            None => (None, None),
+        };
+        wet_mixed = wet_mixed_twin;
         let steep = match weather {
             None => {
                 let [full, spotless_r, baked, baked_spotless] = space_soup::renderer::ground_twins::steep_readers(device, format, uniform_layout, samples, probe_layout)
@@ -2194,7 +2485,7 @@ fn offline_terrain(
                     split.steep_total as u32,
                 ))
             }
-            Some(_) => None,
+            Some(_) => wet_steep_twin.map(|s| (s, split.steep_total as u32)),
         };
         eprintln!(
             "offline frame: {} of {} ground indices drawn by the gentle twin, {} by the steep twin",
@@ -2210,6 +2501,7 @@ fn offline_terrain(
     } else {
         (idx.to_vec(), None)
     };
+    let reader = wet_mixed.unwrap_or(reader);
     Some(OfflineTerrain {
         vb: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("offline_terrain_vb"),
@@ -2222,6 +2514,8 @@ fn offline_terrain(
             usage: wgpu::BufferUsages::INDEX,
         }),
         count: idx.len() as u32,
+        caster_ib,
+        world_model,
         material,
         pass,
         reader,
@@ -2271,6 +2565,9 @@ pub(crate) fn ground_map_cpu(
     if let Some((line, band)) = crate::water_render::wet_shore(&scene.water) {
         settings.wet_line = line;
         settings.wet_band = band;
+    }
+    if let Some(sea) = crate::water_render::sea_line(&scene.water) {
+        settings.sea_line = sea;
     }
     let map = ground_map::build(
         &ground_map::GroundInputs {
@@ -2917,7 +3214,11 @@ mod bench_views {
             let effects = std::env::var("EFFECTS").as_deref() != Ok("0");
             let water = std::env::var("WATER").as_deref() != Ok("0");
             let weather = std::env::var("WEATHER").as_deref() != Ok("0");
-            let Some(shot) = render_brushes("test_room", View { adapt: true, flashlight, torch, terrain, cut, effects, water, weather, ..View::headset(eye, at) }) else {
+            // `MSAA=1`: one sample a pixel (the headset draws four), to tell a
+            // difference at triangle edges from one inside them.
+            let base = View::headset(eye, at);
+            let samples = std::env::var("MSAA").ok().and_then(|n| n.parse().ok()).unwrap_or(base.samples);
+            let Some(shot) = render_brushes("test_room", View { adapt: true, flashlight, torch, terrain, cut, effects, water, weather, samples, ..base }) else {
                 eprintln!("skipping: no GPU or no test_room");
                 return;
             };

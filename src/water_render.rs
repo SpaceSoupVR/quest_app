@@ -93,7 +93,10 @@ pub fn build(
     out
 }
 
-/// WET SAND: the line below which the ground is wet, world y, and the damp
+/// WET ROCK IN A SEA CAVE (the cave's own shaders' tide band,
+/// `TerrainMaterialUniform::wet_line`; the open ground's wet sand is the
+/// weather's now, `weather_render::Shore`): the line below which it is wet,
+/// world y, and the damp
 /// band above it -- from the bodies whose waves wash a shore (a lake's still
 /// edge leaves no band): their surface plus the wash's run-up, which reaches
 /// further up a beach than the wash rises, and the highest of them.
@@ -102,6 +105,15 @@ pub fn wet_shore(defs: &[WaterDef]) -> Option<(f32, f32)> {
         .filter(|d| d.swash > 0.0)
         .map(|d| (d.height + 1.3 * d.swash, 0.25))
         .reduce(|a, b| if a.0 >= b.0 { a } else { b })
+}
+
+/// THE SEA'S STILL SURFACE, world y, for the ground's shader
+/// (`TerrainMaterialUniform::sea_line`): ground under it is soaked. The
+/// highest of the bodies whose waves wash a shore -- above it the wash wets
+/// the sand, and that moves (`weather_render::Shore`). A still lake's bed is
+/// left as it was.
+pub fn sea_line(defs: &[WaterDef]) -> Option<f32> {
+    defs.iter().filter(|d| d.swash > 0.0).map(|d| d.height).reduce(f32::max)
 }
 
 #[cfg(test)]
@@ -154,8 +166,10 @@ mod tests {
         assert_eq!(wet_shore(&[lake.clone()]), None);
         let mut sea = def();
         sea.swash = 0.2;
-        let (line, band) = wet_shore(&[lake, sea]).unwrap();
+        assert_eq!(sea_line(&[lake.clone()]), None);
+        let (line, band) = wet_shore(&[lake.clone(), sea.clone()]).unwrap();
         assert!((line - 1.26).abs() < 1e-5 && band > 0.0);
+        assert_eq!(sea_line(&[lake, sea]), Some(1.0));
     }
 
     #[test]

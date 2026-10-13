@@ -502,6 +502,62 @@
       "eye": [35.5, 2.0, 35.5],
       "at": [30.5, 1.4, 33.6],
       "note": "From the lawn at the back exit: the arch, the cliff round it and the chamber's glow (cave round 6, 2026-10-08)."
+    },
+    {
+      "name": "walk_field",
+      "eye": [0.0, 1.6, 6.0],
+      "at": [6.0, 0.8, 14.0],
+      "sway": 1.0,
+      "note": "outdoors_field with the RIG carried 1 m side to side, 1.57 m/s at the middle and turning to keep its target: a player walking. Every frame the rig's offset and yaw change, which is what makes the app re-pose static geometry (scale audit F1, 2026-10-13). Read against outdoors_field."
+    },
+    {
+      "name": "walk_beach",
+      "eye": [0.0, 1.7, 24.0],
+      "at": [0.0, 0.4, 60.0],
+      "sway": 1.0,
+      "note": "beach_south walking, as walk_field. Read against beach_south."
+    },
+    {
+      "name": "walk_cave",
+      "eye": [19.6, 1.0, 33.3],
+      "at": [25.0, 0.3, 33.2],
+      "sway": 1.0,
+      "note": "cave_chamber walking, as walk_field. Read against cave_chamber."
+    },
+    {
+      "name": "walk_cave_out",
+      "eye": [35.5, 2.0, 35.5],
+      "at": [30.5, 1.4, 33.6],
+      "sway": 1.0,
+      "note": "cave_back_out walking, as walk_field: the view with the least room. Read against cave_back_out."
+    },
+    {
+      "name": "walk_cave_through",
+      "eye": [6.0, 1.2, 36.0],
+      "at": [12.5, 1.0, 35.0],
+      "path": [[12.5, 1.0, 35.0], [19.6, 1.0, 33.3], [26.0, 1.2, 33.5], [35.5, 2.0, 35.5], [42.0, 2.5, 37.0]],
+      "note": "A walk at 1.4 m/s from the lawn in through the cave's mouth, across the chamber, out of the back exit and on, then round and back: the four cave views joined up, the rig moving every frame and turning at each bend (scale audit F1, 2026-10-13). 57 s a cycle: bench it with --windows 9."
+    },
+    {
+      "name": "walk_field_beach",
+      "eye": [0.0, 1.6, 6.0],
+      "at": [6.0, 0.8, 14.0],
+      "path": [[6.0, 1.6, 14.0], [0.0, 1.7, 24.0], [0.0, 1.7, 40.0]],
+      "note": "A walk at 1.4 m/s from the hall's front across the field and down the beach to the water, then round and back."
+    },
+    {
+      "name": "turn_field",
+      "eye": [0.0, 1.6, 6.0],
+      "at": [6.0, 0.8, 14.0],
+      "spin": 45.0,
+      "note": "outdoors_field's eye turning on the spot, 45 degrees a second: a held stick. The whole level passes through the view every 8 s."
+    },
+    {
+      "name": "turn_hall",
+      "eye": [-1.3, 1.6, -14.5],
+      "at": [0.4, 2.4, 3.7],
+      "spin": 45.0,
+      "note": "hall_back's eye turning on the spot, 45 degrees a second."
     }
   ]
 }

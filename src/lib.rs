@@ -39,6 +39,7 @@ mod soundmap_client;
 // gating it would mean its tests never compile, let alone run, on any machine a
 // developer actually types on.
 mod brush_render;
+mod draw_range;
 mod offline_frame;
 mod probe_level;
 mod flashlight;
@@ -287,12 +288,21 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         terrain_settings.wet_line = line;
         terrain_settings.wet_band = band;
     }
+    // The ground under the sea's still surface is soaked; the wash above it
+    // is the weather's (`weather_render::Shore`).
+    if let Some(sea) = water_render::sea_line(&static_scene.water) {
+        terrain_settings.sea_line = sea;
+    }
     renderer.set_terrain_settings(terrain_settings);
     renderer.set_terrain_splat(loaded_terrain.as_ref().and_then(|(_, s)| s.as_ref()));
     // The ground reflections land on. See `space_soup::renderer::ground_map`.
     renderer.set_terrain_heights(
         loaded_terrain.as_ref().and_then(|(t, _)| t.height_grid(static_scene.terrain.as_ref(), &dir)),
     );
+    // What the ground hides. See `space_soup::renderer::ground_horizon`.
+    renderer.set_ground_horizon(loaded_terrain.as_ref().and_then(|(t, _)| {
+        Some((t.ground_occluder(static_scene.terrain.as_ref())?, t.chunk_world_bounds()))
+    }));
 
     // WATER. Built once here rather than per frame: the surface is static world
     // geometry whose depth comes from the terrain, posed into the player's
@@ -852,7 +862,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         // player goes back to where they stood. Taken once, here: the lever
         // file is read later in the frame, and a pin that changed halfway
         // would draw the new head against geometry placed for the old rig.
-        if let Some((pose, since)) = bench_pose.as_ref().filter(|(pose, _)| pose.sway.is_some()) {
+        if let Some((pose, since)) = bench_pose.as_ref().filter(|(pose, _)| pose.moves()) {
             bench = Some(space_soup::renderer::bench::BenchRig::for_pose_at(pose, since.elapsed().as_secs_f32()));
         }
         let frame_bench = bench;
@@ -1058,6 +1068,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 static_scene = grab_detect::StaticScene::load(&dir, &w.scene_name);
                 loaded_terrain = load_scene_terrain(&dir, &w.scene_name);
+                renderer.ground_changed();
                 // Per scene, like the terrain: the previous level's walls would
                 // otherwise still be standing in this one.
                 brushes = load_scene_brushes(&dir, &w.scene_name);
@@ -1099,6 +1110,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 renderer.set_terrain_heights(
                     loaded_terrain.as_ref().and_then(|(t, _)| t.height_grid(static_scene.terrain.as_ref(), &dir)),
                 );
+                renderer.set_ground_horizon(loaded_terrain.as_ref().and_then(|(t, _)| {
+                    Some((t.ground_occluder(static_scene.terrain.as_ref())?, t.chunk_world_bounds()))
+                }));
             }
         }
 
@@ -1622,8 +1636,19 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         // are taken -- `assemble` borrows mutably and `caster_chunks` borrows
         // shared, and the two cannot overlap. The second `assemble` is the
         // cached path and costs a comparison.
+        // (Timed: what posing the static geometry for the rig costs a frame,
+        // `WindowRecord::cpu`'s `pose_ms`.)
+        let pose_clock = std::time::Instant::now();
+        // IN THE WORLD, untouched, where the renderer poses the ground itself
+        // (`XrRenderer::ground_in_world`): only its chunks' boxes follow the
+        // rig then, from a few vertices each.
+        let ground_world = renderer.ground_in_world();
         if let Some((t, _)) = loaded_terrain.as_mut() {
-            t.assemble(offset, yaw_inv, locomotion.player_yaw);
+            if ground_world {
+                t.assemble_world(offset, yaw_inv, locomotion.player_yaw);
+            } else {
+                t.assemble(offset, yaw_inv, locomotion.player_yaw);
+            }
         }
         let terrain_chunks: Vec<space_soup::renderer::shadow::CasterChunk> = loaded_terrain
             .as_ref()
@@ -1632,7 +1657,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         let terrain_arg = loaded_terrain
             .as_mut()
             .map(|(g, _)| g)
-            .and_then(|t| t.assemble(offset, yaw_inv, locomotion.player_yaw));
+            .and_then(|t| match ground_world {
+                true => t.assemble_world(offset, yaw_inv, locomotion.player_yaw),
+                false => t.assemble(offset, yaw_inv, locomotion.player_yaw),
+            });
         // Transformed into the player's frame here rather than at load, and
         // only when something moved -- see BrushGeometry::assemble.
         let brush_arg = brushes.assemble(
@@ -1641,6 +1669,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             yaw_inv,
             locomotion.player_yaw,
         );
+        renderer.note_cpu("pose_ms", pose_clock.elapsed().as_secs_f64() * 1e3);
 
         // SHARPENING NEVER RIDES WITH SPACEWARP: together the compositor tore
         // 30-60 times a second. See `layer_settings::sharpening_for`. Bit 64
