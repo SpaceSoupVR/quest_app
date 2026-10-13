@@ -600,6 +600,14 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     if std::env::var("NO_TRACE").as_deref() == Ok("1") {
         probes.no_trace = true;
     }
+    // `OPEN=1`: ground past the baked outdoor volume reflects the outdoors, as
+    // `Levers::open_reflections` has it on the headset (`ProbeUpload::open_ground`).
+    // With `TERRAIN_PASS_CUT=terrain_cut_open` the whole ground is drawn by the
+    // open-ground twin instead: the same picture where no ground in view lies in
+    // a photograph's box.
+    if std::env::var("OPEN").as_deref() == Ok("1") {
+        probes.open_ground = true;
+    }
     // THE EYE IN THE WATER: which body, if any, and how -- against the moving
     // surface at `WATER_TIME`, as the headset tests it each frame. See
     // `space_soup::renderer::underwater`.
@@ -881,6 +889,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                 std::env::var("POOLLESS").as_deref() != Ok("0") && !lights_uniform.reads_pool_maps(),
             ),
             weather.as_ref().map(|_| &weather_layout),
+            &probes,
         ),
         (_, true) => {
             eprintln!("offline frame: the ground is drawn only with half-resolution reflections and deferred lookups");
@@ -902,6 +911,21 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             (format, view.samples),
             (&uniforms.layout, &t.reader.material_layout),
             (offset, yaw_inv),
+        ),
+        _ => None,
+    };
+    // THE BAKED CAVES (`space_soup::renderer::baked_cave`), each with its own
+    // lightmap, as the headset's scene pass draws them.
+    let baked_caves = match (&terrain, std::env::var("NO_CAVES").as_deref()) {
+        (Some(t), Err(_)) | (Some(t), Ok("0")) => OfflineBakedCaves::new(
+            &device,
+            &queue,
+            &game,
+            scene_name,
+            (format, view.samples),
+            (&uniforms.layout, &t.reader.material_layout),
+            (offset, yaw_inv),
+            &lm,
         ),
         _ => None,
     };
@@ -958,7 +982,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         }
         _ => None,
     };
-    // SPLASHES to look at: `SPLASH=x,y,z,vx,vy,vz,size,mass,age[,depth]`
+    // SPLASHES to look at: `SPLASH=x,y,z,vx,vy,vz,size,mass,age[,depth[,held]]`
     // (world; the velocity of what struck, m/s; the radius of its
     // cross-section, metres; its mass, kg; seconds since it struck at the
     // effects' and the water's clock; the still water's depth there),
@@ -988,7 +1012,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                 u.set_time(born, loop_seconds);
                 position.y += space_soup::renderer::water_pipeline::swash_lift(&u, depth, glam::Vec2::new(position.x, position.z));
             }
-            let splash = Splash { depth, seed: 7 + 0x9e37 * k as u64, ..Splash::new(position, born, Vec3::new(n[3], n[4], n[5]), n[6], n[7]) };
+            let splash = Splash { depth, held: n.get(10).copied().unwrap_or(0.0), seed: 7 + 0x9e37 * k as u64, ..Splash::new(position, born, Vec3::new(n[3], n[4], n[5]), n[6], n[7]) };
             strike(&mut live, splash, 48);
         }
         live
@@ -1227,7 +1251,21 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             pass.set_bind_group(3, pass_bg, &[]);
             pass.set_vertex_buffer(0, t.vb.slice(..));
             pass.set_index_buffer(t.ib.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..t.count, 0, 0..1);
+            match &t.classes {
+                // Each ground class's runs by its twin, as the headset draws
+                // a chunk's triangles (`GROUND_CLASSES=1`).
+                Some((outdoors, nowhere, runs)) => {
+                    for (twin, (r, n)) in [None, outdoors.as_ref(), nowhere.as_ref()].into_iter().zip(runs) {
+                        if let Some(twin) = twin {
+                            pass.set_pipeline(&twin.pipeline);
+                        }
+                        for &(first, len) in &r[..*n] {
+                            pass.draw_indexed(first..first + len, 0, 0..1);
+                        }
+                    }
+                }
+                None => pass.draw_indexed(0..t.count, 0, 0..1),
+            }
         }
         drop(pass);
         if let Some((fixups, (target_bg, _))) = fixups {
@@ -1328,6 +1366,9 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                 pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..*count, 0, 0..1);
             }
+        }
+        if let (Some(b), Some(t)) = (&baked_caves, &terrain) {
+            b.draw(&mut pass, &uniforms.bind_group, &t.material.bind_group);
         }
         // UNDER THE WATER: the veil over everything opaque, then the body's
         // underside -- before its own surface, which keeps only what is seen
@@ -1675,6 +1716,120 @@ impl OfflineDoors {
     }
 }
 
+/// The scene's baked caves, ready to draw: the pipelines, and for each cave
+/// its model uniform, its vertices and indices, and its lightmap.
+struct OfflineBakedCaves {
+    pipelines: space_soup::renderer::baked_cave::BakedCavePipelines,
+    caves: Vec<OfflineBakedCave>,
+}
+
+struct OfflineBakedCave {
+    model: space_soup::renderer::mesh_pipeline::ModelUniform,
+    placed: Mat4,
+    primitive: space_soup::renderer::baked_cave::BakedCavePrimitive,
+    indices: wgpu::Buffer,
+    index_count: u32,
+    lightmap: space_soup::renderer::mesh::LoadedTexture,
+}
+
+impl OfflineBakedCaves {
+    /// Every drawn scene model whose file is a baked cave, placed in the
+    /// player's frame as `render_prep` places a mesh, with the lightmap its
+    /// object's id names in `lm` (unbaked: black, and the whole sky).
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        game: &std::path::Path,
+        scene_name: &str,
+        (format, samples): (wgpu::TextureFormat, u32),
+        (uniform_layout, material_layout): (&wgpu::BindGroupLayout, &wgpu::BindGroupLayout),
+        (offset, yaw_inv): (Vec3, Quat),
+        lm: &[space_soup_engine::lightmaps::LoadedLightmap],
+    ) -> Option<Self> {
+        // A model's uniform and lightmap come from the MESH pipeline on the
+        // headset, so they do here.
+        let mesh_pipeline = space_soup::renderer::mesh_pipeline::MeshPipeline::new(device, format, uniform_layout);
+        let mut caves = Vec::new();
+        for m in crate::scene_meshes::load(game, scene_name) {
+            let Ok(mesh) = space_soup::renderer::mesh::GltfMesh::load(device, queue, &mesh_pipeline.texture_layout, &game.join(&m.path)) else {
+                continue;
+            };
+            let placed = Mat4::from_scale_rotation_translation(
+                Vec3::from(m.scale),
+                yaw_inv * Quat::from_array(m.rotation),
+                yaw_inv * (Vec3::from(m.position) - offset),
+            );
+            for prim in &mesh.primitives {
+                let Some(cave) = &prim.baked_cave else { continue };
+                let model = mesh_pipeline.create_model_uniform(device);
+                model.upload(queue, placed);
+                let baked = lm
+                    .iter()
+                    .find(|l| l.target == space_soup_engine::lightmaps::LightmapTarget::Object && l.object_id == m.id);
+                let lightmap = match baked {
+                    Some(l) => space_soup::renderer::mesh::create_lightmap_texture_full(
+                        device,
+                        queue,
+                        &mesh_pipeline.lightmap_layout,
+                        match &l.linear {
+                            Some(lin) => space_soup::renderer::mesh::LightmapLight::Linear(lin),
+                            None => space_soup::renderer::mesh::LightmapLight::Srgb8(&l.rgba),
+                        },
+                        l.width,
+                        l.height,
+                        None,
+                        None,
+                        None,
+                    ),
+                    None => space_soup::renderer::brush_pipeline::default_brush_lightmap(device, queue, &mesh_pipeline.lightmap_layout),
+                };
+                eprintln!(
+                    "offline frame: baked cave {} -- {} triangles in {} chunks, lightmap {}",
+                    m.id,
+                    prim.indices.len() / 3,
+                    cave.chunks.len(),
+                    baked.map_or("NONE (unbaked)".to_string(), |l| format!("{}x{}", l.width, l.height)),
+                );
+                caves.push(OfflineBakedCave {
+                    model,
+                    placed,
+                    primitive: cave.clone(),
+                    indices: prim.index_buffer.clone(),
+                    index_count: prim.indices.len() as u32,
+                    lightmap,
+                });
+            }
+        }
+        if caves.is_empty() {
+            return None;
+        }
+        let pipelines = space_soup::renderer::baked_cave::BakedCavePipelines::new(
+            device, format, uniform_layout, material_layout, &mesh_pipeline.lightmap_layout, samples, false,
+        );
+        Some(Self { pipelines, caves })
+    }
+
+    fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, uniform: &'a wgpu::BindGroup, material: &'a wgpu::BindGroup) {
+        let draws: Vec<_> = self
+            .caves
+            .iter()
+            .map(|c| space_soup::renderer::baked_cave::BakedCaveDraw {
+                model: &c.model.bind_group,
+                lightmap: &c.lightmap.bind_group,
+                vertices: &c.primitive.vertex_buffer,
+                indices: &c.indices,
+                index_count: c.index_count,
+                chunks: &c.primitive.chunks,
+                emissive: c.primitive.emissive,
+                placed: c.placed,
+                bounds: space_soup::renderer::cave_twins::placed_box(c.placed, c.primitive.bounds),
+            })
+            .collect();
+        self.pipelines.draw_scene(pass, uniform, material, &draws, None, false, false);
+    }
+}
+
 /// A live sun map over the caves, OPT-IN (`CAVE_SHADOWS=1`). The hill's and
 /// the brow's shadow on a cave now arrive baked in its `COLOR_1` alpha
 /// (caveSky.sunVisibility, the same static sun the terrain bake casts), so the
@@ -1779,6 +1934,15 @@ struct OfflineTerrain {
         u32,
         Option<(space_soup::renderer::terrain_pipeline::TerrainPipeline, u32)>,
     )>,
+    /// `GROUND_CLASSES=1`: the pass's outdoor twin and its nowhere (or
+    /// open-ground) twin, and the index runs each ground class draws --
+    /// `[full, outdoors, nowhere]`, as the headset draws a chunk by its
+    /// triangles' classes (`Levers::ground_classes`).
+    classes: Option<(
+        Option<space_soup::renderer::terrain_pipeline::TerrainPipeline>,
+        Option<space_soup::renderer::terrain_pipeline::TerrainPipeline>,
+        [([(u32, u32); 4], usize); 3],
+    )>,
 }
 
 /// THE GROUND, as the headset draws it in the shipped single-eye path: its
@@ -1806,10 +1970,16 @@ fn offline_terrain(
     ),
     (spotless, poolless): (bool, bool),
     weather: Option<&wgpu::BindGroupLayout>,
+    probes: &space_soup::renderer::uniforms::ProbeUpload,
 ) -> Option<OfflineTerrain> {
     use space_soup::renderer::terrain_pipeline::{self as tp, TerrainImage, TerrainPipeline};
     use wgpu::util::DeviceExt;
     let (mut geometry, splat) = crate::load_scene_terrain(game, scene_name)?;
+    // THE GROUND'S SHADERS AS THE HEADSET BUILDS THEM FOR THIS LEVEL: for a
+    // painted one, without the slope-driven weights (`tp::GROUND_PAINTED`).
+    // `GROUND_BUILD=generic` keeps the build with the choice in it, to show
+    // the two draw the same picture.
+    tp::expect_painted_ground(splat.is_some() && std::env::var("GROUND_BUILD").as_deref() != Ok("generic"));
     // `SHEER_ROCK=0`: the painted map as painted, without bare rock on sheer
     // ground (`SplatMap::bare_rock_on_sheer_ground`) -- the picture before
     // 2026-10-08, to set beside the one the headset now draws.
@@ -1885,6 +2055,22 @@ fn offline_terrain(
             };
             let reader =
                 TerrainPipeline::new_probe_reader_twin(device, format, uniform_layout, samples, probe_layout, spotless, sun_baked);
+            // `GROUND_FRAME=was`: the reader with the sample frame as it was
+            // before 2026-10-13 (`shader_opt::frame_was`), the control the
+            // shipped frame's picture is compared with.
+            let reader = if std::env::var("GROUND_FRAME").as_deref() == Ok("was") {
+                let [full, spotless_r, baked, baked_spotless] =
+                    TerrainPipeline::new_edited_probe_readers(device, format, uniform_layout, samples, probe_layout, "opt_frame_was")
+                        .expect("the frame as it was");
+                match (spotless, sun_baked) {
+                    (false, false) => full,
+                    (true, false) => spotless_r,
+                    (false, true) => baked,
+                    (true, true) => baked_spotless,
+                }
+            } else {
+                reader
+            };
             // `TERRAIN_PASS_CUT=<cut>`: the pass drawn with one of its
             // measurement cuts (`terrain_pipeline::PROBE_PASS_REGISTER_CUTS`),
             // as the `pass_cut` lever draws it on the headset.
@@ -1939,8 +2125,49 @@ fn offline_terrain(
     // twin (`ground_twins`), as the headset draws them -- to prove the twin
     // draws the same picture.
     let threshold = tp::load_terrain_settings(&dir).biplanar_start_deg;
+    // `GROUND_CLASSES=1`: the ground's triangles sorted by what the pass may
+    // draw them with, from this frame's table (which is the whole level's
+    // here), and each class drawn by its twin -- to prove the twins draw the
+    // full pass's picture where the headset draws them
+    // (`space_soup::renderer::outdoor_pass::LevelGround`).
+    // (`GROUND_CLASSES=order`: sorted the same and all drawn by the full
+    // pass, the control for the triangles' order.)
+    let order_only = std::env::var("GROUND_CLASSES").is_ok_and(|v| v == "order");
+    let by_class = order_only || std::env::var("GROUND_CLASSES").is_ok_and(|v| v == "1");
+    let level_ground = space_soup::renderer::outdoor_pass::LevelGround::of_table(probes);
+    let class_of = |corners: [[f32; 3]; 3]| if by_class { level_ground.class_of_posed(offset, yaw, corners) } else { 0 };
+    let classed = |verts: &[space_soup::renderer::cuboid::SolidVertex], idx: &[u32]| {
+        space_soup::renderer::ground_twins::SlopeSplit::classed(verts, idx, &[], threshold, by_class as u64, &class_of)
+    };
+    let class_draws = |split: &space_soup::renderer::ground_twins::SlopeSplit| {
+        by_class.then(|| {
+            let open = probes.open_ground && !probes.no_trace;
+            let outdoors = (!order_only).then(|| TerrainPipeline::new_probe_pass_outdoors(device, uniform_layout, fixups, weather)).flatten();
+            let nowhere = (!order_only)
+                .then(|| match open {
+                    true => TerrainPipeline::new_probe_pass_open(device, uniform_layout, fixups, weather),
+                    false => TerrainPipeline::new_probe_pass_nowhere(device, uniform_layout, fixups, weather),
+                })
+                .flatten();
+            let pick = [
+                [true, outdoors.is_none(), nowhere.is_none()],
+                [false, outdoors.is_some(), false],
+                [false, false, nowhere.is_some()],
+            ];
+            eprintln!(
+                "offline frame: ground classes -- {} indices the full pass's, {} the outdoor twin's, {} the {} twin's",
+                split.class_totals[0],
+                split.class_totals[1],
+                split.class_totals[2],
+                if open { "open-ground" } else { "nowhere" },
+            );
+            (outdoors, nowhere, pick.map(|p| split.class_ranges(0, p)))
+        })
+    };
+    let mut classes = None;
     let (idx, gentle) = if std::env::var("TERRAIN_GENTLE").is_ok_and(|v| v == "1") {
-        let split = space_soup::renderer::ground_twins::SlopeSplit::new(&verts, &idx, &[], threshold);
+        let split = classed(&verts, &idx);
+        classes = class_draws(&split);
         let kinds = weather.map(|l| (l, space_soup::renderer::weather::WeatherKinds::Both));
         let readers = space_soup::renderer::ground_twins::gentle_readers(device, format, uniform_layout, samples, probe_layout, kinds)
             .expect("the ground's gentle twins");
@@ -1976,6 +2203,10 @@ fn offline_terrain(
             steep.as_ref().map_or(0, |s| s.1)
         );
         (split.indices, Some((reader, split.gentle_total as u32, steep)))
+    } else if by_class {
+        let split = classed(&verts, &idx);
+        classes = class_draws(&split);
+        (split.indices, None)
     } else {
         (idx.to_vec(), None)
     };
@@ -1995,6 +2226,7 @@ fn offline_terrain(
         pass,
         reader,
         gentle,
+        classes,
     })
 }
 
@@ -2691,6 +2923,127 @@ mod bench_views {
             };
             shot.save(&out.join(format!("bench_{name}.png")));
         }
+    }
+
+    /// THE COLOUR STEP ACROSS THE JOIN between a baked cave and the ground
+    /// round it, MEASURED in rendered pixels on the level's own files.
+    ///
+    /// The join is the edges of the ground's patch that carry an authored
+    /// normal on both ends (`terrain::GroundPatch`: the carve's line). For a
+    /// spread of them the frame is drawn from just off the surface, looking
+    /// at the edge's middle, and four small patches of pixels are read round
+    /// it: two on each side of the line. ACROSS is the difference between the
+    /// two sides; ALONG is the difference between the two patches of one
+    /// side, the same distance apart -- what the rock's own texture and
+    /// light do over that distance with no join in it. A join that shows is
+    /// an ACROSS well over ALONG.
+    ///
+    /// `--ignored --nocapture`; `GAME_DIR` picks the game folder, `OUT` a
+    /// folder to keep the views in. Skips on a level with no baked cave.
+    #[test]
+    #[ignore]
+    fn cave_join_colour_step() {
+        let game = offline_game_dir();
+        let Ok(scene) = space_soup_engine::scene::Scene::load(&game.join("scenes/test_room.json")) else {
+            eprintln!("skipping: no test_room");
+            return;
+        };
+        let Some(def) = scene.terrain.as_ref() else { return };
+        let source = space_soup_engine::terrain::load(def, &game).expect("terrain loads");
+        let ground = source.patch(source.bounds(), 1);
+        if ground.normals.is_empty() {
+            eprintln!("skipping: this level has no baked cave with its ground patch");
+            return;
+        }
+        // The ground's open edges whose two ends carry an authored normal --
+        // and where the surface runs SMOOTHLY through the join: the ground's
+        // own triangle there faces within 12 degrees of the sculpt's normal
+        // at both ends. At a crease (the rim of a mouth, the foot of a wall)
+        // the two sides face different ways and are lit differently because
+        // they are different faces, join or no join.
+        let mut count: std::collections::HashMap<(u32, u32), (u32, Vec3)> = std::collections::HashMap::new();
+        for t in ground.indices.chunks_exact(3) {
+            let [pa, pb, pc] = [0, 1, 2].map(|k| ground.positions[t[k] as usize]);
+            let face = (pb - pa).cross(pc - pa).normalize_or_zero();
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                let e = count.entry((a.min(b), a.max(b))).or_insert((0, face));
+                e.0 += 1;
+            }
+        }
+        let all = count
+            .iter()
+            .filter(|((a, b), (n, _))| *n == 1 && ground.normals[*a as usize] != Vec3::ZERO && ground.normals[*b as usize] != Vec3::ZERO)
+            .count();
+        let mut join: Vec<(u32, u32)> = count
+            .into_iter()
+            .filter(|((a, b), (n, face))| {
+                let smooth = |v: u32| ground.normals[v as usize].normalize_or_zero().dot(*face) > 12f32.to_radians().cos();
+                *n == 1 && ground.normals[*a as usize] != Vec3::ZERO && ground.normals[*b as usize] != Vec3::ZERO && smooth(*a) && smooth(*b)
+            })
+            .map(|(k, _)| k)
+            .collect();
+        join.sort();
+        eprintln!("cave join: {all} edges, {} of them where the surface runs smoothly through", join.len());
+        assert!(all > 100 && join.len() > 30, "the cave meets the ground along its mouths");
+        let wanted: usize = std::env::var("SAMPLES").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+        let out = std::env::var("OUT").ok().map(std::path::PathBuf::from);
+        const SIZE: u32 = 256;
+        // Pixels from the line to each patch's middle, and along it.
+        const D: f32 = 7.0;
+        let (mut across, mut along) = (Vec::new(), Vec::new());
+        for s in 0..wanted {
+            let (a, b) = join[s * join.len() / wanted];
+            let (pa, pb) = (ground.positions[a as usize], ground.positions[b as usize]);
+            let n = (ground.normals[a as usize] + ground.normals[b as usize]).normalize_or_zero();
+            let mid = (pa + pb) * 0.5;
+            let eye = mid + n * 0.8;
+            let Some(shot) = render_brushes(
+                "test_room",
+                View { adapt: true, terrain: true, effects: false, water: true, weather: false, fov_y: 28.0, width: SIZE, height: SIZE, ..View::headset(eye, mid) },
+            ) else {
+                eprintln!("skipping: no GPU");
+                return;
+            };
+            if let Some(dir) = &out {
+                shot.save(&dir.join(format!("join_{s:02}.png")));
+            }
+            // The edge's direction on the screen (x right, y down).
+            let f = (mid - eye).normalize();
+            let r = if f.cross(Vec3::Y).length() > 1e-3 { f.cross(Vec3::Y).normalize() } else { Vec3::X };
+            let u = r.cross(f);
+            let e = pb - pa;
+            let t = glam::Vec2::new(e.dot(r), -e.dot(u)).normalize_or_zero();
+            let p = glam::Vec2::new(-t.y, t.x);
+            let patch = |sp: f32, st: f32| -> Vec3 {
+                let c = glam::Vec2::splat(SIZE as f32 * 0.5) + p * (sp * D) + t * (st * D);
+                let mut sum = Vec3::ZERO;
+                for dy in -2..=2i32 {
+                    for dx in -2..=2i32 {
+                        let px = shot.px((c.x as i32 + dx).clamp(0, SIZE as i32 - 1) as u32, (c.y as i32 + dy).clamp(0, SIZE as i32 - 1) as u32);
+                        sum += Vec3::new(px[0] as f32, px[1] as f32, px[2] as f32);
+                    }
+                }
+                sum / 25.0
+            };
+            let (pp, pm, mp, mm) = (patch(1.0, 1.0), patch(1.0, -1.0), patch(-1.0, 1.0), patch(-1.0, -1.0));
+            let diff = |a: Vec3, b: Vec3| (a - b).abs().max_element();
+            let (x, l) = ((diff(pp, mp) + diff(pm, mm)) * 0.5, (diff(pp, pm) + diff(mp, mm)) * 0.5);
+            eprintln!("  join {s:02} at {mid:.2}: across {x:.1}, along {l:.1} (of 255)");
+            across.push(x);
+            along.push(l);
+        }
+        let median = |v: &mut Vec<f32>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+        let (xm, lm) = (mean(&across), mean(&along));
+        let (xmed, lmed) = (median(&mut across), median(&mut along));
+        eprintln!(
+            "cave join colour step over {wanted} places: across the join mean {xm:.2} median {xmed:.2}; along it mean {lm:.2} median {lmed:.2} (8-bit, the largest channel)"
+        );
+        assert!(xmed <= lmed * 1.6 + 2.0, "the join shows: {xmed:.1} across against {lmed:.1} along");
     }
 
     /// ONE VIEWPOINT from the environment, to look again at something seen on

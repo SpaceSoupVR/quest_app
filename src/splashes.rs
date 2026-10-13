@@ -13,10 +13,12 @@
 //!   wide and as heavy as they are. Seen by the engine's own rule
 //!   (`space_soup_engine::water::WaterWatch`), so one floating at the
 //!   waterline does not go in again each time it bobs. The server knows their
-//!   true speed and mass (`PhysicsWorld::take_water_entries`); until its
-//!   snapshot carries them, the headset takes the speed from how the thing
-//!   moved and the mass from its size, as physics does for a body with none
-//!   authored.
+//!   true speed and mass, and tells of each going-in in its snapshots
+//!   (`WireWorld::water_entries`): those are raised by [`SplashWatch::told`],
+//!   once each. Only from a server before that does the headset work them
+//!   out itself ([`SplashWatch::step`]'s `things`), the speed from how the
+//!   thing moved and the mass from its size, as physics does for a body with
+//!   none authored -- never both, or each would splash twice.
 //!
 //! Everything is in the WORLD's frame, on the water's clock. Only the still
 //! surface is known here (the footprints' height); the waves move it a hand
@@ -24,6 +26,7 @@
 use glam::{Quat, Vec3};
 use space_soup::renderer::effects::Splash;
 use space_soup_engine::water::{world_half_extents, WaterWatch};
+use space_soup_protocol::WireWaterEntry;
 use std::collections::HashMap;
 
 /// A stride, metres: a splash each, alternate feet.
@@ -39,10 +42,11 @@ const SLAP_IN: f32 = 0.5;
 const PULL_OUT: f32 = 1.0;
 /// No hand splashes twice within this, seconds.
 const COOLDOWN: f64 = 0.15;
-/// A FOOT, as the water meets it: as wide as a disc of this radius, metres;
+/// A FOOT, as the water meets it: as wide as a disc of this radius, metres
+/// (a foot and the ankle above it are some 150 cm2 to the water they push);
 /// with the shank that drives it, this heavy, kilograms; and coming down
 /// into the water this far below level, a wading step's shallow angle.
-const FOOT_RADIUS: f32 = 0.05;
+const FOOT_RADIUS: f32 = 0.07;
 const FOOT_MASS: f32 = 3.0;
 const FOOT_ENTRY_DEG: f32 = 25.0;
 /// A HAND, likewise, with the forearm behind it.
@@ -61,8 +65,15 @@ pub struct SplashWatch {
     things: HashMap<String, (Vec3, f64, Vec3)>,
     /// Which of them are in the water.
     water: WaterWatch,
+    /// The server's entries in the last snapshot, by number: those already
+    /// raised.
+    told: Vec<u64>,
     count: u64,
 }
+
+/// A splash older than this when first heard of is not raised: its drops
+/// would appear in mid-air. The server tells of one for half a second.
+const TOLD_LATE: f32 = 1.0;
 
 impl SplashWatch {
     /// This frame's splashes, at `now` (the water's clock), `dt` after the
@@ -85,7 +96,7 @@ impl SplashWatch {
     ) -> Vec<Splash> {
         let mut out = Vec::new();
         let dt = dt.max(1e-3);
-        let mut emit = |position: Vec3, depth: Option<f32>, velocity: Vec3, size: f32, mass: f32, count: &mut u64| {
+        let mut emit = |position: Vec3, depth: Option<f32>, velocity: Vec3, size: f32, mass: f32, held: f32, count: &mut u64| {
             *count += 1;
             out.push(Splash {
                 position,
@@ -98,6 +109,7 @@ impl SplashWatch {
                 depth: depth.or_else(|| ground(position).map(|g| position.y - g)).unwrap_or(30.0).max(0.0),
                 // The renderer finds how still the water was (`effects::strike`).
                 calm: 1.0,
+                held,
                 seed: count.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (now.to_bits()),
             });
         };
@@ -124,7 +136,7 @@ impl SplashWatch {
                         let kick = 1.0 - 0.6 * smoothstep(0.25, 0.7, depth);
                         let swing = 2.0 * walk * kick;
                         let (down, along) = FOOT_ENTRY_DEG.to_radians().sin_cos();
-                        emit(Vec3::new(at.x, water, at.z), Some(water - floor.y), ahead * (swing * along) - Vec3::Y * (swing * down), FOOT_RADIUS, FOOT_MASS, &mut self.count);
+                        emit(Vec3::new(at.x, water, at.z), Some(water - floor.y), ahead * (swing * along) - Vec3::Y * (swing * down), FOOT_RADIUS, FOOT_MASS, 1.0, &mut self.count);
                     }
                 }
                 self.feet = Some(floor);
@@ -152,7 +164,7 @@ impl SplashWatch {
                             // A hand pulled out drags water up after it and
                             // lets it fall back: as one going in half as fast.
                             let velocity = if into { v } else { Vec3::new(v.x, -v.y, v.z) * 0.5 };
-                            emit(Vec3::new(p.x, s, p.z), None, velocity, HAND_RADIUS, HAND_MASS, &mut self.count);
+                            emit(Vec3::new(p.x, s, p.z), None, velocity, HAND_RADIUS, HAND_MASS, 1.0, &mut self.count);
                         }
                     }
                 }
@@ -180,11 +192,47 @@ impl SplashWatch {
             };
             let mass = space_soup_engine::rigid_physics::default_mass(half);
             if let Some(e) = self.water.see(id, centre, world_half_extents(half, rotation), velocity, mass, surface(centre.x, centre.z)) {
-                emit(e.position, None, e.velocity, e.radius.clamp(0.01, 2.0), e.mass, &mut self.count);
+                emit(e.position, None, e.velocity, e.radius.clamp(0.01, 2.0), e.mass, 0.0, &mut self.count);
             }
         }
         self.things.retain(|id, _| seen.contains(id));
         self.water.keep(|id| seen.iter().any(|s| s == id));
+        out
+    }
+
+    /// THINGS THE SERVER SAW GO IN: the entries in its latest snapshot
+    /// (`WireWorld::water_entries`; none while there is no snapshot). Each is
+    /// in every snapshot for half a second, under its own number: a splash is
+    /// raised for each number not in the snapshot before, born when the thing
+    /// went in -- `age` before `now` -- not when word of it came. `ground` and
+    /// `sunlit` as in [`Self::step`].
+    pub fn told(&mut self, now: f64, entries: &[WireWaterEntry], ground: &dyn Fn(Vec3) -> Option<f32>, sunlit: &dyn Fn(Vec3) -> f32) -> Vec<Splash> {
+        let mut out = Vec::new();
+        for e in entries {
+            let sound = e.position.iter().chain(&e.velocity).chain([&e.radius, &e.mass, &e.age]).all(|v| v.is_finite());
+            if self.told.contains(&e.serial) || !sound || !(0.0..TOLD_LATE).contains(&e.age) {
+                continue;
+            }
+            let position = Vec3::from(e.position);
+            self.count += 1;
+            out.push(Splash {
+                position,
+                born: now - e.age as f64,
+                velocity: Vec3::from(e.velocity).clamp_length_max(60.0),
+                size: e.radius.clamp(0.01, 2.0),
+                mass: e.mass.max(1e-3),
+                sunlit: sunlit(position + Vec3::Y * 0.05),
+                depth: ground(position).map(|g| position.y - g).unwrap_or(30.0).max(0.0),
+                calm: 1.0,
+                held: 0.0,
+                // By its number, so every headset draws the same splash.
+                seed: e.serial.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x5eed,
+            });
+        }
+        // Only what the server still tells of: a number is not given twice
+        // while it does, and a server started again starts its numbers again.
+        self.told.clear();
+        self.told.extend(entries.iter().map(|e| e.serial));
         out
     }
 }
@@ -287,6 +335,60 @@ mod tests {
         // As fast as it fell, as wide as a disc its footprint's size, as heavy
         // as physics makes a box that size.
         assert!(-out[0].velocity.y > 4.0 && (out[0].size - 0.2257).abs() < 1e-3 && (out[0].mass - 32.0).abs() < 1e-3, "{:?}", out[0]);
+    }
+
+    fn entry(serial: u64, age: f32) -> WireWaterEntry {
+        WireWaterEntry { serial, id: "crate".into(), position: [4.0, 0.0, 1.0], velocity: [0.5, -5.6, 0.0], radius: 0.23, mass: 32.0, age }
+    }
+
+    /// The server tells of a going-in in thirty snapshots; the headset reads
+    /// one a frame, some twice and some never. One splash, with the server's
+    /// numbers, born when the thing went in.
+    #[test]
+    fn what_the_server_tells_of_splashes_once_as_it_was_and_when_it_was() {
+        let mut w = SplashWatch::default();
+        let dt = 1.0 / 72.0;
+        let mut out = Vec::new();
+        let mut latest: Vec<WireWaterEntry> = Vec::new();
+        for k in 0..72 {
+            let now = 10.0 + k as f64 * dt;
+            // Snapshots at 60 a second from a going-in at 10.1 s; every
+            // seventh frame none has come, and the one before is read again.
+            let age = (now - 10.1) as f32;
+            if k % 7 != 3 {
+                latest = if (0.0..0.5).contains(&age) { vec![entry(12, (age * 60.0).floor() / 60.0)] } else { vec![] };
+            }
+            out.extend(w.told(now, &latest, &bed, &sun));
+        }
+        assert_eq!(out.len(), 1, "{out:?}");
+        let s = &out[0];
+        assert!((s.born - 10.1).abs() < 0.02, "born at {}", s.born);
+        assert_eq!((s.position, s.velocity, s.size, s.mass, s.held), (Vec3::new(4.0, 0.0, 1.0), Vec3::new(0.5, -5.6, 0.0), 0.23, 32.0, 0.0));
+        assert!((s.depth - 0.4).abs() < 1e-6 && s.sunlit == 1.0);
+        // The same thing going in again later is another number: another splash.
+        assert_eq!(w.told(12.0, &[entry(13, 0.0)], &bed, &sun).len(), 1);
+        // Two at once, and one heard of too late to draw from its start.
+        let mut w = SplashWatch::default();
+        assert_eq!(w.told(1.0, &[entry(0, 0.1), entry(1, 0.0), entry(2, 1.5)], &bed, &sun).len(), 2);
+        // Every headset draws the same splash for the same number.
+        let (a, b) = (SplashWatch::default().told(1.0, &[entry(5, 0.0)], &bed, &sun), SplashWatch::default().told(7.0, &[entry(5, 0.2)], &bed, &sun));
+        assert_eq!(a[0].seed, b[0].seed);
+        // Nonsense off the wire is not drawn.
+        let mut bad = entry(9, 0.0);
+        bad.velocity[1] = f32::NAN;
+        assert!(SplashWatch::default().told(1.0, &[bad], &bed, &sun).is_empty());
+    }
+
+    /// A server started again numbers its entries from nothing again: the
+    /// first of them must not be taken for one already drawn.
+    #[test]
+    fn a_number_is_only_remembered_while_the_server_tells_of_it() {
+        let mut w = SplashWatch::default();
+        assert_eq!(w.told(1.0, &[entry(0, 0.0)], &bed, &sun).len(), 1);
+        assert_eq!(w.told(1.1, &[entry(0, 0.1)], &bed, &sun).len(), 0);
+        // The connection drops: no snapshot, no entries.
+        assert_eq!(w.told(1.2, &[], &bed, &sun).len(), 0);
+        assert_eq!(w.told(4.0, &[entry(0, 0.0)], &bed, &sun).len(), 1);
     }
 
     /// Floating at the waterline, bobbing: it went in once, and that was all.
