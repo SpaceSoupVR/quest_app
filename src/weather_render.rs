@@ -8,6 +8,9 @@ use glam::Vec3;
 use space_soup::renderer::weather::AreaParams;
 #[cfg(test)]
 use space_soup::renderer::weather::WeatherMaps;
+use space_soup::renderer::water_pipeline::{shore_wet_line, shore_wet_line_most};
+use space_soup::renderer::weather::CHUNK_POOLS;
+use space_soup_engine::water::WaterDef;
 use space_soup_engine::weather::{PrecipitationKind, WeatherField};
 
 /// Where a ray from the sky starts, and how far it may fall.
@@ -32,25 +35,174 @@ pub fn area_params(field: &WeatherField) -> Vec<AreaParams> {
             falling: state.falling,
             wind: def.wind,
             edge: def.edge,
+            shore: false,
         })
         .collect()
 }
 
-/// The maps' texture, sized for `field`'s areas. (The headset's are the
-/// renderer's own: `XrRenderer::set_weather`.)
-#[cfg(test)]
-pub fn maps(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, field: &WeatherField) -> WeatherMaps {
-    let sizes: Vec<(u32, u32)> = field.areas.iter().map(|(_, g, _)| (g.nx as u32, g.nz as u32)).collect();
-    WeatherMaps::new(device, layout, &sizes)
+/// A SHORE THE SEA WASHES, as the weather's maps carry it: a coarse layer
+/// over the body's footprint holding, at each point, how far above the still
+/// surface the wash has the sand wet now -- the WET LINE
+/// (`water_pipeline::shore_wet_line`: it jumps up the beach with a wave and
+/// creeps back after it, higher where the bigger sections break). The ground's
+/// weather twin compares each pixel's own height with it, so the wet edge
+/// follows the beach's shape to the pixel while the layer stays a few
+/// thousand texels, of which only those with sand the wash can reach are
+/// worked out again (`AreaParams::shore`).
+#[derive(Debug, Clone)]
+pub struct Shore {
+    /// The still surface, world y, and the wash's rise, metres.
+    pub sea: f32,
+    pub swash: f32,
+    pub min: [f32; 2],
+    /// A texel's size along x and along z.
+    pub cell: [f32; 2],
+    pub nx: usize,
+    pub nz: usize,
+    /// The texels with ground the wash can reach in or beside them, each
+    /// with its centre.
+    active: Vec<(usize, glam::Vec2)>,
 }
 
-/// Every area's map and numbers as `field` stands now, uploaded.
+/// A shore layer's texel, metres, and the most along a side: the line varies
+/// along a shore over tens of metres (`water_pipeline::SWASH_SECTION`).
+pub const SHORE_CELL: f32 = 2.5;
+const SHORE_MAX_CELLS: usize = 64;
+/// How often the wet lines are worked out again, seconds: a wave lifts the
+/// line a hand's height in a second, and four times a second showed as steps
+/// at the water's edge.
+pub const SHORE_REFRESH: f64 = 1.0 / 12.0;
+
+impl Shore {
+    /// `def`'s shore, if its waves wash one. `ground_within(x, z, top, drop)`
+    /// is whether ground lies within `drop` metres under world `(x, top, z)`.
+    pub fn find(def: &WaterDef, ground_within: impl Fn(f32, f32, f32, f32) -> bool) -> Option<Self> {
+        if def.swash <= 0.0 {
+            return None;
+        }
+        let [a, b, c, d] = def.bounds;
+        let (x0, z0, x1, z1) = (a.min(c), b.min(d), a.max(c), b.max(d));
+        let cell = SHORE_CELL.max((x1 - x0).max(z1 - z0) / SHORE_MAX_CELLS as f32);
+        let nx = (((x1 - x0) / cell).ceil() as usize).clamp(2, SHORE_MAX_CELLS);
+        let nz = (((z1 - z0) / cell).ceil() as usize).clamp(2, SHORE_MAX_CELLS);
+        let (cx, cz) = ((x1 - x0) / nx as f32, (z1 - z0) / nz as f32);
+        // Ground from a hand under the still surface to a hand over the
+        // highest the line gets.
+        let most = shore_wet_line_most(def.swash);
+        let (top, drop) = (def.height + most + 0.3, most + 0.6);
+        let mut reached = vec![false; nx * nz];
+        for z in 0..nz {
+            for x in 0..nx {
+                reached[z * nx + x] = (0..25).any(|k| {
+                    let (u, v) = ((k % 5) as f32 * 0.25, (k / 5) as f32 * 0.25);
+                    ground_within(x0 + (x as f32 + u) * cx, z0 + (z as f32 + v) * cz, top, drop)
+                });
+            }
+        }
+        // And the texels beside them: the map is read between its texels.
+        let active: Vec<(usize, glam::Vec2)> = (0..nx * nz)
+            .filter(|i| {
+                let (x, z) = (i % nx, i / nx);
+                (z.saturating_sub(1)..=(z + 1).min(nz - 1)).any(|j| (x.saturating_sub(1)..=(x + 1).min(nx - 1)).any(|i| reached[j * nx + i]))
+            })
+            .map(|i| (i, glam::Vec2::new(x0 + ((i % nx) as f32 + 0.5) * cx, z0 + ((i / nx) as f32 + 0.5) * cz)))
+            .collect();
+        (!active.is_empty()).then_some(Self { sea: def.height, swash: def.swash, min: [x0, z0], cell: [cx, cz], nx, nz, active })
+    }
+
+    pub fn params(&self) -> AreaParams {
+        AreaParams {
+            min: self.min,
+            extent: [self.cell[0] * self.nx as f32, self.cell[1] * self.nz as f32],
+            edge: 1e-3,
+            shore: true,
+            ..Default::default()
+        }
+    }
+
+    /// The layer at the waves' clock `t`, seconds: each texel the wet line's
+    /// height over the still surface, no water, no snow, open sky (the wash
+    /// comes in under a roof). Where no sand is in reach, the line at rest.
+    pub fn texels(&self, t: f32) -> Vec<[f32; 4]> {
+        let mut out = vec![[space_soup::renderer::water_pipeline::SHORE_BAND, 0.0, 0.0, space_soup_engine::weather::NO_COVER]; self.nx * self.nz];
+        for (i, xz) in &self.active {
+            out[*i][0] = shore_wet_line(t, self.swash, *xz);
+        }
+        out
+    }
+
+    /// Whether ground in the box `lo`..`hi` (world) can be in the wash: what
+    /// decides whether a terrain chunk draws the weather's twin for it.
+    /// Ground wholly under the still surface, or wholly above the line's
+    /// highest, is the same in the dry shader (`terrain_pipeline::SEA_LINE_WGSL`).
+    pub fn touches(&self, lo: Vec3, hi: Vec3) -> bool {
+        let (x1, z1) = (self.min[0] + self.cell[0] * self.nx as f32, self.min[1] + self.cell[1] * self.nz as f32);
+        lo.x <= x1 && hi.x >= self.min[0] && lo.z <= z1 && hi.z >= self.min[1] && hi.y >= self.sea - 0.1 && lo.y <= self.sea + shore_wet_line_most(self.swash) + 0.05
+    }
+
+    pub fn active(&self) -> usize {
+        self.active.len()
+    }
+}
+
+/// The scene's washed shores, their ground through `physics`: at most what
+/// the maps have room for beside `areas` areas of weather, and only those of
+/// the sea the ground's shader knows as the sea ([`crate::water_render::sea_line`]).
+pub fn shores(water: &[WaterDef], physics: &space_soup_engine::rigid_physics::PhysicsWorld, areas: usize) -> Vec<Shore> {
+    let Some(sea) = crate::water_render::sea_line(water) else { return Vec::new() };
+    water
+        .iter()
+        .filter(|d| d.swash > 0.0 && d.height == sea)
+        .filter_map(|d| Shore::find(d, |x, z, top, drop| physics.raycast_down(Vec3::new(x, top, z), drop).is_some()))
+        .take(space_soup_engine::weather::MAX_AREAS.saturating_sub(areas))
+        .collect()
+}
+
+/// Every layer of the weather's maps as the GPU takes it: the shores first,
+/// so an area of weather over the same ground is the one read there, then the
+/// areas ([`area_params`]).
+pub fn layer_params(field: &WeatherField, shores: &[Shore]) -> Vec<AreaParams> {
+    shores.iter().map(Shore::params).chain(area_params(field)).collect()
+}
+
+/// Each layer's size in texels, in [`layer_params`]' order.
+pub fn layer_texels(field: &WeatherField, shores: &[Shore]) -> Vec<(u32, u32)> {
+    shores.iter().map(|s| (s.nx as u32, s.nz as u32)).chain(field.areas.iter().map(|(_, g, _)| (g.nx as u32, g.nz as u32))).collect()
+}
+
+/// An area's map as it stands (`space_soup_engine::weather::surface`), with
+/// what lies under the sea's still surface soaked and holding no puddle: the
+/// ground's weather twin has the map where its dry shader has the sea's line
+/// (`terrain_pipeline::SEA_LINE_WGSL`).
+pub fn area_map(def: &space_soup_engine::weather::WeatherDef, ground: &space_soup_engine::weather::WeatherGround, state: &space_soup_engine::weather::WeatherState, sea: Option<f32>) -> Vec<[f32; 4]> {
+    let mut texels = space_soup_engine::weather::surface(def, ground, state);
+    if let Some(sea) = sea {
+        for (t, cover) in texels.iter_mut().zip(&ground.cover) {
+            if *cover < sea {
+                t[0] = 1.0;
+                t[1] = 0.0;
+            }
+        }
+    }
+    texels
+}
+
+/// The maps' texture, sized for `field`'s areas and `shores`. (The headset's
+/// are the renderer's own: `XrRenderer::set_weather`.)
 #[cfg(test)]
-pub fn upload(queue: &wgpu::Queue, maps: &mut WeatherMaps, field: &WeatherField) {
-    for (k, ((def, ground, state), params)) in field.areas.iter().zip(area_params(field)).enumerate() {
-        let texels = space_soup_engine::weather::surface(def, ground, state);
-        maps.upload_map(queue, k as u32, ground.nx as u32, ground.nz as u32, &texels);
-        maps.set_area(k, &params, (ground.nx as u32, ground.nz as u32));
+pub fn maps(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, field: &WeatherField, shores: &[Shore]) -> WeatherMaps {
+    WeatherMaps::new(device, layout, &layer_texels(field, shores))
+}
+
+/// Every layer's map and numbers as `field` stands now and the shores at the
+/// waves' clock `water_time`, uploaded.
+#[cfg(test)]
+pub fn upload(queue: &wgpu::Queue, maps: &mut WeatherMaps, field: &WeatherField, shores: &[Shore], water_time: f32) {
+    let sea = shores.first().map(|s| s.sea);
+    let texels = shores.iter().map(|s| s.texels(water_time)).chain(field.areas.iter().map(|(d, g, st)| area_map(d, g, st, sea)));
+    for (k, ((texels, params), size)) in texels.zip(layer_params(field, shores)).zip(layer_texels(field, shores)).enumerate() {
+        maps.upload_map(queue, k as u32, size.0, size.1, &texels);
+        maps.set_area(k, &params, size);
     }
 }
 
@@ -70,19 +222,30 @@ pub fn wind_at(field: &WeatherField, head: Vec3) -> [f32; 2] {
 /// ones drawn with the ground's weather twins. A chunk that holds any vertex
 /// inside an area is one, so the snow's lift never tears a seam between a
 /// lifted chunk and its neighbour (the snow is zero at an area's edge).
-pub fn chunk_flags(field: &WeatherField, bounds: &[(Vec3, Vec3)]) -> Vec<bool> {
-    chunk_areas(field, bounds).iter().map(|m| *m != 0).collect()
+pub fn chunk_flags(field: &WeatherField, shores: &[Shore], bounds: &[(Vec3, Vec3)]) -> Vec<bool> {
+    chunk_areas(field, shores, bounds).iter().map(|m| *m != 0).collect()
 }
 
-/// Which areas each chunk touches, as a bit mask by the areas' order: what
-/// the renderer's weather twin for the chunk must draw (`WeatherKinds`).
-pub fn chunk_areas(field: &WeatherField, bounds: &[(Vec3, Vec3)]) -> Vec<u32> {
+/// Which layers each chunk touches, as a bit mask in [`layer_params`]' order
+/// -- a shore's where the chunk has ground the wash can reach
+/// ([`Shore::touches`]), an area's where their footprints meet -- and, from
+/// bit `CHUNK_POOLS`, which of those areas can hold standing water in the
+/// chunk's own ground (`WeatherGround::can_pool`): what the renderer's
+/// weather twin for the chunk must draw (`WeatherScene::chunks`,
+/// `WeatherKinds`).
+pub fn chunk_areas(field: &WeatherField, shores: &[Shore], bounds: &[(Vec3, Vec3)]) -> Vec<u32> {
     bounds
         .iter()
         .map(|(lo, hi)| {
-            field.areas.iter().enumerate().take(32).fold(0u32, |mask, (k, (d, _, _))| {
+            let washed = shores.iter().enumerate().fold(0u32, |mask, (k, s)| if s.touches(*lo, *hi) { mask | (1 << k) } else { mask });
+            field.areas.iter().enumerate().take(CHUNK_POOLS as usize - shores.len()).fold(washed, |mask, (k, (d, g, _))| {
                 let (x0, z0, x1, z1) = d.extent();
-                if lo.x <= x1 && hi.x >= x0 && lo.z <= z1 && hi.z >= z0 { mask | (1 << k) } else { mask }
+                let k = k + shores.len();
+                if lo.x <= x1 && hi.x >= x0 && lo.z <= z1 && hi.z >= z0 {
+                    mask | (1 << k) | if g.can_pool(d, [lo.x, lo.z], [hi.x, hi.z]) { 1 << (k + CHUNK_POOLS as usize) } else { 0 }
+                } else {
+                    mask
+                }
             })
         })
         .collect()
@@ -121,7 +284,10 @@ pub const MAP_REFRESH: f64 = 0.25;
 #[derive(Default)]
 pub struct WeatherClient {
     pub field: WeatherField,
+    /// The shores the sea washes, the maps' first layers.
+    pub shores: Vec<Shore>,
     refreshed: Option<f64>,
+    shores_refreshed: Option<f64>,
     /// The player's avatar and hands: 0 dry, 1 soaked. See
     /// `space_soup_engine::weather::body_wetness_step`.
     pub body_wet: f32,
@@ -138,12 +304,16 @@ impl WeatherClient {
         for (d, g, _) in &field.areas {
             log::info!("WEATHER area {:?}: {:?}, {}x{} texels of {:.2} m", d.name, d.kind, g.nx, g.nz, g.cell);
         }
-        Self { field, refreshed: None, body_wet: 0.0 }
+        let shores = shores(&scene.water, physics, field.areas.len());
+        for s in &shores {
+            log::info!("WEATHER shore at y={:.2}: {}x{} texels of {:.2} m, {} with sand in the wash", s.sea, s.nx, s.nz, s.cell[0], s.active());
+        }
+        Self { field, shores, refreshed: None, shores_refreshed: None, body_wet: 0.0 }
     }
 
-    /// Each area's map size, for `XrRenderer::set_weather`.
+    /// Each layer's map size, for `XrRenderer::set_weather`.
     pub fn texels(&self) -> Vec<(u32, u32)> {
-        self.field.areas.iter().map(|(_, g, _)| (g.nx as u32, g.nz as u32)).collect()
+        layer_texels(&self.field, &self.shores)
     }
 
     /// The terrain chunks an area touches, by their first index, each with
@@ -152,32 +322,134 @@ impl WeatherClient {
         let Some(t) = terrain else { return Vec::new() };
         let chunks = t.chunk_world_bounds();
         let bounds: Vec<(Vec3, Vec3)> = chunks.iter().map(|(_, b)| *b).collect();
-        chunk_areas(&self.field, &bounds).iter().zip(&chunks).filter(|(m, _)| **m != 0).map(|(m, (first, _))| (*first, *m)).collect()
+        chunk_areas(&self.field, &self.shores, &bounds).iter().zip(&chunks).filter(|(m, _)| **m != 0).map(|(m, (first, _))| (*first, *m)).collect()
     }
 
     /// `dt` seconds on, at game time `time`, with the head at `head` (world):
-    /// each area's numbers, and the maps when they are due (else empty).
+    /// each layer's numbers ([`layer_params`]), and the maps: a layer's when
+    /// it is due -- the areas' every [`MAP_REFRESH`], the shores' every
+    /// [`SHORE_REFRESH`], on the waves' clock, which is `time` too
+    /// (`XrRenderer::set_water_time`) -- and empty for one that is not; no
+    /// maps at all when none is.
     pub fn step(&mut self, time: f64, dt: f32, head: Vec3) -> (Vec<AreaParams>, Vec<Vec<[f32; 4]>>) {
-        if self.field.is_empty() {
+        if self.field.is_empty() && self.shores.is_empty() {
             return (Vec::new(), Vec::new());
         }
         self.field.step(time, dt.min(0.25));
         let (rain, snow) = self.field.falling_on(head.to_array());
         self.body_wet = space_soup_engine::weather::body_wetness_step(self.body_wet, rain, snow, dt.min(0.25));
         let due = self.refreshed.is_none_or(|t| time - t >= MAP_REFRESH || time < t);
-        let maps = if due {
-            self.refreshed = Some(time);
-            self.field.areas.iter().map(|(d, g, st)| space_soup_engine::weather::surface(d, g, st)).collect()
+        let shores_due = !self.shores.is_empty() && self.shores_refreshed.is_none_or(|t| time - t >= SHORE_REFRESH || time < t);
+        let maps = if due || shores_due {
+            // The waves' clock repeats every loop, and so does the line.
+            let loop_s = space_soup::renderer::water_waves::WaveParams::default().loop_seconds as f64;
+            let sea = self.shores.first().map(|s| s.sea);
+            let shores = self.shores.iter().map(|s| if shores_due { s.texels(time.rem_euclid(loop_s) as f32) } else { Vec::new() });
+            let areas = self.field.areas.iter().map(|(d, g, st)| if due { area_map(d, g, st, sea) } else { Vec::new() });
+            let maps = shores.chain(areas).collect();
+            if due {
+                self.refreshed = Some(time);
+            }
+            if shores_due {
+                self.shores_refreshed = Some(time);
+            }
+            maps
         } else {
             Vec::new()
         };
-        (area_params(&self.field), maps)
+        (layer_params(&self.field, &self.shores), maps)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sea(swash: f32) -> WaterDef {
+        serde_json::from_value(serde_json::json!({ "height": 0.0, "bounds": [-20.0, -20.0, 20.0, 20.0], "swash": swash })).unwrap()
+    }
+
+    /// A beach rising a metre in ten along x, the still waterline at x = 0.
+    fn beach(x: f32, _z: f32, top: f32, drop: f32) -> bool {
+        let y = 0.1 * x;
+        y <= top && y > top - drop
+    }
+
+    /// A shore's layer: found only for a body whose waves wash a beach; the
+    /// texels with sand in the wash's reach carry the wet line, which moves
+    /// with the waves between its rest and its most; the rest hold the line
+    /// at rest; and only ground the wash can reach makes a chunk the
+    /// weather's.
+    #[test]
+    fn a_shore_carries_the_wet_line_where_the_wash_reaches() {
+        use space_soup::renderer::water_pipeline::SHORE_BAND;
+        assert!(Shore::find(&sea(0.0), beach).is_none(), "a still lake has no wash");
+        let shore = Shore::find(&sea(0.22), beach).expect("a washed beach");
+        assert_eq!((shore.nx, shore.nz, shore.sea), (16, 16, 0.0));
+        let most = shore_wet_line_most(0.22);
+        // The texel columns round the waterline are in reach, far inland
+        // (x = 18: the sand 1.8 m up) and far out (x = -18: 1.8 m down) not.
+        let column = |x: f32| ((x + 20.0) / shore.cell[0]) as usize;
+        let reached: Vec<usize> = (0..shore.nx).filter(|c| shore.active.iter().any(|(i, _)| i % shore.nx == *c)).collect();
+        assert!(reached.contains(&column(0.5)) && reached.contains(&column(3.0)), "{reached:?}");
+        assert!(!reached.contains(&column(18.0)) && !reached.contains(&column(-18.0)), "{reached:?}");
+        let (a, b) = (shore.texels(10.0), shore.texels(13.0));
+        let at = |x: f32, z: f32| column(z) * shore.nx + column(x);
+        for t in [&a, &b] {
+            assert_eq!(t.len(), shore.nx * shore.nz);
+            assert!(t.iter().all(|x| x[0] >= SHORE_BAND && x[0] <= most + 1e-5 && x[1] == 0.0 && x[2] == 0.0 && x[3] == space_soup_engine::weather::NO_COVER));
+            assert_eq!(t[at(18.0, 0.0)][0], SHORE_BAND, "no sand in reach: the line at rest");
+        }
+        assert!(reached.iter().any(|c| (0..shore.nz).any(|r| (a[r * shore.nx + c][0] - b[r * shore.nx + c][0]).abs() > 0.01)), "the line did not move in three seconds");
+        // Chunks: the beach's is washed; the bed's and the dunes' are not.
+        assert!(shore.touches(Vec3::new(-4.0, -0.4, -8.0), Vec3::new(4.0, 0.4, 8.0)));
+        assert!(!shore.touches(Vec3::new(-20.0, -2.0, -8.0), Vec3::new(-12.0, -1.2, 8.0)), "wholly under the still water");
+        assert!(!shore.touches(Vec3::new(12.0, 1.2, -8.0), Vec3::new(20.0, 2.0, 8.0)), "wholly above the wash");
+        assert!(!shore.touches(Vec3::new(40.0, -0.4, 0.0), Vec3::new(48.0, 0.4, 8.0)), "beyond the body");
+        let p = shore.params();
+        assert!(p.shore && !p.snow && p.falling == 0.0 && p.min == [-20.0, -20.0] && p.extent == [40.0, 40.0]);
+    }
+
+    /// The layers' order and the chunks' masks: a shore first, then the areas;
+    /// a chunk's bit for each it touches, and its pooling bit only where
+    /// water can stand in its own ground; and an area's map soaked, with no
+    /// puddle, where its ground lies under the sea.
+    #[test]
+    fn a_chunk_is_told_its_layers_and_where_water_can_stand() {
+        let rain: space_soup_engine::weather::WeatherDef =
+            serde_json::from_str(r#"{"bounds": [4, -8, 20, 8], "ground_relief": 0.0, "edge": 0.01, "start": {"wetness": 0.5, "puddles": 1.0}}"#).unwrap();
+        // The beach, with a bowl a metre across at (14, 4) dug into it, deep
+        // enough to be closed on its downhill side.
+        let ground = |x: f32, z: f32| Some(0.1 * x - if (x - 14.0).hypot(z - 4.0) < 0.6 { 0.2 } else { 0.0 });
+        let field = WeatherField::new(&[rain], ground);
+        let shores = vec![Shore::find(&sea(0.22), beach).unwrap()];
+        let params = layer_params(&field, &shores);
+        assert_eq!(params.len(), 2);
+        assert!(params[0].shore && !params[1].shore);
+        assert_eq!(layer_texels(&field, &shores), vec![(16, 16), (64, 64)]);
+        let masks = chunk_areas(
+            &field,
+            &shores,
+            &[
+                (Vec3::new(-4.0, -0.4, -8.0), Vec3::new(4.0, 0.4, 8.0)),   // the waterline, and the rain's edge
+                (Vec3::new(12.0, 1.1, 0.0), Vec3::new(20.0, 2.0, 8.0)),    // the rain, with the bowl
+                (Vec3::new(12.0, 1.2, -8.0), Vec3::new(20.0, 2.0, 0.0)),   // the rain, no hollow
+                (Vec3::new(-20.0, -2.0, -8.0), Vec3::new(-12.0, -1.2, 8.0)), // the sea bed
+            ],
+        );
+        let pools = 1u32 << (1 + CHUNK_POOLS);
+        assert_eq!(masks, vec![0b11, 0b10 | pools, 0b10, 0]);
+        assert_eq!(chunk_flags(&field, &shores, &[(Vec3::splat(100.0), Vec3::splat(101.0))]), vec![false]);
+        // An area whose ground dips under a sea at y = 0.6 (x < 6): soaked
+        // there, no puddle; as the weather has it above.
+        let (def, g, state) = &field.areas[0];
+        let (dry, wet) = (area_map(def, g, state, None), area_map(def, g, state, Some(0.6)));
+        let texel = |x: f32, z: f32| ((z + 8.0) / g.cell) as usize * g.nx + ((x - 4.0) / g.cell) as usize;
+        assert!(dry[texel(4.6, 0.0)][0] < 0.6 && wet[texel(4.6, 0.0)][0] == 1.0 && wet[texel(4.6, 0.0)][1] == 0.0);
+        assert_eq!(dry[texel(10.0, 0.0)], wet[texel(10.0, 0.0)]);
+        // The bowl holds water at its downhill end, and nowhere else does.
+        assert!(dry[texel(13.6, 4.0)][1] > 0.0 && dry.iter().filter(|t| t[1] > 0.0).count() < 30, "{}", dry[texel(13.6, 4.0)][1]);
+    }
 
     /// MEASUREMENT: each demo area's map at `WEATHER_TIME` (600 s), as a
     /// coarse picture and its coverage -- puddles (p), snow (s).

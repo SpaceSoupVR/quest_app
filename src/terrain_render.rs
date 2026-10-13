@@ -127,6 +127,55 @@ pub struct TerrainGeometry {
     chunk_ranges: Vec<(u32, u32)>,
     /// Player-frame bounds per chunk, rebuilt alongside `posed`.
     chunk_bounds: Vec<(Vec3, Vec3)>,
+    /// Per chunk, the vertices that can be its box's extremes at ANY turn of
+    /// the rig: its hull seen from above, and its lowest and highest. Found
+    /// once, on the first frame that wants them (`assemble_world`).
+    chunk_extremes: Vec<Vec<u32>>,
+}
+
+/// How far a chunk's box from its extremes is let out, metres: more than a
+/// turn's arithmetic can put another of its vertices past them.
+pub const CHUNK_BOX_SLACK: f32 = 1e-4;
+
+/// The points of `vertices` (by index, each once) that are corners of their
+/// hull seen from above (x, z), with the lowest and the highest: whatever the
+/// turn about the vertical, the box of these is the box of all.
+fn extremes_of(positions: &dyn Fn(u32) -> Vec3, vertices: &[u32]) -> Vec<u32> {
+    let mut ids: Vec<u32> = vertices.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() <= 3 {
+        return ids;
+    }
+    let key = |i: u32| {
+        let p = positions(i);
+        (p.x, p.z)
+    };
+    let mut by_x = ids.clone();
+    by_x.sort_by(|&a, &b| key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal));
+    let cross = |o: u32, a: u32, b: u32| {
+        let (o, a, b) = (key(o), key(a), key(b));
+        (a.0 as f64 - o.0 as f64) * (b.1 as f64 - o.1 as f64) - (a.1 as f64 - o.1 as f64) * (b.0 as f64 - o.0 as f64)
+    };
+    // Andrew's chain, keeping points ON an edge out.
+    let mut hull: Vec<u32> = Vec::new();
+    for pass in 0..2 {
+        let start = hull.len();
+        let order: Box<dyn Iterator<Item = &u32>> = if pass == 0 { Box::new(by_x.iter()) } else { Box::new(by_x.iter().rev()) };
+        for &i in order {
+            while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], i) <= 0.0 {
+                hull.pop();
+            }
+            hull.push(i);
+        }
+        hull.pop();
+    }
+    let by_height = |a: &&u32, b: &&u32| positions(**a).y.partial_cmp(&positions(**b).y).unwrap_or(std::cmp::Ordering::Equal);
+    hull.extend(ids.iter().min_by(by_height));
+    hull.extend(ids.iter().max_by(by_height));
+    hull.sort_unstable();
+    hull.dedup();
+    hull
 }
 
 impl TerrainGeometry {
@@ -188,6 +237,46 @@ impl TerrainGeometry {
             self.built_for = Some(key);
         }
         Some((&self.posed, &self.indices))
+    }
+
+    /// THE GROUND AS LOADED, IN THE WORLD, for a renderer that poses it
+    /// itself (`XrRenderer::ground_in_world`): no vertex is touched. Only
+    /// the chunks' boxes follow the rig into the player's frame, from each
+    /// chunk's few extreme vertices (`extremes_of`) and not from all of
+    /// them -- on a frame the rig moved, where [`Self::assemble`] re-posed
+    /// every vertex and walked every index.
+    pub fn assemble_world(&mut self, offset: Vec3, yaw_inv: Quat, player_yaw: f32) -> Option<(&[SolidVertex], &[u32])> {
+        if self.is_empty() {
+            return None;
+        }
+        if self.chunk_extremes.len() != self.chunk_ranges.len() {
+            let (vertices, indices) = (&self.vertices, &self.indices);
+            let position = |i: u32| Vec3::from(vertices[i as usize].position);
+            self.chunk_extremes = self
+                .chunk_ranges
+                .iter()
+                .map(|&(first, count)| extremes_of(&position, &indices[first as usize..(first + count) as usize]))
+                .collect();
+            self.built_for = None;
+        }
+        let key = (offset, player_yaw);
+        if self.built_for != Some(key) || self.chunk_bounds.len() != self.chunk_ranges.len() {
+            // The posed copy is not kept beside the world's.
+            self.posed = Vec::new();
+            self.chunk_bounds.clear();
+            for extremes in &self.chunk_extremes {
+                let mut lo = Vec3::splat(f32::INFINITY);
+                let mut hi = Vec3::splat(f32::NEG_INFINITY);
+                for &i in extremes {
+                    let p = yaw_inv * (Vec3::from(self.vertices[i as usize].position) - offset);
+                    lo = lo.min(p);
+                    hi = hi.max(p);
+                }
+                self.chunk_bounds.push((lo - Vec3::splat(CHUNK_BOX_SLACK), hi + Vec3::splat(CHUNK_BOX_SLACK)));
+            }
+            self.built_for = Some(key);
+        }
+        Some((&self.vertices, &self.indices))
     }
 
     /// The chunks a shadow pass may cull against a light's frustum.
@@ -267,6 +356,32 @@ impl TerrainGeometry {
         space_soup::renderer::ground_horizon::GroundOccluder::from_triangles(&positions, &self.indices, cells)
     }
 
+    /// The index runs of the chunks the ground hides from an eye at `eye` in
+    /// the WORLD, and the horizon itself for asking after anything else: what
+    /// the headset leaves out under `Levers::ground_horizon`, for the offline
+    /// frame to leave out too.
+    /// `caves`: the baked caves that plug the ground's holes
+    /// ([`plugging_caves`]), or none for the first rule alone.
+    pub fn behind_the_ground(
+        &self,
+        def: Option<&TerrainDef>,
+        eye: Vec3,
+        caves: &[(Vec3, Vec3)],
+    ) -> Option<(Vec<(u32, u32)>, space_soup::renderer::ground_horizon::GroundOccluder, space_soup::renderer::ground_horizon::Horizon)> {
+        use space_soup::renderer::ground_horizon::{Horizon, REACH};
+        let ground = self.ground_occluder(def)?;
+        let mut horizon = Horizon::new(&ground, eye, REACH, caves);
+        let bounds = self.chunk_world_bounds();
+        let runs = self
+            .chunk_ranges
+            .iter()
+            .zip(&bounds)
+            .filter(|(_, (_, (lo, hi)))| horizon.hides_ground(&ground, *lo, *hi))
+            .map(|(run, _)| *run)
+            .collect();
+        Some((runs, ground, horizon))
+    }
+
     pub fn caster_chunks(&self) -> Vec<space_soup::renderer::shadow::CasterChunk> {
         self.chunk_ranges
             .iter()
@@ -276,6 +391,32 @@ impl TerrainGeometry {
             })
             .collect()
     }
+}
+
+/// THE CAVES THAT PLUG THE GROUND'S HOLES, as WORLD boxes, for the horizon's
+/// second rule (`space_soup::renderer::ground_horizon`): every model of the
+/// scene that stands in for ground, when each is a baked cave -- a closed
+/// sheet joined to the ground along its mouths. Empty when any is of the
+/// older kind, whose edges were left open: then nothing is said of what lies
+/// under the ground. What the headset reads off the frame's own draws; here
+/// for the offline frame and the tests.
+pub fn plugging_caves(scene: &space_soup_engine::scene::Scene, game_dir: &std::path::Path) -> Vec<(Vec3, Vec3)> {
+    let mut boxes = Vec::new();
+    for obj in scene.objects.iter().filter(|o| !o.hidden && o.terrain_collider.is_some()) {
+        let Some(mesh) = &obj.mesh else { continue };
+        let Some(parts) = space_soup_engine::mesh_lightmap::load_mesh_parts(&game_dir.join(&mesh.path)) else { return Vec::new() };
+        if parts.iter().any(|p| p.authored.is_none()) {
+            return Vec::new();
+        }
+        let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+        for p in parts.iter().flat_map(|p| p.positions.iter()) {
+            let w = obj.cuboid.rotation * (Vec3::from(*p) * mesh.scale) + obj.cuboid.position;
+            lo = lo.min(w);
+            hi = hi.max(w);
+        }
+        boxes.push((lo, hi));
+    }
+    boxes
 }
 
 /// Reorder triangles so that spatially-near ones are adjacent in the buffer.
@@ -411,7 +552,9 @@ pub fn load(
     // comfortably smaller than the sun's box and larger than a small spot's
     // cone, so a 4 m lamp touches one or two chunks instead of all 32k
     // triangles.
-    let (indices, chunk_ranges) = chunk_indices(&vertices, &kept_indices, CHUNK_TARGET);
+    // (MEASUREMENT: another count from `debug.spacesoup.chunks`.)
+    let asked = space_soup::renderer::ground_horizon::CHUNKS_A_SIDE.load(std::sync::atomic::Ordering::Relaxed);
+    let (indices, chunk_ranges) = chunk_indices(&vertices, &kept_indices, if asked > 0 { asked } else { CHUNK_TARGET });
     log::info!(
         "terrain_render: {} caster chunks over {} triangles",
         chunk_ranges.len(),
@@ -424,6 +567,7 @@ pub fn load(
         built_for: None,
         chunk_ranges,
         chunk_bounds: Vec::new(),
+        chunk_extremes: Vec::new(),
     })
 }
 
@@ -599,6 +743,7 @@ mod player_frame_tests {
             built_for: None,
             chunk_ranges: Vec::new(),
             chunk_bounds: Vec::new(),
+            chunk_extremes: Vec::new(),
         }
     }
 
@@ -648,6 +793,61 @@ mod player_frame_tests {
         assert_eq!(n, [0.0, 1.0, 0.0]);
     }
 
+    /// Handed over in the world, no vertex is posed; and each chunk's box,
+    /// from its few extreme vertices, is the box of all its vertices posed --
+    /// at any turn and any place of the rig, let out by a hair and no more.
+    #[test]
+    fn a_chunks_box_from_its_extremes_is_the_box_of_all_its_vertices_at_any_turn() {
+        // A bumpy 24 x 24 patch in two chunks.
+        let n = 24u32;
+        let mut positions = Vec::new();
+        for z in 0..n {
+            for x in 0..n {
+                let h = ((x * 7 + z * 13) % 11) as f32 * 0.37 + (x as f32 * 0.9).sin() * 2.0;
+                positions.push([x as f32 * 1.5 - 9.0, h, z as f32 * 1.5 + 4.0]);
+            }
+        }
+        let mut indices = Vec::new();
+        for z in 0..n - 1 {
+            for x in 0..n - 1 {
+                let a = z * n + x;
+                indices.extend_from_slice(&[a, a + n, a + 1, a + 1, a + n, a + n + 1]);
+            }
+        }
+        let half = (indices.len() / 6 * 3) as u32;
+        let mut world = geometry(&positions);
+        world.indices = indices.clone();
+        world.chunk_ranges = vec![(0, half), (half, indices.len() as u32 - half)];
+        let mut posed = geometry(&positions);
+        posed.indices = indices.clone();
+        posed.chunk_ranges = world.chunk_ranges.clone();
+        for k in 0..200 {
+            let yaw = k as f32 * 0.173;
+            let offset = Vec3::new(k as f32 * 0.31 - 20.0, (k % 7) as f32 * 0.4, 3.0 - k as f32 * 0.11);
+            let yaw_inv = Quat::from_rotation_y(yaw).inverse();
+            let (v, i) = world.assemble_world(offset, yaw_inv, yaw).unwrap();
+            assert_eq!(v.len(), positions.len());
+            assert!(v.iter().zip(&positions).all(|(v, p)| v.position == *p), "a vertex was touched");
+            assert_eq!(i, &indices[..]);
+            posed.assemble(offset, yaw_inv, yaw).unwrap();
+            let (ours, exact) = (world.caster_chunks(), posed.caster_chunks());
+            assert_eq!(ours.len(), 2);
+            for (a, b) in ours.iter().zip(&exact) {
+                assert_eq!((a.first_index, a.index_count), (b.first_index, b.index_count));
+                assert!(a.min.cmple(b.min).all() && a.max.cmpge(b.max).all(), "turn {k}: a vertex outside its chunk's box");
+                assert!((b.min - a.min).max_element() <= 3.0 * CHUNK_BOX_SLACK && (a.max - b.max).max_element() <= 3.0 * CHUNK_BOX_SLACK, "turn {k}: the box is loose");
+            }
+        }
+        // Far fewer vertices than the chunk has.
+        assert!(world.chunk_extremes.iter().all(|e| e.len() >= 4 && e.len() < 80), "{:?}", world.chunk_extremes.iter().map(Vec::len).collect::<Vec<_>>());
+        // Standing still, nothing is done again.
+        let before = world.built_for;
+        world.assemble_world(Vec3::ONE, Quat::IDENTITY, 0.0);
+        world.assemble_world(Vec3::ONE, Quat::IDENTITY, 0.0);
+        assert_ne!(before, world.built_for);
+        assert!(world.posed.is_empty());
+    }
+
     #[test]
     fn standing_still_reuses_the_previous_build() {
         // 16k vertices rebuilt every frame would be real cost for no change.
@@ -668,6 +868,7 @@ mod player_frame_tests {
             built_for: None,
             chunk_ranges: Vec::new(),
             chunk_bounds: Vec::new(),
+            chunk_extremes: Vec::new(),
         };
         assert!(g.assemble(Vec3::ZERO, Quat::IDENTITY, 0.0).is_none());
     }
@@ -1007,16 +1208,21 @@ pub(crate) mod horizon_tests {
     use super::*;
     use space_soup::renderer::ground_horizon::{GroundOccluder, Horizon, REACH};
 
-    /// The shipped level's ground as the headset draws it, and its triangles
-    /// by the heightfield cell they lie over, for asking one ray at a time.
+    /// The shipped level's ground as the headset draws it and its baked caves'
+    /// rock, each by the heightfield cell its triangles lie over, for asking
+    /// one ray at a time.
     pub struct Level {
         pub geometry: TerrainGeometry,
         pub occluder: GroundOccluder,
         pub chunks: Vec<(u32, u32, (Vec3, Vec3))>,
+        /// The caves that plug the ground's holes, and their triangles.
+        pub caves: Vec<(Vec3, Vec3)>,
+        rock: Vec<[Vec3; 3]>,
         lo: glam::Vec2,
         cell: glam::Vec2,
         n: [u32; 2],
         cells: Vec<Vec<u32>>,
+        rock_cells: Vec<Vec<u32>>,
     }
 
     pub fn level() -> Option<Level> {
@@ -1028,36 +1234,52 @@ pub(crate) mod horizon_tests {
         let occluder = geometry.ground_occluder(Some(def))?;
         let bounds = geometry.chunk_world_bounds();
         let chunks = geometry.chunk_ranges.iter().zip(&bounds).map(|(&(first, count), &(_, b))| (first, count, b)).collect();
+        let caves = plugging_caves(&scene, &game);
+        let mut rock = Vec::new();
+        for obj in scene.objects.iter().filter(|o| !o.hidden && o.terrain_collider.is_some()) {
+            let Some(mesh) = &obj.mesh else { continue };
+            for part in space_soup_engine::mesh_lightmap::load_mesh_parts(&game.join(&mesh.path)).unwrap_or_default() {
+                let at = |i: u32| obj.cuboid.rotation * (Vec3::from(part.positions[i as usize]) * mesh.scale) + obj.cuboid.position;
+                rock.extend(part.indices.chunks_exact(3).map(|t| [at(t[0]), at(t[1]), at(t[2])]));
+            }
+        }
         let (lo3, hi3) = geometry.world_bounds();
         let n = [256u32, 256];
         let lo = glam::Vec2::new(lo3.x, lo3.z);
         let cell = (glam::Vec2::new(hi3.x, hi3.z) - lo) / glam::Vec2::new(n[0] as f32, n[1] as f32);
-        let mut cells = vec![Vec::new(); (n[0] * n[1]) as usize];
-        for (t, tri) in geometry.indices.chunks_exact(3).enumerate() {
-            let p = [0, 1, 2].map(|k| Vec3::from(geometry.vertices[tri[k] as usize].position));
-            let (a, b) = (p[0].min(p[1]).min(p[2]), p[0].max(p[1]).max(p[2]));
-            let at = |v: f32, o: f32, c: f32, n: u32| (((v - o) / c - 1e-3).floor().max(0.0) as u32).min(n - 1);
-            let at_hi = |v: f32, o: f32, c: f32, n: u32| (((v - o) / c + 1e-3).floor().max(0.0) as u32).min(n - 1);
-            for iz in at(a.z, lo.y, cell.y, n[1])..=at_hi(b.z, lo.y, cell.y, n[1]) {
-                for ix in at(a.x, lo.x, cell.x, n[0])..=at_hi(b.x, lo.x, cell.x, n[0]) {
-                    cells[(iz * n[0] + ix) as usize].push(t as u32);
+        let bucket = |tris: &mut dyn Iterator<Item = [Vec3; 3]>| {
+            let mut cells = vec![Vec::new(); (n[0] * n[1]) as usize];
+            for (t, p) in tris.enumerate() {
+                let (a, b) = (p[0].min(p[1]).min(p[2]), p[0].max(p[1]).max(p[2]));
+                let at = |v: f32, o: f32, c: f32, n: u32, pad: f32| (((v - o) / c + pad).floor().max(0.0) as u32).min(n - 1);
+                for iz in at(a.z, lo.y, cell.y, n[1], -1e-3)..=at(b.z, lo.y, cell.y, n[1], 1e-3) {
+                    for ix in at(a.x, lo.x, cell.x, n[0], -1e-3)..=at(b.x, lo.x, cell.x, n[0], 1e-3) {
+                        cells[(iz * n[0] + ix) as usize].push(t as u32);
+                    }
                 }
             }
-        }
-        Some(Level { geometry, occluder, chunks, lo, cell, n, cells })
+            cells
+        };
+        let cells = bucket(&mut geometry.indices.chunks_exact(3).map(|tri| [0, 1, 2].map(|k| Vec3::from(geometry.vertices[tri[k] as usize].position))));
+        let rock_cells = bucket(&mut rock.iter().copied());
+        Some(Level { geometry, occluder, chunks, caves, rock, lo, cell, n, cells, rock_cells })
     }
 
     impl Level {
+        fn triangle(&self, t: u32) -> [Vec3; 3] {
+            let tri = &self.geometry.indices[t as usize * 3..t as usize * 3 + 3];
+            [0, 1, 2].map(|k| Vec3::from(self.geometry.vertices[tri[k] as usize].position))
+        }
+
         /// Whether the sight line from `eye` to `to` goes through the upper
-        /// side of a drawn triangle before it arrives.
-        pub fn blocked(&self, eye: Vec3, to: Vec3) -> bool {
+        /// side of a drawn triangle of the ground before it arrives -- or,
+        /// with `rock`, through the caves' rock from either side.
+        pub fn blocked(&self, eye: Vec3, to: Vec3, rock: bool) -> bool {
             let dir = to - eye;
-            let hit = |t: u32| {
-                let tri = &self.geometry.indices[t as usize * 3..t as usize * 3 + 3];
-                let [a, b, c] = [0, 1, 2].map(|k| Vec3::from(self.geometry.vertices[tri[k] as usize].position));
+            let hit = |[a, b, c]: [Vec3; 3], both_sides: bool| {
                 let n = (b - a).cross(c - a);
                 let facing = n.dot(dir);
-                if facing >= 0.0 {
+                if if both_sides { facing.abs() < 1e-12 } else { facing >= 0.0 } {
                     return false;
                 }
                 let s = n.dot(a - eye) / facing;
@@ -1065,7 +1287,10 @@ pub(crate) mod horizon_tests {
                     return false;
                 }
                 let p = eye + dir * s;
-                let inside = |u: Vec3, v: Vec3| (v - u).cross(p - u).dot(n) >= 0.0;
+                // A tenth of a millimetre over each edge: a line that meets
+                // the shared edge of two triangles must not slip between
+                // them, as it cannot between their pixels.
+                let inside = |u: Vec3, v: Vec3| (v - u).cross(p - u).dot(n) >= -1e-4 * (v - u).length() * n.length();
                 inside(a, b) && inside(b, c) && inside(c, a)
             };
             // Every cell the line passes over, a cell at a time.
@@ -1087,7 +1312,11 @@ pub(crate) mod horizon_tests {
                         }
                         last = c;
                     }
-                    if self.cells[(c.1 * self.n[0] + c.0) as usize].iter().any(|&t| hit(t)) {
+                    let k = (c.1 * self.n[0] + c.0) as usize;
+                    if self.cells[k].iter().any(|&t| hit(self.triangle(t), false)) {
+                        return true;
+                    }
+                    if rock && self.rock_cells[k].iter().any(|&t| hit(self.rock[t as usize], true)) {
                         return true;
                     }
                 }
@@ -1095,27 +1324,34 @@ pub(crate) mod horizon_tests {
             false
         }
 
-        /// The chunks the horizon at `eye` hides, and the first point of one
-        /// that an eye within its reach sees after all.
-        pub fn hidden_from(&self, eye: Vec3, every: usize) -> (Vec<usize>, Option<(Vec3, Vec3)>) {
-            let mut h = Horizon::new(&self.occluder, eye, REACH);
+        /// The chunks the horizon at `eye` hides, and the first place on one
+        /// that an eye within its reach sees after all: of each chunk called
+        /// hidden, one triangle in `every` that faces the eye asked from, at
+        /// its middle. `caves`: the second rule too.
+        pub fn hidden_from(&self, eye: Vec3, every: usize, caves: bool) -> (Vec<usize>, Option<(Vec3, Vec3)>, bool) {
+            let boxes: &[(Vec3, Vec3)] = if caves { &self.caves } else { &[] };
+            let mut h = Horizon::new(&self.occluder, eye, REACH, boxes);
             let mut hidden = Vec::new();
             let mut seen = None;
+            let eyes = [eye, eye + Vec3::X * REACH, eye - Vec3::X * REACH, eye + Vec3::Y * REACH, eye - Vec3::Y * REACH, eye + Vec3::Z * REACH, eye - Vec3::Z * REACH];
             for (k, &(first, count, (lo, hi))) in self.chunks.iter().enumerate() {
-                if !h.hides(&self.occluder, lo, hi) {
+                if !h.hides_ground(&self.occluder, lo, hi) {
                     continue;
                 }
                 hidden.push(k);
-                let eyes = [eye, eye + Vec3::X * REACH, eye - Vec3::X * REACH, eye + Vec3::Y * REACH, eye - Vec3::Y * REACH, eye + Vec3::Z * REACH, eye - Vec3::Z * REACH];
-                for (j, &i) in self.geometry.indices[first as usize..(first + count) as usize].iter().enumerate().step_by(every) {
-                    let to = Vec3::from(self.geometry.vertices[i as usize].position);
-                    let from = eyes[j / every % eyes.len()];
-                    if seen.is_none() && !self.blocked(from, to) {
-                        seen = Some((from, to));
+                for t in (first / 3..(first + count) / 3).skip(k % every).step_by(every) {
+                    let c = self.triangle(t);
+                    let mid = (c[0] + c[1] + c[2]) / 3.0;
+                    let from = eyes[t as usize % eyes.len()];
+                    if (c[1] - c[0]).cross(c[2] - c[0]).dot(from - mid) <= 0.0 {
+                        continue;
+                    }
+                    if seen.is_none() && !self.blocked(from, mid, h.plugged()) {
+                        seen = Some((from, mid));
                     }
                 }
             }
-            (hidden, seen)
+            (hidden, seen, h.plugged())
         }
     }
 
@@ -1140,17 +1376,25 @@ pub(crate) mod horizon_tests {
         // the buildings' floors are not.
         let cells = 256 * 256;
         assert!(level.occluder.solid_cells > cells * 9 / 10 && level.occluder.solid_cells < cells, "{} of {cells} cells are ground", level.occluder.solid_cells);
-        // The fixture: the cave is open from end to end, and its hill is not.
-        assert!(!level.blocked(Vec3::new(19.6, 1.0, 33.3), Vec3::new(26.0, 1.2, 33.5)), "the cave's chamber sees its back passage");
-        assert!(level.blocked(Vec3::new(0.0, 1.7, 24.0), Vec3::new(40.0, 1.0, 60.0)) || level.blocked(Vec3::new(35.5, 2.0, 35.5), Vec3::new(-17.0, 0.5, 0.0)), "no hill stands between the bench's views");
+        // The fixture: the cave is open from end to end, to the ground's own
+        // triangles and to its rock's; its hill is not; and the level's cave
+        // is a baked one, which plugs the ground's holes.
+        let (chamber, back) = (Vec3::new(19.6, 1.0, 33.3), Vec3::new(26.0, 1.2, 33.5));
+        assert!(!level.blocked(chamber, back, true), "the cave's chamber sees its back passage");
+        assert!(level.blocked(chamber, Vec3::new(19.6, 30.0, 33.3), true) && !level.blocked(chamber, Vec3::new(19.6, 30.0, 33.3), false), "the cave's roof is its rock, not the ground's upper side");
+        assert!(level.blocked(Vec3::new(35.5, 2.0, 35.5), Vec3::new(-17.0, 0.5, 0.0), false) || level.blocked(Vec3::new(0.0, 1.7, 24.0), Vec3::new(40.0, 1.0, 60.0), false), "no hill stands between the bench's views");
+        assert_eq!(level.caves.len(), 1, "test_room's cave is a baked one");
     }
 
-    /// NOTHING THE HORIZON HIDES CAN BE SEEN, from the bench's viewpoints, from
-    /// a walk through the cave and out of both its mouths (every vertex of
-    /// every hidden chunk there), and from a grid of places over the level:
-    /// each vertex of a chunk called hidden is asked of the drawn triangles
-    /// from eyes across the horizon's reach. And the horizon does hide ground
-    /// in the views it was built for.
+    /// NO GROUND THE HORIZON HIDES CAN BE SEEN, from the bench's viewpoints,
+    /// from a walk through the cave and out of both its mouths, and from a
+    /// grid of places over the level, standing and crouched -- under the
+    /// first rule (the ground's own upper side) asked of the ground's
+    /// triangles alone, and under both (the caves' rock too) asked of the
+    /// ground and the rock: of every chunk called hidden, the triangles that
+    /// face an eye within the horizon's reach are asked ray by ray. And the
+    /// rules do hide ground in the views they were built for, and never all
+    /// of it from inside the cave, whose mouths show some.
     #[test]
     fn nothing_the_horizon_hides_in_the_shipped_level_can_be_seen() {
         let Some(level) = level() else { return };
@@ -1159,38 +1403,144 @@ pub(crate) mod horizon_tests {
             let scene = space_soup_engine::scene::Scene::load(&game.join("scenes/test_room.json")).unwrap();
             space_soup_engine::terrain::load(scene.terrain.as_ref().unwrap(), &game).unwrap()
         };
-        let mut eyes: Vec<(String, Vec3, usize)> = bench_eyes().into_iter().map(|(n, e, _)| (n, e, 3)).collect();
-        eyes.extend(cave_walk().into_iter().enumerate().map(|(i, e)| (format!("cave walk {i}"), e, 1)));
+        let mut eyes: Vec<(String, Vec3, usize)> = bench_eyes().into_iter().map(|(n, e, _)| (n, e, 5)).collect();
+        eyes.extend(cave_walk().into_iter().enumerate().map(|(i, e)| (format!("cave walk {i}"), e, 3)));
         for iz in 0..12 {
             for ix in 0..12 {
                 let (x, z) = (-50.0 + ix as f32 * 9.1, -50.0 + iz as f32 * 9.1);
                 if let Some(y) = source.height_at(x, z) {
-                    eyes.push((format!("grid {ix},{iz}"), Vec3::new(x, y + 1.6, z), 5));
-                    eyes.push((format!("grid {ix},{iz} crouched"), Vec3::new(x, y + 0.6, z), 7));
+                    eyes.push((format!("grid {ix},{iz}"), Vec3::new(x, y + 1.6, z), 13));
+                    eyes.push((format!("grid {ix},{iz} crouched"), Vec3::new(x, y + 0.6, z), 17));
                 }
             }
         }
-        let mut hidden_by: std::collections::HashMap<String, usize> = Default::default();
+        let mut hidden_by: std::collections::HashMap<String, (usize, usize)> = Default::default();
         for (name, eye, every) in &eyes {
-            let (hidden, seen) = level.hidden_from(*eye, *every);
-            assert!(seen.is_none(), "{name}: from {:?} the vertex at {:?} of a chunk called hidden is seen", seen.unwrap().0, seen.unwrap().1);
-            hidden_by.insert(name.clone(), hidden.len());
+            let (first, seen, _) = level.hidden_from(*eye, *every, false);
+            assert!(seen.is_none(), "{name}, the first rule: from {:?} the ground at {:?}, of a chunk called hidden, is seen", seen.unwrap().0, seen.unwrap().1);
+            let (both, seen, plugged) = level.hidden_from(*eye, *every, true);
+            assert!(seen.is_none(), "{name}, both rules: from {:?} the ground at {:?}, of a chunk called hidden, is seen", seen.unwrap().0, seen.unwrap().1);
+            assert!(first.iter().all(|k| both.contains(k)), "{name}: the second rule shows what the first hides");
+            assert!(plugged || both == first, "{name}: the second rule spoke for an eye it does not cover");
+            assert!(both.len() < level.chunks.len(), "{name}: every chunk hidden");
+            hidden_by.insert(name.clone(), (first.len(), both.len()));
         }
-        assert!(hidden_by["cave_back_out"] >= 8, "cave_back_out hides {} chunks", hidden_by["cave_back_out"]);
-        let total: usize = hidden_by.values().sum();
+        let of = |name: &str| hidden_by[name];
+        eprintln!("chunks hidden, first rule and both: cave_back_out {:?}, cave_mouth {:?}, cave_chamber {:?}, cave_back_exit {:?}, outdoors_field {:?}", of("cave_back_out"), of("cave_mouth"), of("cave_chamber"), of("cave_back_exit"), of("outdoors_field"));
+        assert!(of("cave_back_out").0 >= 8 && of("cave_back_out").1 > of("cave_back_out").0, "cave_back_out hides {:?} chunks", of("cave_back_out"));
+        assert!(of("cave_chamber").0 == 0 && of("cave_chamber").1 >= 15, "from inside the cave {:?} chunks are hidden", of("cave_chamber"));
+        let total: usize = hidden_by.values().map(|h| h.1).sum();
         assert!(total > eyes.len() * 4, "{total} chunks hidden over {} eyes: the test proves little", eyes.len());
+    }
+
+    /// DIAGNOSTIC: what the sight lines through given pixels of a bench view's
+    /// offline picture (1445 x 1546, 104 degrees) meet first, sample by
+    /// sample: for a pixel that `HORIZON=1` changes, whether a triangle of a
+    /// chunk called hidden is the first thing a sample's line meets.
+    /// `VIEW=pond PIXELS=779,740;331,687 cargo test --release horizon_pixels -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn horizon_pixels() {
+        let Some(level) = level() else { return };
+        let name = std::env::var("VIEW").unwrap_or_else(|_| "pond".into());
+        let (_, eye, at) = bench_eyes().into_iter().find(|(n, _, _)| *n == name).expect("a bench view");
+        let (w, h) = (1445.0f32, 1546.0f32);
+        let clip = glam::Mat4::perspective_rh(104f32.to_radians(), w / h, 0.03, 1000.0) * glam::Mat4::look_at_rh(eye, at, Vec3::Y);
+        let inv = clip.inverse();
+        let mut horizon = Horizon::new(&level.occluder, eye, REACH, &level.caves);
+        let hidden: Vec<bool> = level.chunks.iter().map(|&(_, _, (lo, hi))| horizon.hides_ground(&level.occluder, lo, hi)).collect();
+        println!("{name}: {} chunk(s) hidden: {:?}", hidden.iter().filter(|h| **h).count(), hidden.iter().enumerate().filter(|(_, h)| **h).map(|(k, _)| k).collect::<Vec<_>>());
+        let chunk_of = |t: u32| level.chunks.iter().position(|&(first, count, _)| t * 3 >= first && t * 3 < first + count).unwrap();
+        // `RECT=x0,y0,x1,y1`: every sample of every pixel of a rectangle whose
+        // line meets the upper side of a hidden chunk's triangle before
+        // anything else of the ground.
+        if let Ok(rect) = std::env::var("RECT") {
+            let r: Vec<f32> = rect.split(',').map(|n| n.trim().parse().unwrap()).collect();
+            let meet = |dir: Vec3, t: u32| -> Option<(f32, bool)> {
+                let [a, b, c] = level.triangle(t);
+                let (e1, e2) = (b - a, c - a);
+                let p = dir.cross(e2);
+                let det = e1.dot(p);
+                if det.abs() < 1e-12 {
+                    return None;
+                }
+                let s = eye - a;
+                let u = s.dot(p) / det;
+                let q = s.cross(e1);
+                let v = dir.dot(q) / det;
+                let at_t = e2.dot(q) / det;
+                (u >= -1e-5 && v >= -1e-5 && u + v <= 1.0 + 1e-5 && at_t > 0.03).then_some((at_t, e1.cross(e2).dot(dir) < 0.0))
+            };
+            let hidden_tris: Vec<u32> = level.chunks.iter().zip(&hidden).filter(|(_, h)| **h).flat_map(|(&(first, count, _), _)| first / 3..(first + count) / 3).collect();
+            let all = level.geometry.indices.len() as u32 / 3;
+            let (mut rays, mut seen) = (0u32, 0u32);
+            for y in r[1] as u32..=r[3] as u32 {
+                for x in r[0] as u32..=r[2] as u32 {
+                    for (sx, sy) in [(0.5, 0.5), (0.375, 0.125), (0.875, 0.375), (0.125, 0.625), (0.625, 0.875)] {
+                        let ndc = glam::Vec2::new((x as f32 + sx) / w * 2.0 - 1.0, 1.0 - (y as f32 + sy) / h * 2.0);
+                        let dir = (inv.project_point3(Vec3::new(ndc.x, ndc.y, 1.0)) - eye).normalize();
+                        rays += 1;
+                        let Some((near, tri)) = hidden_tris.iter().filter_map(|&t| meet(dir, t).filter(|m| m.1).map(|m| (m.0, t))).min_by(|a, b| a.0.total_cmp(&b.0)) else { continue };
+                        let nearer = (0..all).filter_map(|t| meet(dir, t)).any(|m| m.0 < near - 1e-3);
+                        if !nearer {
+                            seen += 1;
+                            if seen <= 12 {
+                                println!("  SEEN: pixel {x},{y} sample ({sx}, {sy}) meets hidden chunk {} at {near:.2} m first", chunk_of(tri));
+                            }
+                        }
+                    }
+                }
+            }
+            println!("{name}: {seen} of {rays} sample lines in {rect} meet a hidden chunk first");
+        }
+        let pixels = std::env::var("PIXELS").unwrap_or_default();
+        for px in pixels.split(';').filter(|p| !p.is_empty()) {
+            let xy: Vec<f32> = px.split(',').map(|n| n.trim().parse().unwrap()).collect();
+            for (sx, sy) in [(0.5, 0.5), (0.375, 0.125), (0.875, 0.375), (0.125, 0.625), (0.625, 0.875)] {
+                let ndc = glam::Vec2::new((xy[0] + sx) / w * 2.0 - 1.0, 1.0 - (xy[1] + sy) / h * 2.0);
+                let far = inv.project_point3(Vec3::new(ndc.x, ndc.y, 1.0));
+                let dir = (far - eye).normalize();
+                // Every triangle the line meets, nearest first.
+                let mut hits: Vec<(f32, u32, bool)> = Vec::new();
+                for t in 0..level.geometry.indices.len() as u32 / 3 {
+                    let [a, b, c] = level.triangle(t);
+                    let (e1, e2) = (b - a, c - a);
+                    let p = dir.cross(e2);
+                    let det = e1.dot(p);
+                    if det.abs() < 1e-12 {
+                        continue;
+                    }
+                    let s = eye - a;
+                    let u = s.dot(p) / det;
+                    let q = s.cross(e1);
+                    let v = dir.dot(q) / det;
+                    let at_t = e2.dot(q) / det;
+                    if u >= -1e-5 && v >= -1e-5 && u + v <= 1.0 + 1e-5 && at_t > 0.03 {
+                        hits.push((at_t, t, e1.cross(e2).dot(dir) < 0.0));
+                    }
+                }
+                hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let line: Vec<String> = hits
+                    .iter()
+                    .take(5)
+                    .map(|&(t, tri, front)| format!("{t:.2} m chunk {}{}{}", chunk_of(tri), if hidden[chunk_of(tri)] { " HIDDEN" } else { "" }, if front { "" } else { " (back)" }))
+                    .collect();
+                println!("  pixel {px} sample ({sx}, {sy}): {}", if line.is_empty() { "nothing".to_string() } else { line.join(" | ") });
+            }
+        }
     }
 
     /// DIAGNOSTIC: what the horizon takes out of each bench view -- the share
     /// of the ground's indices in the view's frustum that it hides by whole
-    /// chunk, and what hiding each chunk's quarters or sixteenths would add.
+    /// chunk under the first rule and under both, and what hiding each
+    /// chunk's quarters or sixteenths, or each triangle, would add to both.
     /// `cargo test --release horizon_census -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn horizon_census() {
         let Some(level) = level() else { return };
         let only = std::env::var("ONLY").ok();
-        println!("{:<20} {:>9} {:>8} {:>8} {:>8} {:>8} {:>7}", "view", "in view", "chunk", "1/4", "1/16", "tri", "sectors");
+        println!("{:<20} {:>9} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7}", "view", "in view", "rule 1", "both", "+1/4", "+1/16", "+tri", "sectors");
         for (name, eye, at) in bench_eyes() {
             if only.as_ref().is_some_and(|o| !o.split(',').any(|n| n == name)) {
                 continue;
@@ -1198,26 +1548,28 @@ pub(crate) mod horizon_tests {
             let view = glam::Mat4::look_at_rh(eye, at, Vec3::Y);
             let proj = glam::Mat4::perspective_rh(105f32.to_radians(), 0.93, 0.03, 1000.0);
             let planes = space_soup::renderer::shadow::frustum_planes(proj * view);
-            let mut h = Horizon::new(&level.occluder, eye, REACH);
-            let (mut in_view, mut by_chunk) = (0u32, 0u32);
+            let mut first = Horizon::new(&level.occluder, eye, REACH, &[]);
+            let mut h = Horizon::new(&level.occluder, eye, REACH, &level.caves);
+            let (mut in_view, mut by_first, mut by_chunk) = (0u32, 0u32, 0u32);
             let mut by_part = [0u32; 3];
-            for &(first, count, (lo, hi)) in &level.chunks {
+            for &(first_index, count, (lo, hi)) in &level.chunks {
                 if !space_soup::renderer::shadow::aabb_in_frustum(&planes, lo, hi) {
                     continue;
                 }
                 in_view += count;
-                if h.hides(&level.occluder, lo, hi) {
+                by_first += if first.hides_ground(&level.occluder, lo, hi) { count } else { 0 };
+                if h.hides_ground(&level.occluder, lo, hi) {
                     by_chunk += count;
                     continue;
                 }
                 // Its triangles by quarter, by sixteenth, and one by one.
                 for (slot, parts) in [(0usize, 2u32), (1, 4), (2, 0)] {
                     let mut boxes: std::collections::HashMap<(u32, u32), (Vec3, Vec3, u32)> = Default::default();
-                    for (t, tri) in level.geometry.indices[first as usize..(first + count) as usize].chunks_exact(3).enumerate() {
-                        let p = [0, 1, 2].map(|k| Vec3::from(level.geometry.vertices[tri[k] as usize].position));
+                    for t in first_index / 3..(first_index + count) / 3 {
+                        let p = level.triangle(t);
                         let c = (p[0] + p[1] + p[2]) / 3.0;
                         let key = if parts == 0 {
-                            (t as u32, 0)
+                            (t, 0)
                         } else {
                             let f = ((c - lo) / (hi - lo).max(Vec3::splat(1e-6)) * parts as f32).min(Vec3::splat(parts as f32 - 1.0));
                             (f.x as u32, f.z as u32)
@@ -1228,34 +1580,14 @@ pub(crate) mod horizon_tests {
                         e.2 += 3;
                     }
                     for (blo, bhi, n) in boxes.into_values() {
-                        if space_soup::renderer::shadow::aabb_in_frustum(&planes, blo, bhi) {
-                            if h.hides(&level.occluder, blo, bhi) {
-                                by_part[slot] += n;
-                            }
-                        } else {
-                            // Out of the view: a finer frustum test's, not the horizon's.
+                        // (Out of the view: a finer frustum test's, not the horizon's.)
+                        if space_soup::renderer::shadow::aabb_in_frustum(&planes, blo, bhi) && h.hides_ground(&level.occluder, blo, bhi) {
+                            by_part[slot] += n;
                         }
                     }
                 }
             }
-            println!("{name:<20} {in_view:>9} {by_chunk:>8} {:>8} {:>8} {:>8} {:>7}", by_part[0], by_part[1], by_part[2], h.walked);
-        }
-    }
-}
-#[cfg(test)]
-mod horizon_debug {
-    use super::*;
-    #[test]
-    #[ignore]
-    fn debug_line() {
-        let level = horizon_tests::level().unwrap();
-        let game = crate::offline_frame::offline_game_dir();
-        let scene = space_soup_engine::scene::Scene::load(&game.join("scenes/test_room.json")).unwrap();
-        let source = space_soup_engine::terrain::load(scene.terrain.as_ref().unwrap(), &game).unwrap();
-        let (eye, to) = (Vec3::new(0.0, -2.4, 45.0), Vec3::new(0.0, -9.599604, -55.0));
-        for i in 0..=50 {
-            let p = eye.lerp(to, i as f32 / 50.0);
-            println!("z {:7.2} ray y {:7.2} ground {:?} blocked-to-here {}", p.z, p.y, source.height_at(p.x, p.z), level.blocked(eye, p));
+            println!("{name:<20} {in_view:>9} {by_first:>8} {by_chunk:>8} {:>8} {:>8} {:>8} {:>7} {} {}", by_part[0], by_part[1], by_part[2], h.walked, if h.plugged() { "plugged" } else { "" }, if level.caves.iter().any(|(lo, hi)| eye.cmpge(*lo).all() && eye.cmple(*hi).all()) { "in a cave's box" } else { "" });
         }
     }
 }
