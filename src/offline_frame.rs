@@ -958,10 +958,13 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         }
         _ => None,
     };
-    // A SPLASH to look at: `SPLASH=x,y,z,speed,size,age[,depth]` (world;
-    // seconds since it struck at the effects' and the water's clock; the
-    // still water's depth there), in full sun, lifted by the swash as
-    // `XrRenderer::add_splash` lifts it.
+    // SPLASHES to look at: `SPLASH=x,y,z,vx,vy,vz,size,mass,age[,depth]`
+    // (world; the velocity of what struck, m/s; the radius of its
+    // cross-section, metres; its mass, kg; seconds since it struck at the
+    // effects' and the water's clock; the still water's depth there),
+    // several with `;` between them, oldest first: in full sun, lifted by
+    // the swash and joined to those before it as `XrRenderer::add_splash`
+    // does both.
     let swash_uniforms: Vec<_> = if std::env::var("SPLASH").is_ok() {
         let source = scene.terrain.as_ref().and_then(|def| space_soup_engine::terrain::load(def, &game).ok());
         crate::water_render::build(&scene.water, source.as_deref()).into_iter().map(|b| (b.uniform, b.waves.loop_seconds)).collect()
@@ -969,20 +972,26 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         Vec::new()
     };
     let splash_at = |time: f64| -> Vec<space_soup::renderer::effects::Splash> {
+        use space_soup::renderer::effects::{strike, Splash};
         let Ok(v) = std::env::var("SPLASH") else { return Vec::new() };
-        let n: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-        if n.len() < 6 {
-            eprintln!("offline frame: SPLASH wants x,y,z,speed,size,age; got {v}");
-            return Vec::new();
+        let mut live: Vec<Splash> = Vec::new();
+        for (k, one) in v.split(';').enumerate() {
+            let n: Vec<f32> = one.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if n.len() < 9 {
+                eprintln!("offline frame: SPLASH wants x,y,z,vx,vy,vz,size,mass,age; got {one}");
+                continue;
+            }
+            let depth = n.get(9).copied().unwrap_or(0.0);
+            let mut position = Vec3::new(n[0], n[1], n[2]);
+            let born = time - n[8] as f64;
+            if let Some((mut u, loop_seconds)) = swash_uniforms.iter().copied().find(|(u, _)| (u.extinction[3] - position.y).abs() < 0.05) {
+                u.set_time(born, loop_seconds);
+                position.y += space_soup::renderer::water_pipeline::swash_lift(&u, depth, glam::Vec2::new(position.x, position.z));
+            }
+            let splash = Splash { depth, seed: 7 + 0x9e37 * k as u64, ..Splash::new(position, born, Vec3::new(n[3], n[4], n[5]), n[6], n[7]) };
+            strike(&mut live, splash, 48);
         }
-        let depth = n.get(6).copied().unwrap_or(0.0);
-        let mut position = Vec3::new(n[0], n[1], n[2]);
-        let born = time - n[5] as f64;
-        if let Some((mut u, loop_seconds)) = swash_uniforms.iter().copied().find(|(u, _)| (u.extinction[3] - position.y).abs() < 0.05) {
-            u.set_time(born, loop_seconds);
-            position.y += space_soup::renderer::water_pipeline::swash_lift(&u, depth, glam::Vec2::new(position.x, position.z));
-        }
-        vec![space_soup::renderer::effects::Splash { position, born, speed: n[3], size: n[4], sunlit: 1.0, depth, seed: 7 }]
+        live
     };
     // THE EFFECTS, simulated, lit and uploaded as the headset's frame does it.
     let effects = {
@@ -1052,7 +1061,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                 .map(|mut b| {
                     let waves = space_soup::renderer::water_waves::WaveField::new(&device, &queue, b.waves);
                     b.uniform.set_time(time, b.waves.loop_seconds);
-                    b.uniform.rings = space_soup::renderer::effects::splash_rings(&splash_at(time), time, view.eye);
+                    b.uniform.set_rings(&space_soup::renderer::effects::splash_rings(&splash_at(time), time, view.eye));
                     let buffer = |label, contents: &[u8], usage| {
                         device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents, usage })
                     };
@@ -1383,8 +1392,10 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         // The falling rain and snow last, lit by the ground's baked sky and sun.
         if let (Some((pipeline, counts)), Some((_, maps, _)), Some(t)) = (&weather_particles, &weather, &terrain) {
             pipeline.draw(&mut pass, &uniforms.bind_group, &t.material.bind_group, &maps.bind_group, *counts);
-            // And the areas' columns seen from afar, ended by the probe pass's depth.
-            if let Some((_, target, _)) = &probe_pass {
+            // And the areas' columns seen from afar, ended by the probe pass's
+            // depth. `NO_VEILS=1` leaves them out (the particles stay), to
+            // tell what the columns draw from what the ground's twins do.
+            if let (Some((_, target, _)), false) = (&probe_pass, std::env::var("NO_VEILS").as_deref() == Ok("1")) {
                 pipeline.draw_veils(&mut pass, &uniforms.bind_group, &t.material.bind_group, &maps.bind_group, &target.bind_group);
             }
         }
@@ -1799,6 +1810,19 @@ fn offline_terrain(
     use space_soup::renderer::terrain_pipeline::{self as tp, TerrainImage, TerrainPipeline};
     use wgpu::util::DeviceExt;
     let (mut geometry, splat) = crate::load_scene_terrain(game, scene_name)?;
+    // `SHEER_ROCK=0`: the painted map as painted, without bare rock on sheer
+    // ground (`SplatMap::bare_rock_on_sheer_ground`) -- the picture before
+    // 2026-10-08, to set beside the one the headset now draws.
+    let splat = if std::env::var("SHEER_ROCK").as_deref() == Ok("0") {
+        space_soup_engine::scene::Scene::load(&space_soup_engine::Manifest::scene_path(game, scene_name))
+            .ok()
+            .and_then(|s| s.terrain)
+            .and_then(|def| space_soup_engine::terrain::load_splat(&def, game).ok().flatten())
+            .map(|map| TerrainImage { width: map.resolution()[0], height: map.resolution()[1], rgba: map.as_bytes().to_vec() })
+            .or(splat)
+    } else {
+        splat
+    };
     let image = |m: &space_soup_engine::lightmaps::LoadedLightmap| TerrainImage {
         width: m.width,
         height: m.height,

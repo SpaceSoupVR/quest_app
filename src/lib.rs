@@ -1138,7 +1138,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             let surface = |x: f32, z: f32| physics.water_depth_at(x, z, 0.0);
             let sun = renderer.sun_toward();
             let sunlit = |p: Vec3| sun.map_or(0.0, |d| if physics.raycast(p, d, 300.0).is_some() { 0.0 } else { 1.0 });
-            let things = live_objects.by_id.iter().map(|(id, c)| (id.as_str(), c.position, c.half_size));
+            let things = live_objects.by_id.iter().map(|(id, c)| (id.as_str(), c.position, c.half_size, c.rotation));
             let ground = |p: Vec3| physics.raycast_down(p + Vec3::Y * 0.01, 40.0).map(|(hit, _)| hit.y);
             for s in splash_watch.step(sim_time as f64, dt, &surface, &ground, &sunlit, Some((floor, facing)), hands, things) {
                 renderer.add_splash(s);
@@ -1793,9 +1793,16 @@ fn load_scene_terrain(
     // cannot be read is worth a warning, though -- that is a broken level
     // rather than an unpainted one.
     let splat = match space_soup_engine::terrain::load_splat(def, game_dir) {
-        Ok(Some(map)) => {
+        Ok(Some(mut map)) => {
             let [w, h] = map.resolution();
-            log::info!("terrain_render: splat map {w}x{h}");
+            // Bare rock where the ground is sheer: a top-down map cannot paint
+            // a cliff step apart from the grass at its foot. See
+            // `SplatMap::bare_rock_on_sheer_ground`.
+            let bared = match space_soup_engine::terrain::load(def, game_dir) {
+                Ok(ground) => map.bare_rock_on_sheer_ground(ground.as_ref()),
+                Err(_) => 0,
+            };
+            log::info!("terrain_render: splat map {w}x{h}, {bared} texel(s) bared to rock on sheer ground");
             Some(space_soup::renderer::terrain_pipeline::TerrainImage {
                 width: w,
                 height: h,
