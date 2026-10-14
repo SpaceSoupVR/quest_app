@@ -115,7 +115,7 @@ impl SplashWatch {
     ) -> Vec<Splash> {
         let mut out = Vec::new();
         let dt = dt.max(1e-3);
-        let mut emit = |position: Vec3, depth: Option<f32>, velocity: Vec3, size: f32, mass: f32, held: f32, count: &mut u64| {
+        let mut emit = |position: Vec3, depth: Option<f32>, velocity: Vec3, size: f32, mass: f32, held: f32, flat: f32, count: &mut u64| {
             *count += 1;
             out.push(Splash {
                 position,
@@ -129,6 +129,7 @@ impl SplashWatch {
                 // The renderer finds how still the water was (`effects::strike`).
                 calm: 1.0,
                 held,
+                flat,
                 seed: count.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (now.to_bits()),
             });
         };
@@ -155,7 +156,7 @@ impl SplashWatch {
                         let kick = 1.0 - 0.6 * smoothstep(0.25, 0.7, depth);
                         let swing = 2.0 * walk * kick;
                         let (down, along) = FOOT_ENTRY_DEG.to_radians().sin_cos();
-                        emit(Vec3::new(at.x, water, at.z), Some(water - floor.y), ahead * (swing * along) - Vec3::Y * (swing * down), FOOT_RADIUS, FOOT_MASS, 1.0, &mut self.count);
+                        emit(Vec3::new(at.x, water, at.z), Some(water - floor.y), ahead * (swing * along) - Vec3::Y * (swing * down), FOOT_RADIUS, FOOT_MASS, 1.0, 0.0, &mut self.count);
                     }
                 }
                 self.feet = Some(floor);
@@ -183,7 +184,10 @@ impl SplashWatch {
                             // A hand pulled out drags water up after it and
                             // lets it fall back: as one going in half as fast.
                             let velocity = if into { v } else { Vec3::new(v.x, -v.y, v.z) * 0.5 };
-                            emit(Vec3::new(p.x, s, p.z), None, velocity, HAND_RADIUS, HAND_MASS, 1.0, &mut self.count);
+                            // A hand brought down steeply is a SLAP: the palm
+                            // meets the water flat (`Splash::flat`).
+                            let flat = if into { smoothstep(0.6, 0.9, -v.y / v.length().max(1e-3)) } else { 0.0 };
+                            emit(Vec3::new(p.x, s, p.z), None, velocity, HAND_RADIUS, HAND_MASS, 1.0, flat, &mut self.count);
                         }
                     }
                 }
@@ -211,7 +215,7 @@ impl SplashWatch {
             };
             let mass = space_soup_engine::rigid_physics::default_mass(half);
             if let Some(e) = self.water.see(id, centre, world_half_extents(half, rotation), velocity, mass, surface(centre.x, centre.z)) {
-                emit(e.position, None, e.velocity, e.radius.clamp(0.01, 2.0), e.mass, 0.0, &mut self.count);
+                emit(e.position, None, e.velocity, e.radius.clamp(0.01, 2.0), e.mass, 0.0, 0.0, &mut self.count);
             }
         }
         self.things.retain(|id, _| seen.contains(id));
@@ -295,6 +299,7 @@ impl SplashWatch {
                 depth: ground(position).map(|g| position.y - g).unwrap_or(30.0).max(0.0),
                 calm: 1.0,
                 held: 0.0,
+                flat: 0.0,
                 // By its number, so every headset draws the same splash.
                 seed: e.serial.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x5eed,
             });
@@ -303,6 +308,80 @@ impl SplashWatch {
         // while it does, and a server started again starts its numbers again.
         self.told.clear();
         self.told.extend(entries.iter().map(|e| e.serial));
+        out
+    }
+}
+
+/// WHAT STIRS THE WATER each frame, for the wake round the player
+/// (`space_soup::renderer::water_wake`): the hands, the legs while wading,
+/// and every object crossing the surface -- where each crosses it, how fast
+/// it moves, how wide and how deep it is there. A splash is an event; this
+/// is the steady push of things moving through the water, so a hand drawn
+/// along it or a wading leg makes one continuous wake.
+#[derive(Default)]
+pub struct WakeWatch {
+    /// Each one's last place and when it last moved, and its speed then.
+    last: HashMap<String, (Vec3, f64, Vec3)>,
+}
+
+/// A wading leg, as the water meets it: its radius, metres, and how far
+/// either side of the body's middle the two stand.
+const LEG_RADIUS: f32 = 0.06;
+const LEG_APART: f32 = 0.11;
+
+impl WakeWatch {
+    #[allow(clippy::too_many_arguments)]
+    pub fn sources<'a>(
+        &mut self,
+        now: f64,
+        surface: &dyn Fn(f32, f32) -> Option<f32>,
+        feet: Option<(Vec3, Vec3)>,
+        hands: [Option<Vec3>; 2],
+        things: impl Iterator<Item = (&'a str, Vec3, Vec3, Quat)>,
+    ) -> Vec<space_soup::renderer::water_wake::WakeSource> {
+        use space_soup::renderer::water_wake::WakeSource;
+        let mut out = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        // How fast `id` is going, from its last place (a networked thing moves
+        // when an update arrives: over the time since it last moved).
+        let mut speed = |id: String, p: Vec3, seen: &mut Vec<String>| -> Vec3 {
+            seen.push(id.clone());
+            let v = match self.last.get(&id).copied() {
+                Some((was, _, v)) if was == p => v,
+                Some((was, at, _)) if was.distance(p) < JUMP => ((p - was) / (now - at).max(1e-3) as f32).clamp_length_max(20.0),
+                _ => Vec3::ZERO,
+            };
+            if self.last.get(&id).is_none_or(|l| l.0 != p) {
+                self.last.insert(id, (p, now, v));
+            }
+            v
+        };
+        let mut add = |at: Vec3, v: Vec3, radius: f32, bottom: f32| {
+            if let Some(s) = surface(at.x, at.z) {
+                if bottom < s {
+                    out.push(WakeSource { position: Vec3::new(at.x, s, at.z), velocity: v, radius, depth: (s - bottom).min(0.5) });
+                }
+            }
+        };
+        for (i, hand) in hands.iter().enumerate() {
+            if let Some(p) = *hand {
+                let v = speed(format!("hand{i}"), p, &mut seen);
+                add(p, v, HAND_RADIUS, p.y - HAND_RADIUS);
+            }
+        }
+        if let Some((floor, facing)) = feet {
+            let v = speed("legs".into(), floor, &mut seen);
+            let side = Vec3::new(facing.x, 0.0, facing.z).normalize_or(Vec3::Z).cross(Vec3::Y) * LEG_APART;
+            for leg in [floor + side, floor - side] {
+                add(leg, Vec3::new(v.x, 0.0, v.z), LEG_RADIUS, leg.y);
+            }
+        }
+        for (id, centre, half, rotation) in things {
+            let v = speed(id.to_string(), centre, &mut seen);
+            let e = world_half_extents(half, rotation);
+            add(centre, v, (e.x * e.z).sqrt().max(0.01), centre.y - e.y);
+        }
+        self.last.retain(|id, _| seen.contains(id));
         out
     }
 }
@@ -384,6 +463,29 @@ mod tests {
             .map(|k| w.bob(k as f64 * 0.05, &sea, &sun, std::iter::once(("crate", Vec3::new(-5.0, 0.04 * (k as f32 * 0.4).cos(), 0.0), half, Quat::IDENTITY))).len())
             .sum();
         assert_eq!((still, dry), (0, 0));
+    }
+
+    /// A hand drawn through the water, a leg wading and a thing floating
+    /// stir it where they cross the surface, at their speed; a hand in the
+    /// air or on land does not.
+    #[test]
+    fn what_moves_through_the_water_stirs_it() {
+        let mut w = WakeWatch::default();
+        let dt = 1.0 / 72.0;
+        let mut last = Vec::new();
+        for k in 0..10 {
+            let t = k as f64 * dt as f64;
+            let hand = Vec3::new(5.0 + 0.8 * t as f32, -0.03, 0.0);
+            last = w.sources(t, &sea, Some((Vec3::new(4.0 + 1.2 * t as f32, -0.4, 0.0), Vec3::X)), [Some(hand), Some(Vec3::new(5.0, 0.5, 0.0))], std::iter::once(("crate", Vec3::new(6.0, -0.05, 1.0), Vec3::splat(0.2), Quat::IDENTITY)));
+        }
+        assert_eq!(last.len(), 4, "a hand, two legs, the crate: {last:?}");
+        let hand = last[0];
+        assert!(hand.position.y == 0.0 && (hand.velocity.x - 0.8).abs() < 0.05 && hand.depth > 0.05 && hand.radius == HAND_RADIUS, "{hand:?}");
+        assert!(last[1..3].iter().all(|l| (l.velocity.x - 1.2).abs() < 0.05 && (l.depth - 0.4).abs() < 1e-4 && l.velocity.y == 0.0));
+        assert!(last[3].velocity == Vec3::ZERO && (last[3].depth - 0.25).abs() < 1e-4);
+        // On land: nothing.
+        let dry = w.sources(1.0, &sea, Some((Vec3::new(-3.0, 0.0, 0.0), Vec3::X)), [Some(Vec3::new(-3.0, 0.2, 0.0)), None], std::iter::empty());
+        assert!(dry.is_empty());
     }
 
     #[test]

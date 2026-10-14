@@ -88,6 +88,8 @@ pub struct StaticScene {
     /// a door). What the scene does not name -- spawned while it runs -- is
     /// not in here, and can be. See `nearest_grabbable_object_to`.
     pub fixed: std::collections::HashSet<String>,
+    /// The scene's objects that never move. See `grab_reach::still_objects`.
+    pub still: std::collections::HashSet<String>,
 }
 
 impl StaticScene {
@@ -101,9 +103,11 @@ impl StaticScene {
         let mut reflection_probes = Vec::new();
         let mut doors = crate::client_doors::ClientDoors::default();
         let mut fixed = std::collections::HashSet::new();
+        let mut still = std::collections::HashSet::new();
         let (grip_points, part_animations) = match Scene::load(&path) {
             Ok(scene) => {
                 fixed = crate::grab_reach::fixed_objects(&scene);
+                still = crate::grab_reach::still_objects(&scene);
                 physics.rebuild(&scene, game_dir);
                 doors = crate::client_doors::ClientDoors::from_scene(&scene);
                 sky = scene.sky.clone();
@@ -169,6 +173,7 @@ impl StaticScene {
             reflection_probes,
             doors,
             fixed,
+            still,
         }
     }
 }

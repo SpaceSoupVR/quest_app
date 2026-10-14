@@ -362,8 +362,14 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     let mut shots = crate::muzzle_test::offline_bursts(&game);
     // The scene's PLACED EFFECTS (`effect.asset`), standing since the level
     // loaded (the effects' clock 0), as `XrRenderer::place_effects` stands them.
-    let placed_effects = if view.effects { crate::scene_effects::placed(&game, scene_name) } else { Vec::new() };
+    let mut placed_effects = if view.effects { crate::scene_effects::placed(&game, scene_name) } else { Vec::new() };
     if !placed_effects.is_empty() {
+        // Whether the sky's sun reaches each, by a ray through the physics
+        // scene, as the client finds it at load.
+        let mut physics = space_soup_engine::rigid_physics::PhysicsWorld::new();
+        physics.rebuild(&scene, &game);
+        let toward = sky_sun.as_ref().map(|s| Vec3::from(s.direction));
+        crate::scene_effects::find_sunlit(&mut placed_effects, toward, |p, d| physics.raycast(p, d, 300.0).is_some());
         let (lib, set) = shots.get_or_insert_with(|| {
             let (lib, errors) = space_soup::renderer::effects::stack::EffectLibrary::from_dir(&game.join("effects"));
             errors.iter().for_each(|e| eprintln!("offline frame: {e}"));
@@ -381,7 +387,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         for l in set.live.iter_mut().filter(|l| l.standing.is_some()) {
             (l.born, l.frames) = (Some(0.0), 1);
         }
-        eprintln!("offline frame: {} placed effects", placed_effects.len());
+        eprintln!("offline frame: {} placed effects, sunlit {:?}", placed_effects.len(), placed_effects.iter().map(|p| (p.object.as_str(), p.placed.sunlit)).collect::<Vec<_>>());
     }
     if let Some((lib, set)) = shots.as_mut() {
         let judged = std::env::var("BURST_EXPOSURE").ok().and_then(|v| v.parse().ok()).unwrap_or(f32::MAX);
@@ -1127,7 +1133,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         }
         _ => None,
     };
-    // SPLASHES to look at: `SPLASH=x,y,z,vx,vy,vz,size,mass,age[,depth[,held]]`
+    // SPLASHES to look at: `SPLASH=x,y,z,vx,vy,vz,size,mass,age[,depth[,held[,flat]]]`
     // (world; the velocity of what struck, m/s; the radius of its
     // cross-section, metres; its mass, kg; seconds since it struck at the
     // effects' and the water's clock; the still water's depth there),
@@ -1157,7 +1163,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                 u.set_time(born, loop_seconds);
                 position.y += space_soup::renderer::water_pipeline::swash_lift(&u, depth, glam::Vec2::new(position.x, position.z));
             }
-            let splash = Splash { depth, held: n.get(10).copied().unwrap_or(0.0), seed: 7 + 0x9e37 * k as u64, ..Splash::new(position, born, Vec3::new(n[3], n[4], n[5]), n[6], n[7]) };
+            let splash = Splash { depth, held: n.get(10).copied().unwrap_or(0.0), flat: n.get(11).copied().unwrap_or(0.0), seed: 7 + 0x9e37 * k as u64, ..Splash::new(position, born, Vec3::new(n[3], n[4], n[5]), n[6], n[7]) };
             strike(&mut live, splash, 48);
         }
         live
@@ -1184,7 +1190,9 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                 let turn = Quat::from_rotation_y(yaw);
                 let reaches =
                     |e: &effects::EffectEmitter, i: usize| effects::lamp_in_room(&descs, e.position, turn * lights[i].position + offset);
-                let ambient = |w: Vec3| effects::room_ambient_now(&descs, w, &relit);
+                // The terrain's heights, which tell a cave from the open air.
+                let ground = crate::load_scene_terrain(&game, scene_name).and_then(|(g, _)| g.height_grid(scene.terrain.as_ref(), &game));
+                let ambient = |w: Vec3| effects::room_ambient_now(&descs, w, &relit, ground.as_ref());
                 // What each splash is lit by, to hold against the water's light there.
                 for s in &splashes {
                     eprintln!("SPLASH_AMBIENT at {:?}: {:?} (baked {:?}), exposure {exposure}", s.position, ambient(s.position), effects::room_ambient(&descs, s.position));
@@ -1224,6 +1232,18 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                     None => effects::simulate_with(&emitters, &splashes, time, &at),
                 };
                 eprintln!("offline frame: effects at {time} s: {} over, {} screened", frame.over, frame.screened);
+                // What the frame's governor weighs each placed effect at from
+                // this view (`LiveBurst::seen_cost`: both eyes, this frustum).
+                if let Some((lib, set)) = shots.as_ref() {
+                    let up = glam::Quat::from_axis_angle((view.at - view.eye).normalize(), view.roll_deg.to_radians()) * Vec3::Y;
+                    let planes = space_soup::renderer::shadow::frustum_planes(shift * proj * Mat4::look_at_rh(view.eye, view.at, up));
+                    for l in set.live.iter().filter(|l| l.standing.is_some()) {
+                        if let Some(c) = lib.get(l.burst.asset) {
+                            let (fill, count) = l.seen_cost(c, &[planes, planes], view.eye);
+                            eprintln!("PLACED_SEEN_FILL {{\"effect\":\"{}\",\"fill\":{fill:.3},\"instances\":{count:.0}}}", c.name);
+                        }
+                    }
+                }
                 // `EFFECT_VARIANTS=0`: the two union shaders, as the lever
                 // `effect_variants` off draws them.
                 gpu.use_variants = std::env::var("EFFECT_VARIANTS").as_deref() != Ok("0");
@@ -1311,6 +1331,44 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                     let waves = space_soup::renderer::water_waves::WaveField::new(&device, &queue, b.waves);
                     b.uniform.set_time(time, b.waves.loop_seconds);
                     b.uniform.set_rings(&space_soup::renderer::effects::splash_rings(&splash_at(time), time, view.eye));
+                    // THE WAKE to look at: `WAKE=x0,z0,x1,z1,speed,radius,depth[,vy]`
+                    // (world; something `radius` wide reaching `depth` under
+                    // the surface drawn from the first point to the second at
+                    // `speed` m/s, moving up or down at `vy`), several with `;`
+                    // between them moving together, then `WAKE_AFTER` seconds
+                    // of nothing; the grid round the eye, as the headset's.
+                    if let Ok(paths) = std::env::var("WAKE") {
+                        use space_soup::renderer::water_wake::{WakeField, WakeSource};
+                        let paths: Vec<Vec<f32>> = paths.split(';').map(|p| p.split(',').filter_map(|x| x.trim().parse().ok()).collect()).filter(|p: &Vec<f32>| p.len() >= 7).collect();
+                        let mut field = WakeField::default();
+                        let dt = 1.0 / 72.0;
+                        let centre = glam::Vec2::new(view.eye.x, view.eye.z);
+                        let longest = paths.iter().map(|p| glam::Vec2::new(p[2] - p[0], p[3] - p[1]).length() / p[4].max(1e-3)).fold(0.0f32, f32::max);
+                        for k in 0..(longest / dt).ceil() as usize {
+                            let t = k as f32 * dt;
+                            let sources: Vec<WakeSource> = paths
+                                .iter()
+                                .filter_map(|p| {
+                                    let (a, z) = (glam::Vec2::new(p[0], p[1]), glam::Vec2::new(p[2], p[3]));
+                                    let along = (z - a).normalize_or_zero() * p[4];
+                                    let at = a + along * t;
+                                    ((at - a).length() <= (z - a).length()).then(|| WakeSource {
+                                        position: Vec3::new(at.x, b.uniform.extinction[3], at.y),
+                                        velocity: Vec3::new(along.x, p.get(7).copied().unwrap_or(0.0), along.y),
+                                        radius: p[5],
+                                        depth: p[6],
+                                    })
+                                })
+                                .collect();
+                            field.step(dt, centre, &sources);
+                        }
+                        let after: f32 = std::env::var("WAKE_AFTER").ok().and_then(|t| t.parse().ok()).unwrap_or(0.0);
+                        for _ in 0..(after / dt).round() as usize {
+                            field.step(dt, centre, &[]);
+                        }
+                        b.uniform.wake = field.uniform();
+                        pipeline.write_wake(&queue, &field.texels());
+                    }
                     let buffer = |label, contents: &[u8], usage| {
                         device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents, usage })
                     };
@@ -1649,7 +1707,16 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             under_body = Some((*i, *state));
         }
         // The water after everything opaque, then the sky where nothing was
-        // drawn, as the headset's scene pass has them.
+        // drawn, as the headset's scene pass has them -- or the sky FIRST, as
+        // `Levers::sky_before_water` has it (on; `SKY_BEFORE_WATER=0` off),
+        // not with the eye in a body.
+        let sky_first = std::env::var("SKY_BEFORE_WATER").as_deref() != Ok("0") && under_body.is_none();
+        if let (Some((pipeline, sky)), true) = (&sky, sky_first) {
+            pass.set_pipeline(&pipeline.pipeline);
+            pass.set_bind_group(0, &uniforms.bind_group, &[]);
+            pass.set_bind_group(1, &sky.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
         if let Some((pipeline, bodies, water_time)) = &water {
             // The splashes' twin as the headset picks it: raining while their
             // drops land (`WaterPipeline::for_rings`).
@@ -1685,7 +1752,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             }
         }
         let wholly_under = under_body.is_some_and(|(_, s)| s == space_soup::renderer::underwater::EyeWater::Under);
-        if let (Some((pipeline, sky)), false) = (&sky, wholly_under) {
+        if let (Some((pipeline, sky)), false) = (&sky, wholly_under || sky_first) {
             pass.set_pipeline(&pipeline.pipeline);
             pass.set_bind_group(0, &uniforms.bind_group, &[]);
             pass.set_bind_group(1, &sky.bind_group, &[]);

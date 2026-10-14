@@ -44,6 +44,57 @@ pub fn fixed_objects(scene: &space_soup_engine::Scene) -> HashSet<String> {
         .collect()
 }
 
+/// THE SCENE'S OBJECTS THAT NEVER MOVE, from the data: not a body physics
+/// moves (Dynamic or Kinematic), not a door or a door's lever, nothing a
+/// hand can hold (grip points), nothing a clip or a binding plays
+/// (animations, part animations), no slider, nothing riding the player's rig,
+/// nothing that comes apart (breakable), no object with a script or named in
+/// one (`move_object("id", ..)`), and not parented to anything that moves.
+/// Everything else -- and whatever the scene does not name, spawned while it
+/// runs -- may move. A model that never
+/// moves takes its sun shadow from the level's baked data, never from the
+/// head-following moving-objects map (`MeshInstance::moves`), where it cast
+/// only within that map's box of the player and so popped with distance
+/// (headset, 2026-10-14) and cost a shadow draw every frame.
+pub fn still_objects(scene: &space_soup_engine::Scene) -> HashSet<String> {
+    let levers: HashSet<&str> = scene.objects.iter().filter_map(|o| o.door.as_ref()?.lever.as_deref()).collect();
+    let scripts: Vec<&str> = scene.objects.iter().filter_map(|o| o.script.as_deref()).collect();
+    let moves_itself = |o: &space_soup_engine::scene::GameObject| {
+        o.rigid_body.as_ref().is_some_and(|b| b.mode != space_soup_engine::BodyMode::Static)
+            || o.door.is_some()
+            || levers.contains(o.id.as_str())
+            || !o.grip_points.is_empty()
+            || !o.animations.is_empty()
+            || !o.animation_bindings.is_empty()
+            || !o.part_animations.is_empty()
+            || o.slider_joint.is_some()
+            || o.rig_attachment.is_some()
+            || o.breakable.is_some()
+            || o.script.is_some()
+            || scripts.iter().any(|s| s.contains(&format!("\"{}\"", o.id)))
+    };
+    // `parent` is the parent's uuid, not its id.
+    let by_uuid: std::collections::HashMap<&str, &space_soup_engine::scene::GameObject> =
+        scene.objects.iter().filter_map(|o| Some((o.uuid.as_deref()?, o))).collect();
+    scene
+        .objects
+        .iter()
+        .filter(|o| {
+            // Up the parent chain, a bounded walk (a cycle in bad data ends it).
+            let mut at = Some(*o);
+            for _ in 0..64 {
+                let Some(obj) = at else { return true };
+                if moves_itself(obj) {
+                    return false;
+                }
+                at = obj.parent.as_deref().and_then(|p| by_uuid.get(p).copied());
+            }
+            true
+        })
+        .map(|o| o.id.clone())
+        .collect()
+}
+
 /// What a hand at `hand` is offered: each loose thing (`may_take`) whose box
 /// is within reach in `grid`, and each door handle within its own reach
 /// (`door::HANDLE_REACH`), lit by the door's lever where it has one.
@@ -110,6 +161,55 @@ mod tests {
         let fixed = fixed_objects(&scene);
         let doors = ClientDoors::from_scene(&scene);
         Some(Level { scene, grid, fixed, doors })
+    }
+
+    /// WHAT MOVES IN THE SHIPPED LEVEL, by its data: the doors, their lever,
+    /// the loose rocks and crates move; the cave, the door frames, the lamps
+    /// and the brushes' rooms do not.
+    #[test]
+    fn the_shipped_levels_still_objects_are_the_ones_nothing_moves() {
+        let Some(level) = test_room() else {
+            eprintln!("skipping: no test_room");
+            return;
+        };
+        let still = still_objects(&level.scene);
+        for id in ["cave", "hall_door_frame", "brick_door_frame", "hall_spot_1", "hallway_sconce_north", "hall_shell"] {
+            assert!(still.contains(id), "{id} never moves, but is not still");
+        }
+        for id in ["hall_door_south", "brick_door_north", "brick_door_lever", "beach_crate", "pond_crate", "beach_boulder"] {
+            assert!(level.scene.find_object(id).is_some(), "no {id} in the level");
+            assert!(!still.contains(id), "{id} moves, but is still");
+        }
+        // Not named by the scene: spawned while it runs, so it may move.
+        assert!(!still.contains("spawned_crate_17"));
+    }
+
+    /// Each thing that makes an object move, one object apiece, and a child
+    /// (by its parent's UUID) of one that moves.
+    #[test]
+    fn whatever_the_data_says_can_move_is_not_still() {
+        let scene: space_soup_engine::Scene = serde_json::from_value(serde_json::json!({
+            "name": "movers",
+            "objects": [
+                { "id": "rock" },
+                { "id": "hand", "uuid": "u-hand", "rig_attachment": { "joint": "hand_l" } },
+                { "id": "ring", "parent": "u-hand" },
+                { "id": "on_rock", "parent": "u-rock-missing" },
+                { "id": "gun", "script": "fn on_update(dt) { move_object(\"bolt\", 0.0, 0.0, 0.1); }" },
+                { "id": "bolt" },
+                { "id": "bolt_rest" },
+                { "id": "crate", "rigid_body": { "mode": "Dynamic" } },
+                { "id": "slab", "rigid_body": { "mode": "Static" } },
+            ],
+        }))
+        .expect("a scene");
+        let still = still_objects(&scene);
+        for id in ["rock", "on_rock", "bolt_rest", "slab"] {
+            assert!(still.contains(id), "{id} never moves, but is not still");
+        }
+        for id in ["hand", "ring", "gun", "bolt", "crate"] {
+            assert!(!still.contains(id), "{id} moves, but is still");
+        }
     }
 
     fn at(level: &Level, id: &str) -> Vec3 {

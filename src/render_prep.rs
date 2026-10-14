@@ -248,6 +248,8 @@ pub(crate) fn build_render_lists<'a>(
                     emissive_drive: rm.emissive_drive,
                     own_light: None,
                     tile_caster: false,
+                    // A skinned body with parts hidden: a character.
+                    moves: true,
                 });
             }
             let (mesh, model) = mesh_cache.get(&rm.id)?;
@@ -263,6 +265,9 @@ pub(crate) fn build_render_lists<'a>(
                 // A door's leaf shadows the lamps reaching it from their
                 // moving casters' tiles. See `space_soup::renderer::doors`.
                 tile_caster: static_scene.doors.is_door(&rm.id),
+                // What the scene's data says can move, or is skinned, or the
+                // scene does not name. See `grab_reach::still_objects`.
+                moves: !static_scene.still.contains(&rm.id) || mesh.skin.is_some(),
             })
         })
         .chain(
@@ -277,6 +282,7 @@ pub(crate) fn build_render_lists<'a>(
                     emissive_drive: 0.0,
                     own_light: None,
                     tile_caster: false,
+                    moves: true,
                 }),
         )
         .chain(
@@ -289,6 +295,7 @@ pub(crate) fn build_render_lists<'a>(
                     emissive_drive: 0.0,
                     own_light: None,
                     tile_caster: false,
+                    moves: true,
                 }),
         )
         .collect();
@@ -302,6 +309,7 @@ pub(crate) fn build_render_lists<'a>(
             emissive_drive: 0.0,
             own_light: None,
             tile_caster: false,
+            moves: true,
         })
         .into_iter()
         .collect();

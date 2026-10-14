@@ -740,6 +740,109 @@
       "at": [-17.1, 0.0, -0.7],
       "flashlight": {"at": [-16.85, 1.25, -0.3], "aim": [-17.1, 0.0, -1.2], "torch": true},
       "note": "rain_puddles_ripples_down with the torch lit and aimed at the puddles: a spot casts, so the frame draws the NON-spotless weather twins (+190 proxy units; the puddle reader past the 3,387 instruction cache without ground_twins::TORCH_WEATHER_SKY_WALK). The bench draws no hand, so not the hand's shadow itself; the reader is the same. Launch A/B: setprop debug.spacesoup.torchskywalk 0."
+    },
+    {
+      "name": "door_hallway_to_hall_shut",
+      "eye": [5.5, 1.6, -3.3],
+      "at": [2.85, 1.1, -3.0],
+      "doors": [0, 0, 0, 0],
+      "note": "Round 2 (headset 2026-10-14 morning: opening from the hallway into the marble hall 'just about as bad as before'): from the hallway at the hall's swing doors, held shut. Read against the next two."
+    },
+    {
+      "name": "door_hallway_to_hall_open",
+      "eye": [5.5, 1.6, -3.3],
+      "at": [2.85, 1.1, -3.0],
+      "doors": [80, 80, 0, 0],
+      "note": "The same, the hall's leaves held 80 degrees open: the marble hall seen from the hallway through its doorway (its pendants, pillar, polished floor and walls, hall_dust)."
+    },
+    {
+      "name": "door_hallway_to_hall_swing",
+      "eye": [5.5, 1.6, -3.3],
+      "at": [2.85, 1.1, -3.0],
+      "doors": [80, 80, 0, 0],
+      "door_swing": 3.0,
+      "note": "The same, the leaves swinging shut -> 80 -> shut every 3 s: the doorway opening and sealing each cycle."
+    },
+    {
+      "name": "door_brick_to_hallway_shut",
+      "eye": [12.0, 1.6, -3.0],
+      "at": [8.0, 1.5, -3.0],
+      "doors": [0, 0, 0, 0],
+      "note": "Round 2 ('coming from the stone room ... just about as bad'): in the brick hall at its latched door into the hallway, held shut."
+    },
+    {
+      "name": "door_brick_to_hallway_open",
+      "eye": [12.0, 1.6, -3.0],
+      "at": [8.0, 1.5, -3.0],
+      "doors": [0, 0, 0, -90],
+      "note": "The same, the brick door's north leaf (the lever's) held 90 degrees open into the brick hall; the hall's doors shut."
+    },
+    {
+      "name": "door_brick_to_hallway_swing",
+      "eye": [12.0, 1.6, -3.0],
+      "at": [8.0, 1.5, -3.0],
+      "doors": [0, 0, 0, -90],
+      "door_swing": 3.0,
+      "note": "The same, the leaf swinging shut -> 90 -> shut every 3 s."
+    },
+    {
+      "name": "door_brick_to_hallway_open_all",
+      "eye": [12.0, 1.6, -3.0],
+      "at": [8.0, 1.5, -3.0],
+      "doors": [80, 80, 0, -90],
+      "note": "The brick door AND the hall's doors open: down the hallway into the marble hall through two doorways, as a player leaves them."
+    },
+    {
+      "name": "walk_back_look_down_rain",
+      "eye": [-17.0, 1.65, -1.0],
+      "at": [-17.0, 0.0, 0.5],
+      "path": [[-17.0, 1.65, 3.0]],
+      "speed": 1.6,
+      "backward": true,
+      "pitch": -60.0,
+      "body": true,
+      "note": "Round 2 (headset: lag at the puddles moving backward while looking down, not forward; more of the body shows): walking BACKWARD at 1.6 m/s through the rain's puddles, 60 degrees down, the player's own wet body drawn (BenchPose::backward, pitch, body). The bench pins the rig, so the one-step body lag fixed in PlayerRig::carried is not in it: this prices the body's pixels."
+    },
+    {
+      "name": "walk_fwd_look_down_rain",
+      "eye": [-17.0, 1.65, -1.0],
+      "at": [-17.0, 0.0, 0.5],
+      "path": [[-17.0, 1.65, 3.0]],
+      "speed": 1.6,
+      "pitch": -60.0,
+      "body": true,
+      "note": "The same walk facing forward: read against walk_back_look_down_rain."
+    },
+    {
+      "name": "walk_back_look_down_rain_nobody",
+      "eye": [-17.0, 1.65, -1.0],
+      "at": [-17.0, 0.0, 0.5],
+      "path": [[-17.0, 1.65, 3.0]],
+      "speed": 1.6,
+      "backward": true,
+      "pitch": -60.0,
+      "note": "walk_back_look_down_rain without the body: what the body costs is the difference."
+    },
+    {
+      "name": "walk_back_look_down_dry",
+      "eye": [0.0, 1.6, 6.0],
+      "at": [0.0, 0.0, 7.5],
+      "path": [[0.0, 1.6, 12.0]],
+      "speed": 1.6,
+      "backward": true,
+      "pitch": -60.0,
+      "body": true,
+      "note": "Walking backward looking down on dry grass, the body drawn: the backward lag where there is no rain."
+    },
+    {
+      "name": "walk_back_look_down_dry_nobody",
+      "eye": [0.0, 1.6, 6.0],
+      "at": [0.0, 0.0, 7.5],
+      "path": [[0.0, 1.6, 12.0]],
+      "speed": 1.6,
+      "backward": true,
+      "pitch": -60.0,
+      "note": "walk_back_look_down_dry without the body."
     }
   ],
   "levels": {
