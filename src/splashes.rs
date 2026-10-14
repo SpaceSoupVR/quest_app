@@ -6,9 +6,16 @@
 //! Three things strike water here:
 //! - FEET, wading: a splash a stride, from alternate feet, each foot swung
 //!   forward and down into the water at a shallow angle, as fast as the walk
-//!   -- and slower in deep water, which a leg pushes through rather than
-//!   steps into.
+//!   -- but only where the step lifts the foot clear of the water and sets
+//!   it back in hard enough to open a cavity (`cavity_speed`). A leg that
+//!   stays in the water pushes a wake (`WakeWatch`), never a splash.
 //! - HANDS, slapped down through the surface, and pulled out of it fast.
+//!
+//! A SPLASH IS AN IMPACT: something coming into the surface from the air,
+//! along its normal, fast enough to open a cavity. Gliding along or through
+//! the surface, or dipping in gently, only makes ripples, which the wake
+//! draws (2026-10-14: a hand moved smoothly through the pond, and walking in
+//! it, fired splashes AND the wake).
 //! - THINGS, a level's moving objects, falling in: as fast as they fall, as
 //!   wide and as heavy as they are. Seen by the engine's own rule
 //!   (`space_soup_engine::water::WaterWatch`), so one floating at the
@@ -37,9 +44,29 @@ const WADE_SPEED: f32 = 0.25;
 const WET: f32 = 0.02;
 /// A move this far in one frame is a teleport or a respawn, not a walk.
 const JUMP: f32 = 1.5;
-/// The slowest hand that splashes going in, and coming out, m/s.
-const SLAP_IN: f32 = 0.5;
-const PULL_OUT: f32 = 1.0;
+/// THE SPEED THAT OPENS A CAVITY, as a Froude number `V^2 / (g r)` of the
+/// speed INTO the surface and the body's radius: about 1 m/s for a hand
+/// (r 4.5 cm), 1.25 m/s for a foot. Gentler, the surface only dimples and
+/// rings in capillary ripples: the wake's.
+const ENTRY_FROUDE: f32 = 2.3;
+/// A GLIDE, not an entry: the speed into the surface must be at least this
+/// share of the speed along it (an entry steeper than 30 degrees).
+const ENTRY_STEEP: f32 = 0.58;
+/// The slowest hand pulled out that throws water, m/s, upward (and as
+/// steeply as an entry).
+const PULL_OUT: f32 = 1.5;
+/// How deep water a step lifts the foot clear of, metres: a walk's foot
+/// clears only shallow water; a run's, knee deep (`FOOT_LIFT_RUN` from
+/// `RUN_FROM` to `RUN_TO` m/s).
+const FOOT_LIFT_WALK: f32 = 0.08;
+const FOOT_LIFT_RUN: f32 = 0.35;
+const RUN_FROM: f32 = 1.5;
+const RUN_TO: f32 = 3.0;
+
+/// The speed into the surface that opens a cavity for a body this wide.
+fn cavity_speed(radius: f32) -> f32 {
+    (ENTRY_FROUDE * 9.81 * radius).sqrt()
+}
 /// No hand splashes twice within this, seconds.
 const COOLDOWN: f64 = 0.15;
 /// A FOOT, as the water meets it: as wide as a disc of this radius, metres
@@ -60,6 +87,10 @@ pub struct SplashWatch {
     left_foot: bool,
     hands: [Option<(Vec3, f64)>; 2],
     hand_last: [f64; 2],
+    /// Whether each hand is OUT of the water: out once clear of the surface
+    /// by its radius, in once under it -- a hand held at the surface does not
+    /// go in and out with every tremble.
+    hand_out: [Option<bool>; 2],
     /// Each object's centre when it last moved, when, and how fast it was
     /// going then.
     things: HashMap<String, (Vec3, f64, Vec3)>,
@@ -146,17 +177,23 @@ impl SplashWatch {
                     if self.walked >= STRIDE {
                         self.walked -= STRIDE;
                         self.left_foot = !self.left_foot;
-                        let ahead = Vec3::new(facing.x, 0.0, facing.z).normalize_or(Vec3::Z);
-                        let side = ahead.cross(Vec3::Y) * if self.left_foot { -0.11 } else { 0.11 };
-                        let at = floor + side + ahead * 0.25;
-                        let water = surface(at.x, at.z).unwrap_or(floor.y + depth);
                         // A foot swings at about twice the walk; a deep step
                         // pushes water aside more than it steps into it.
                         let walk = (moved / dt).min(3.0);
                         let kick = 1.0 - 0.6 * smoothstep(0.25, 0.7, depth);
                         let swing = 2.0 * walk * kick;
                         let (down, along) = FOOT_ENTRY_DEG.to_radians().sin_cos();
-                        emit(Vec3::new(at.x, water, at.z), Some(water - floor.y), ahead * (swing * along) - Vec3::Y * (swing * down), FOOT_RADIUS, FOOT_MASS, 1.0, 0.0, &mut self.count);
+                        // Only a foot lifted CLEAR of the water and set back
+                        // in hard enough to open a cavity: one that stays in
+                        // it, or comes down gently, pushes a wake.
+                        let lift = FOOT_LIFT_WALK + (FOOT_LIFT_RUN - FOOT_LIFT_WALK) * smoothstep(RUN_FROM, RUN_TO, walk);
+                        if depth < lift && swing * down >= cavity_speed(FOOT_RADIUS) {
+                            let ahead = Vec3::new(facing.x, 0.0, facing.z).normalize_or(Vec3::Z);
+                            let side = ahead.cross(Vec3::Y) * if self.left_foot { -0.11 } else { 0.11 };
+                            let at = floor + side + ahead * 0.25;
+                            let water = surface(at.x, at.z).unwrap_or(floor.y + depth);
+                            emit(Vec3::new(at.x, water, at.z), Some(water - floor.y), ahead * (swing * along) - Vec3::Y * (swing * down), FOOT_RADIUS, FOOT_MASS, 1.0, 0.0, &mut self.count);
+                        }
                     }
                 }
                 self.feet = Some(floor);
@@ -171,14 +208,28 @@ impl SplashWatch {
         for (i, hand) in hands.iter().enumerate() {
             let Some(p) = *hand else {
                 self.hands[i] = None;
+                self.hand_out[i] = None;
                 continue;
             };
-            if let Some((was, _)) = self.hands[i] {
+            let Some(s) = surface(p.x, p.z) else {
+                self.hands[i] = Some((p, now));
+                self.hand_out[i] = None;
+                continue;
+            };
+            let was_out = self.hand_out[i];
+            let out_now = match was_out {
+                Some(false) => p.y > s + HAND_RADIUS,
+                _ => p.y > s,
+            };
+            self.hand_out[i] = Some(out_now);
+            if let (Some((was, _)), Some(was_out)) = (self.hands[i], was_out) {
                 if was.distance(p) < JUMP && now - self.hand_last[i] > COOLDOWN {
-                    if let Some(s) = surface(p.x, p.z) {
-                        let v = ((p - was) / dt).clamp_length_max(8.0);
-                        let into = was.y > s && p.y <= s && -v.y >= SLAP_IN;
-                        let out_of = was.y <= s && p.y > s && v.y >= PULL_OUT;
+                    {
+                        let v = ((p - was) / dt).clamp_length_max(8.0);                        let along = Vec3::new(v.x, 0.0, v.z).length();
+                        // In from the air, along the normal, hard enough to
+                        // open a cavity; out, flung up as steeply.
+                        let into = was_out && !out_now && -v.y >= cavity_speed(HAND_RADIUS) && -v.y >= ENTRY_STEEP * along;
+                        let out_of = !was_out && out_now && v.y >= PULL_OUT && v.y >= ENTRY_STEEP * along;
                         if into || out_of {
                             self.hand_last[i] = now;
                             // A hand pulled out drags water up after it and
@@ -412,27 +463,86 @@ mod tests {
         std::iter::empty()
     }
 
+    /// WADING AT A WALK only stirs the water: the legs stay in it, or come
+    /// down too gently to open a cavity (2026-10-14: every stride splashed).
+    /// RUNNING through the shallows lifts each foot clear and stamps it back:
+    /// a splash a stride, from alternate feet.
     #[test]
-    fn wading_splashes_once_a_stride_from_alternate_feet_and_walking_on_land_does_not() {
-        let mut w = SplashWatch::default();
+    fn wading_at_a_walk_only_stirs_and_running_through_shallows_splashes() {
         let dt = 1.0 / 72.0;
-        let mut steps = Vec::new();
-        // Walk 6.5 m along z at 1.3 m/s, 0.3 m deep.
-        for k in 0..360 {
-            let floor = Vec3::new(5.0, -0.3, k as f32 * 1.3 * dt);
-            steps.extend(w.step(k as f64 * dt as f64, dt, &sea, &bed, &sun, Some((floor, Vec3::Z)), [None, None], none()));
-        }
+        let walk = |speed: f32, depth: f32, frames: usize| {
+            let mut w = SplashWatch::default();
+            let mut steps = Vec::new();
+            for k in 0..frames {
+                let floor = Vec3::new(5.0, -depth, k as f32 * speed * dt);
+                steps.extend(w.step(k as f64 * dt as f64, dt, &sea, &bed, &sun, Some((floor, Vec3::Z)), [None, None], none()));
+            }
+            steps
+        };
+        // A walk, knee deep and ankle deep: nothing.
+        assert!(walk(1.3, 0.3, 360).is_empty() && walk(1.3, 0.05, 360).is_empty());
+        // A run 6.5 m through 15 cm of water.
+        let steps = walk(2.8, 0.15, 167);
         assert!((9..=11).contains(&steps.len()), "{} splashes over ten strides", steps.len());
         assert!(steps.windows(2).all(|p| (p[0].position.x - 5.0).signum() != (p[1].position.x - 5.0).signum()), "alternate feet");
-        assert!(steps.iter().all(|s| s.position.y == 0.0 && s.velocity.length() > 1.5), "on the surface, kicked");
-        // Swung forward and down at a shallow angle, by a foot.
-        assert!(steps.iter().all(|s| s.velocity.z > 2.0 * -s.velocity.y && s.velocity.y < -0.5 && s.size == FOOT_RADIUS && s.mass == FOOT_MASS), "{:?}", steps[0]);
+        // Swung forward and down at a shallow angle, by a foot, hard.
+        assert!(steps.iter().all(|s| s.position.y == 0.0 && -s.velocity.y >= cavity_speed(FOOT_RADIUS) && s.velocity.z > 2.0 * -s.velocity.y && s.size == FOOT_RADIUS && s.mass == FOOT_MASS), "{:?}", steps[0]);
+        // A run knee deep pushes through: no foot comes clear.
+        assert!(walk(2.0, 0.5, 240).is_empty());
         // On land, nothing.
         let mut w = SplashWatch::default();
         let dry: usize = (0..360)
-            .map(|k| w.step(k as f64 * dt as f64, dt, &sea, &bed, &sun, Some((Vec3::new(-5.0, 0.0, k as f32 * 1.3 * dt), Vec3::Z)), [None, None], none()).len())
+            .map(|k| w.step(k as f64 * dt as f64, dt, &sea, &bed, &sun, Some((Vec3::new(-5.0, 0.0, k as f32 * 2.8 * dt), Vec3::Z)), [None, None], none()).len())
             .sum();
         assert_eq!(dry, 0);
+    }
+
+    /// The speed into the surface that opens a cavity grows with the body:
+    /// about 1 m/s for a hand, more for a foot.
+    #[test]
+    fn a_cavity_needs_a_harder_entry_the_bigger_the_body() {
+        assert!((cavity_speed(HAND_RADIUS) - 1.0).abs() < 0.03, "{}", cavity_speed(HAND_RADIUS));
+        assert!(cavity_speed(FOOT_RADIUS) > 1.2 * cavity_speed(HAND_RADIUS));
+    }
+
+    /// A HAND GLIDING through the water, or skimming along its surface with
+    /// the tremble of a held hand, stirs a wake and never splashes; nor does
+    /// one swept in at a shallow angle, or dipped in gently -- that only
+    /// rings in ripples, the wake's. A slap does splash.
+    #[test]
+    fn a_glide_or_a_slow_dip_only_stirs_and_a_slap_splashes() {
+        let dt = 1.0 / 72.0;
+        let run = |hand: &dyn Fn(f32) -> Vec3| {
+            let (mut w, mut wake) = (SplashWatch::default(), WakeWatch::default());
+            let (mut splashes, mut stirs) = (Vec::new(), Vec::new());
+            for k in 0..144 {
+                let t = k as f32 * dt;
+                splashes.extend(w.step(t as f64, dt, &sea, &bed, &sun, None, [Some(hand(t)), None], none()));
+                stirs.push(wake.sources(t as f64, &sea, None, [Some(hand(t)), None], std::iter::empty()));
+            }
+            (splashes, stirs)
+        };
+        // Through the water, a few centimetres down, at 1.5 m/s.
+        let (s, stirs) = run(&|t| Vec3::new(2.0 + 1.5 * t, -0.03, 0.0));
+        assert!(s.is_empty() && stirs.iter().skip(2).all(|w| w.len() == 1 && (w[0].velocity.x - 1.5).abs() < 0.05));
+        // Along the surface with a 1 cm tremble at 4 Hz, in and out of it.
+        let (s, _) = run(&|t| Vec3::new(2.0 + 1.5 * t, 0.01 * (std::f32::consts::TAU * 4.0 * t).sin(), 0.0));
+        assert!(s.is_empty(), "{s:?}");
+        // Swept in from 10 cm up at a shallow angle: 0.6 m/s down, 2.5 along.
+        let (s, _) = run(&|t| Vec3::new(2.0 + 2.5 * t, (0.1 - 0.6 * t).max(-0.1), 0.0));
+        assert!(s.is_empty(), "{s:?}");
+        // Dipped in gently at 0.7 m/s: no splash, but the water is stirred
+        // where it goes in, downward (the wake's ring).
+        let (s, stirs) = run(&|t| Vec3::new(3.0, (0.3 - 0.7 * t).max(-0.2), 1.0));
+        assert!(s.is_empty(), "{s:?}");
+        assert!(stirs.iter().flatten().any(|w| (w.velocity.y + 0.7).abs() < 0.05), "the dip stirs the water");
+        // Slapped down at 2.5 m/s: one splash, flat.
+        let (s, _) = run(&|t| Vec3::new(3.0, (0.6 - 2.5 * t).max(-0.2), 1.0));
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert!((s[0].velocity.y + 2.5).abs() < 0.1 && s[0].flat > 0.9);
+        // Lifted clear and slapped back: a second one.
+        let (s, _) = run(&|t| Vec3::new(3.0, if t < 0.5 { (0.6 - 2.5 * t).max(-0.1) } else if t < 1.2 { -0.1 + 0.5 * (t - 0.5) } else { 0.25 - 2.5 * (t - 1.2) }, 1.0));
+        assert_eq!(s.len(), 2, "{s:?}");
     }
 
     /// A crate bobbing at the waterline raises a gentle splash at the bottom

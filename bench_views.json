@@ -438,6 +438,12 @@
       "note": "Across the pond from its bank: the bed through the clear edge, the sky in its deep middle (water, 2026-10-07)."
     },
     {
+      "name": "pond_near_shore",
+      "eye": [-18.8, 1.6, -19.2],
+      "at": [-23.5, -0.3, -24.5],
+      "note": "At the pond's near shore by the rocks and the crate, looking across the water through the pond mist's slab (fx_pond_fog, round 5): the mist's near-shore fill, flagged at about 2 megapixel-layers (2026-10-14)."
+    },
+    {
       "name": "rain_field",
       "eye": [-12.0, 1.6, 6.0],
       "at": [-20.0, 0.3, -4.0],

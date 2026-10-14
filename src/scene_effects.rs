@@ -131,6 +131,8 @@ pub(crate) fn placed(game_dir: &std::path::Path, scene_name: &str) -> Vec<Placed
                         let across = |k: usize| ext.iter().map(|v| v[k].abs()).sum::<f32>();
                         [across(0), across(2)]
                     },
+                    // Its `intensity` (x[0, 4]): a fog slab's density.
+                    strength: e.intensity.clamp(0.0, 4.0),
                 },
             })
         })
