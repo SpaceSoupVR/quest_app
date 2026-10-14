@@ -40,6 +40,7 @@ mod soundmap_client;
 // developer actually types on.
 mod brush_render;
 mod draw_range;
+mod level_limits;
 mod offline_frame;
 mod probe_level;
 mod flashlight;
@@ -238,8 +239,16 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let mut static_scene = grab_detect::StaticScene::load(&dir, &entry_scene);
+    // A level past one of the fixed tables says so, loudly, once.
+    if let Some(scene) = load_entry_scene(&dir, &static_scene.scene_name) {
+        level_limits::report(&static_scene.scene_name, &scene);
+    }
     let mut loaded_terrain = load_scene_terrain(&dir, &static_scene.scene_name);
     let mut brushes = load_scene_brushes(&dir, &static_scene.scene_name);
+    // The world assembly of the brushes the renderer was last told about
+    // (`BrushGeometry::world_revision`): `None` until the first frame, and
+    // after another level's brushes are loaded.
+    let mut brush_revision_sent: Option<u64> = None;
     // The standalone lighting path: a game with no multiplayer server still has
     // to light its levels. See scene_lights.
     let mut static_lights = scene_lights::load(&dir, &static_scene.scene_name);
@@ -710,6 +719,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     // The lenses' hidden area is logged from the first located views, and
     // again whenever the runtime says it changed.
     let mut visibility_mask_due = xr.has_visibility_mask;
+    // THE GROUND'S SPLIT, NOW, with the level's ground and probe table both
+    // loaded -- not on the first frame that draws it. See `prepare_ground`.
+    prepare_ground(&mut renderer, loaded_terrain.as_mut().map(|(t, _)| t), "at the level's load");
     'main: loop {
         pump_android_events(&mut exit);
         if exit {
@@ -1067,11 +1079,15 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     static_scene.scene_name, w.scene_name
                 );
                 static_scene = grab_detect::StaticScene::load(&dir, &w.scene_name);
+                if let Some(scene) = load_entry_scene(&dir, &w.scene_name) {
+                    level_limits::report(&w.scene_name, &scene);
+                }
                 loaded_terrain = load_scene_terrain(&dir, &w.scene_name);
                 renderer.ground_changed();
                 // Per scene, like the terrain: the previous level's walls would
                 // otherwise still be standing in this one.
                 brushes = load_scene_brushes(&dir, &w.scene_name);
+                brush_revision_sent = None;
                 static_lights = scene_lights::load(&dir, &w.scene_name);
                 baked_lights = scene_lights::load_baked(&dir, &w.scene_name);
                 stationary_channels = scene_lights::stationary_channels(&dir, &w.scene_name);
@@ -1113,6 +1129,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 renderer.set_ground_horizon(loaded_terrain.as_ref().and_then(|(t, _)| {
                     Some((t.ground_occluder(static_scene.terrain.as_ref())?, t.chunk_world_bounds()))
                 }));
+                // (With the probe table the renderer holds now; a table that
+                // arrives after it makes the split again, once, in a frame.)
+                prepare_ground(&mut renderer, loaded_terrain.as_mut().map(|(t, _)| t), "at a scene change");
             }
         }
 
@@ -1663,12 +1682,21 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             });
         // Transformed into the player's frame here rather than at load, and
         // only when something moved -- see BrushGeometry::assemble.
-        let brush_arg = brushes.assemble(
-            hidden_brushes,
-            offset,
-            yaw_inv,
-            locomotion.player_yaw,
-        );
+        // IN THE WORLD, untouched, where the renderer poses the brushes
+        // itself (`XrRenderer::brushes_in_world`); it is told when they are
+        // other brushes than it holds (a wall hidden or shown, another level).
+        let brushes_world = renderer.brushes_in_world();
+        if brushes_world {
+            brushes.assemble_world(hidden_brushes);
+            if brush_revision_sent != Some(brushes.world_revision()) {
+                brush_revision_sent = Some(brushes.world_revision());
+                renderer.brushes_changed();
+            }
+        }
+        let brush_arg = match brushes_world {
+            true => brushes.assemble_world(hidden_brushes),
+            false => brushes.assemble(hidden_brushes, offset, yaw_inv, locomotion.player_yaw),
+        };
         renderer.note_cpu("pose_ms", pose_clock.elapsed().as_secs_f64() * 1e3);
 
         // SHARPENING NEVER RIDES WITH SPACEWARP: together the compositor tore
@@ -1800,6 +1828,27 @@ fn load_scene_brushes(
             log::warn!("brush_render: could not read {} for brushes: {e}", path.display());
             brush_render::BrushGeometry::default()
         }
+    }
+}
+
+/// A level's scene file, read for a check at load; `None` if it cannot be.
+#[cfg(target_os = "android")]
+fn load_entry_scene(game_dir: &std::path::Path, scene_name: &str) -> Option<space_soup_engine::scene::Scene> {
+    space_soup_engine::scene::Scene::load(&space_soup_engine::Manifest::scene_path(game_dir, scene_name)).ok()
+}
+
+/// THE GROUND'S SLOPE AND GROUND-CLASS SPLIT MADE AT LOAD, where the ground
+/// is handed over in the world (what a frame hands the renderer is then the
+/// same slices whatever the rig does): `XrRenderer::prepare_ground` with the
+/// ground as the first frame will hand it. With the app posing the ground
+/// (`debug.spacesoup.worldground 0`) it is left to the first frame, as before.
+#[cfg(target_os = "android")]
+fn prepare_ground(renderer: &mut space_soup::renderer::xr_renderer::XrRenderer, terrain: Option<&mut terrain_render::TerrainGeometry>, when: &str) {
+    let Some(t) = terrain.filter(|_| renderer.ground_in_world()) else { return };
+    t.assemble_world(Vec3::ZERO, Quat::IDENTITY, 0.0);
+    let chunks = t.caster_chunks();
+    if let Some((vertices, indices)) = t.assemble_world(Vec3::ZERO, Quat::IDENTITY, 0.0) {
+        renderer.prepare_ground(vertices, indices, &chunks, when);
     }
 }
 

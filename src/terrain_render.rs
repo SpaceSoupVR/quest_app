@@ -62,13 +62,126 @@ pub fn bury_under_structures(
     indices: &[u32],
     solids: &[BrushSolid],
 ) -> (Vec<u32>, Burial) {
-    let buried: Vec<bool> = positions
-        .iter()
-        .map(|p| {
-            let probe = [p.x as f64, (p.y - BURIED_PROBE_DEPTH) as f64, p.z as f64];
-            solids.iter().any(|s| contains_point(s, probe, 1e-4))
+    let (kept, burial, _) = bury_indexed(positions, indices, &SolidIndex::new(solids));
+    (kept, burial)
+}
+
+/// THE LEVEL'S BRUSH SOLIDS BY WHERE THEY STAND, so "is this point inside a
+/// solid" asks the few solids over that spot and not every solid of the
+/// level.
+///
+/// `bury_under_structures` asked every ground vertex against every solid:
+/// samples x solids, both of which grow with the level's area -- 13 ms on
+/// test_room, 210 ms at 625 samples a side, 2.5 s at 1,025, 39 s at 2,049
+/// (`docs/scale-audit-2026-10-13.md`, L1). Nearly all of the ground is under
+/// no building at all.
+///
+/// A grid over the solids' footprints (x, z), each cell listing the solids
+/// whose box reaches it. A point outside the grid, or in an empty cell, is
+/// answered without a plane test; in a cell, by the solids listed there whose
+/// box holds it. THE SAME ANSWER as asking them all (a solid can only hold a
+/// point its own box holds; the boxes are widened by more than the test's
+/// tolerance; a solid with no box -- unbounded, degenerate -- is asked every
+/// time, as before): `the_indexed_burial_is_the_burial_asked_of_every_solid`.
+///
+/// WHAT IT COSTS NOW: the ground's vertices, once each, plus the plane tests
+/// under buildings -- linear in the level's samples.
+pub struct SolidIndex<'a> {
+    solids: &'a [BrushSolid],
+    /// Each solid's box, widened; `None` for one without.
+    boxes: Vec<Option<([f64; 3], [f64; 3])>>,
+    /// Solids with no box: asked for every point.
+    boxless: Vec<u32>,
+    origin: [f64; 2],
+    cell: f64,
+    cells_x: usize,
+    cells_z: usize,
+    cells: Vec<Vec<u32>>,
+    /// Plane-set tests made (`contains_point` calls): what the index is for.
+    tests: std::cell::Cell<u64>,
+}
+
+impl<'a> SolidIndex<'a> {
+    /// Wider than `contains_point`'s tolerance here (1e-4), so no solid is
+    /// missed at its own surface.
+    const SLACK: f64 = 1e-3;
+    /// Past this a face's extent is the CSG's seed polygon showing through
+    /// (`brush::HUGE`, 1e5, over root three for a tilted face): the solid is
+    /// open that way and is asked for every point instead.
+    const BOUNDED: f64 = 2.5e4;
+
+    pub fn new(solids: &'a [BrushSolid]) -> Self {
+        let boxes: Vec<Option<([f64; 3], [f64; 3])>> = solids
+            .iter()
+            .map(|s| {
+                // A solid open on some side has faces that run to the size
+                // the CSG seeds a face at (100 km): its "box" is not one.
+                space_soup_engine::brush::solid_bounds(s)
+                    .filter(|(lo, hi)| lo.iter().chain(hi.iter()).all(|c| c.is_finite() && c.abs() < Self::BOUNDED))
+                    .map(|(lo, hi)| (lo.map(|c| c - Self::SLACK), hi.map(|c| c + Self::SLACK)))
+            })
+            .collect();
+        let boxless: Vec<u32> = boxes.iter().enumerate().filter(|(_, b)| b.is_none()).map(|(i, _)| i as u32).collect();
+        let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for (l, h) in boxes.iter().flatten() {
+            lo = [lo[0].min(l[0]), lo[1].min(l[2])];
+            hi = [hi[0].max(h[0]), hi[1].max(h[2])];
+        }
+        let boxed = boxes.iter().flatten().count();
+        if boxed == 0 {
+            return Self { solids, boxes, boxless, origin: [0.0; 2], cell: 1.0, cells_x: 0, cells_z: 0, cells: Vec::new(), tests: Default::default() };
+        }
+        // About as many cells as solids, and no cell under 4 m: a building's
+        // solids share a few cells, an open level's cells are mostly empty.
+        let side = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(1.0);
+        let per_axis = ((boxed as f64).sqrt().ceil() as usize * 2).clamp(1, 512);
+        let cell = (side / per_axis as f64).max(4.0);
+        let cells_x = (((hi[0] - lo[0]) / cell).floor() as usize + 1).max(1);
+        let cells_z = (((hi[1] - lo[1]) / cell).floor() as usize + 1).max(1);
+        let mut cells = vec![Vec::new(); cells_x * cells_z];
+        for (i, b) in boxes.iter().enumerate() {
+            let Some((l, h)) = b else { continue };
+            let at = |v: f64, o: f64, n: usize| (((v - o) / cell).floor().max(0.0) as usize).min(n - 1);
+            for cz in at(l[2], lo[1], cells_z)..=at(h[2], lo[1], cells_z) {
+                for cx in at(l[0], lo[0], cells_x)..=at(h[0], lo[0], cells_x) {
+                    cells[cz * cells_x + cx].push(i as u32);
+                }
+            }
+        }
+        Self { solids, boxes, boxless, origin: lo, cell, cells_x, cells_z, cells, tests: Default::default() }
+    }
+
+    /// Whether any solid holds `p`, within `tolerance`.
+    pub fn holds(&self, p: [f64; 3], tolerance: f64) -> bool {
+        let inside = |i: u32| {
+            self.tests.set(self.tests.get() + 1);
+            contains_point(&self.solids[i as usize], p, tolerance)
+        };
+        if self.boxless.iter().any(|&i| inside(i)) {
+            return true;
+        }
+        let (fx, fz) = ((p[0] - self.origin[0]) / self.cell, (p[2] - self.origin[1]) / self.cell);
+        if !(fx >= 0.0 && fz >= 0.0) || fx as usize >= self.cells_x || fz as usize >= self.cells_z {
+            return false;
+        }
+        self.cells[fz as usize * self.cells_x + fx as usize].iter().any(|&i| {
+            let (lo, hi) = self.boxes[i as usize].expect("only boxed solids are listed");
+            (0..3).all(|k| p[k] >= lo[k] && p[k] <= hi[k]) && inside(i)
         })
-        .collect();
+    }
+
+    /// Plane-set tests made so far.
+    pub fn tests(&self) -> u64 {
+        self.tests.get()
+    }
+}
+
+/// [`bury_under_structures`] through an index of the solids; also how many
+/// plane-set tests it took.
+fn bury_indexed(positions: &mut [Vec3], indices: &[u32], solids: &SolidIndex) -> (Vec<u32>, Burial, u64) {
+    let before = solids.tests();
+    let covered = |q: Vec3| solids.holds([q.x as f64, (q.y - BURIED_PROBE_DEPTH) as f64, q.z as f64], 1e-4);
+    let buried: Vec<bool> = positions.iter().map(|p| covered(*p)).collect();
     // COVERED ACROSS ITS WHOLE AREA, not just at its corners. Three buried
     // corners prove a triangle covered only under a CONVEX footprint. Where the
     // hallway meets a hall the footprint is an L, and a triangle with a corner
@@ -77,10 +190,6 @@ pub fn bury_under_structures(
     // triangle whose corners are all buried is also sampled across its area,
     // and kept -- lowered, like any triangle crossing a wall -- if any sample
     // is open ground. Only triangles already buried at every corner pay for it.
-    let covered = |q: Vec3| {
-        let probe = [q.x as f64, (q.y - BURIED_PROBE_DEPTH) as f64, q.z as f64];
-        solids.iter().any(|s| contains_point(s, probe, 1e-4))
-    };
     let fully_covered = |a: Vec3, b: Vec3, c: Vec3| {
         (0..=COVERAGE_SAMPLES).all(|i| {
             (0..=(COVERAGE_SAMPLES - i)).all(|j| {
@@ -105,7 +214,7 @@ pub fn bury_under_structures(
             burial.lowered_vertices += 1;
         }
     }
-    (kept, burial)
+    (kept, burial, solids.tests() - before)
 }
 
 /// Ground vertices and indices in the renderer's own format.
@@ -898,6 +1007,115 @@ mod burial_tests {
             }
         }
         (p, idx)
+    }
+
+    /// The burial as it was: every vertex and every sample against every
+    /// solid of the level.
+    fn bury_asking_every_solid(positions: &mut [Vec3], indices: &[u32], solids: &[BrushSolid]) -> (Vec<u32>, Burial, u64) {
+        let tests = std::cell::Cell::new(0u64);
+        let covered = |q: Vec3| {
+            let probe = [q.x as f64, (q.y - BURIED_PROBE_DEPTH) as f64, q.z as f64];
+            solids.iter().any(|s| {
+                tests.set(tests.get() + 1);
+                contains_point(s, probe, 1e-4)
+            })
+        };
+        let buried: Vec<bool> = positions.iter().map(|p| covered(*p)).collect();
+        let mut kept = Vec::new();
+        let mut burial = Burial::default();
+        for tri in indices.chunks_exact(3) {
+            let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| positions[i as usize]);
+            let whole = (0..=COVERAGE_SAMPLES).all(|i| {
+                (0..=(COVERAGE_SAMPLES - i)).all(|j| covered(a + (b - a) * (i as f32 / COVERAGE_SAMPLES as f32) + (c - a) * (j as f32 / COVERAGE_SAMPLES as f32)))
+            });
+            if tri.iter().all(|&i| buried[i as usize]) && whole {
+                burial.hidden_triangles += 1;
+            } else {
+                kept.extend_from_slice(tri);
+            }
+        }
+        for (p, b) in positions.iter_mut().zip(&buried) {
+            if *b {
+                p.y -= BURIED_DROP;
+                burial.lowered_vertices += 1;
+            }
+        }
+        (kept, burial, tests.get())
+    }
+
+    /// A LEVEL LARGER THAN test_room: 121 x 121 samples of rolling ground and
+    /// 144 buildings on it -- floors of every size, some overlapping, some
+    /// L-shaped by two solids, some raised off the ground, some sunk into a
+    /// hillside, one tilted. THE INDEXED BURIAL IS THE BURIAL ASKED OF EVERY
+    /// SOLID: the same triangles kept, the same vertices lowered, bit for
+    /// bit. And it does not ask every solid: under a tenth of the plane
+    /// tests here, where the old way's count is vertices x solids.
+    #[test]
+    fn the_indexed_burial_is_the_burial_asked_of_every_solid() {
+        let n = 121u32;
+        let (mut positions, indices) = flat(n, 0.0);
+        for p in positions.iter_mut() {
+            p.x *= 3.0;
+            p.z *= 3.0;
+            p.y = 0.6 * ((p.x * 0.13).sin() + (p.z * 0.11).cos());
+        }
+        let (lo, hi) = positions.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), p| (l.min(*p), h.max(*p)));
+        let mut solids: Vec<BrushSolid> = Vec::new();
+        for k in 0..144u32 {
+            let (i, j) = ((k % 12) as f64, (k / 12) as f64);
+            let x = lo.x as f64 + (hi.x - lo.x) as f64 * (i + 0.5) / 12.0 + (k as f64 * 0.37).sin() * 3.0;
+            let z = lo.z as f64 + (hi.z - lo.z) as f64 * (j + 0.5) / 12.0 + (k as f64 * 0.53).cos() * 3.0;
+            let (w, d) = (2.0 + (k % 5) as f64 * 1.7, 1.5 + (k % 7) as f64 * 1.3);
+            let lift = if k % 9 == 4 { 2.0 } else { -0.4 - (k % 3) as f64 * 0.5 };
+            solids.push(block_solid([x - w, lift, z - d], [x + w, lift + 1.2, z + d], "m"));
+            if k % 4 == 1 {
+                // An L: a second solid off one corner.
+                solids.push(block_solid([x + w - 0.5, lift, z + d - 0.5], [x + w + 4.0, lift + 1.2, z + d + 6.0], "m"));
+            }
+        }
+        // One whose faces are not axis planes: a wedge cut off a block.
+        let wedge = block_solid([-6.0, -1.0, -6.0], [6.0, 1.5, 6.0], "m");
+        let (cut, _) = space_soup_engine::brush::split_solid(&wedge, space_soup_engine::brush::Plane::new([0.6, 0.0, 0.8], 1.0));
+        solids.extend(cut);
+
+        let mut asked = positions.clone();
+        let (kept_all, burial_all, tests_all) = bury_asking_every_solid(&mut asked, &indices, &solids);
+        let mut indexed = positions.clone();
+        let (kept, burial, tests) = bury_indexed(&mut indexed, &indices, &SolidIndex::new(&solids));
+        assert!(burial_all.hidden_triangles > 500 && burial_all.lowered_vertices > 500, "the level buries ground: {burial_all:?}");
+        assert_eq!(burial, burial_all);
+        assert_eq!(kept, kept_all);
+        assert!(asked.iter().zip(&indexed).all(|(a, b)| a.to_array() == b.to_array()));
+        // What the index is for. (As it was: every vertex against every solid.)
+        assert!(tests_all >= positions.len() as u64 * solids.len() as u64 / 2, "{tests_all}");
+        assert!(tests * 10 < tests_all, "{tests} plane-set tests through the index, {tests_all} asking every solid");
+        // And the public entry is the indexed one.
+        let mut again = positions.clone();
+        assert_eq!(bury_under_structures(&mut again, &indices, &solids), (kept, burial));
+    }
+
+    /// A solid with no box of its own -- too few faces to close -- is still
+    /// asked for every point, as before; and no solid at all buries nothing.
+    #[test]
+    fn a_solid_without_a_box_is_still_asked_and_no_solids_bury_nothing() {
+        let (positions, indices) = flat(9, 0.0);
+        let mut none = positions.clone();
+        let (kept, burial) = bury_under_structures(&mut none, &indices, &[]);
+        assert_eq!((kept.len(), burial), (indices.len(), Burial::default()));
+        // A half space: everything under y = 1 is inside it.
+        let block = block_solid([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0], "m");
+        let half = BrushSolid { faces: block.faces.iter().filter(|f| f.plane().n[1] > 0.5).cloned().collect() };
+        // (Its one face's polygon is the CSG's seed quad, flat in y: a box
+        // that holds none of the ground under it. Taken as a box, it would
+        // bury nothing.)
+        let index = SolidIndex::new(std::slice::from_ref(&half));
+        assert_eq!((index.boxless.len(), index.cells.iter().map(Vec::len).sum::<usize>()), (1, 0));
+        let mut asked = positions.clone();
+        let (kept_all, burial_all, _) = bury_asking_every_solid(&mut asked, &indices, std::slice::from_ref(&half));
+        let mut indexed = positions.clone();
+        let (kept, burial) = bury_under_structures(&mut indexed, &indices, std::slice::from_ref(&half));
+        assert_eq!((kept, burial), (kept_all, burial_all));
+        assert_eq!(burial.lowered_vertices, positions.len());
     }
 
     #[test]

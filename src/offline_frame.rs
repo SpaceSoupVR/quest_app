@@ -215,6 +215,16 @@ fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
 /// Render `scene_name` from `view`. `None` when no GPU is available.
 pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     let (device, queue) = device()?;
+    // THE BRUSHES IN THE WORLD, posed by their vertex shaders, as a launch
+    // that keeps them so draws them: `WORLD_BRUSHES=1` / `=0`, else the
+    // launch's own default. Before any brush pipeline is built, which reads
+    // it. See `brush_pipeline::WORLD_BRUSHES`.
+    let world_brushes = match std::env::var("WORLD_BRUSHES").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => space_soup::renderer::static_brush::WORLD_BRUSHES_BY_DEFAULT,
+    };
+    space_soup::renderer::brush_pipeline::WORLD_BRUSHES.store(world_brushes, std::sync::atomic::Ordering::Relaxed);
     let game = crate::offline_frame::offline_game_dir();
     let scene = space_soup_engine::scene::Scene::load(&space_soup_engine::Manifest::scene_path(&game, scene_name)).ok()?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -857,18 +867,26 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         stationary.first().map(|m| (stationary_layers.as_slice(), m.width, m.height)),
     );
 
-    let (verts, idx) = geometry.assemble(&[], offset, yaw_inv, 0.0)?;
+    // As the headset hands them over: in the world, untouched, or posed for
+    // the rig by the app.
+    eprintln!("offline frame: the brushes {}", if world_brushes { "in the world, posed by their vertex shaders" } else { "posed by the app" });
+    let (verts, idx) = match world_brushes {
+        true => geometry.assemble_world(&[])?,
+        false => geometry.assemble(&[], offset, yaw_inv, 0.0)?,
+    };
     // `BRUSH_CLASSES=1`: DIAGNOSTIC -- the brushes' triangles by what the
     // reflection pass could draw them with were they the ground
     // (`outdoor_pass::LevelGround`): how many, and how much area facing this
     // eye within 20 m, are out of doors or nowhere to the lookup.
     if std::env::var("BRUSH_CLASSES").is_ok() {
         let level = space_soup::renderer::outdoor_pass::LevelGround::of_table(&probes);
-        let eye = to_player(view.eye);
+        // (In the frame the vertices are in.)
+        let eye = if world_brushes { view.eye } else { to_player(view.eye) };
+        let (class_offset, class_yaw) = if world_brushes { (Vec3::ZERO, 0.0) } else { (offset, yaw) };
         let (mut count, mut area, mut near) = ([0u32; 3], [0f32; 3], [0f32; 3]);
         for t in idx.chunks_exact(3) {
             let c = [0, 1, 2].map(|k| verts[t[k] as usize].position);
-            let class = level.class_of_posed(offset, yaw, c);
+            let class = level.class_of_posed(class_offset, class_yaw, c);
             let [a, b, d] = c.map(Vec3::from);
             let n = (b - a).cross(d - a);
             let mid = (a + b + d) / 3.0;
@@ -907,13 +925,22 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         (true, false) => {
             let mut physics = space_soup_engine::rigid_physics::PhysicsWorld::new();
             physics.rebuild(&scene, &game);
-            let mut field = match &rain_at {
+            // The level's own layers as the headset chooses them
+            // (`weather_render::layers`: the washed shore first, then the
+            // areas nearest the player's start).
+            let (mut field, level_shores) = match &rain_at {
                 Some(b) => {
                     let def: space_soup_engine::weather::WeatherDef =
                         serde_json::from_value(serde_json::json!({ "name": "RAIN_AT", "bounds": [b[0], b[1], b[2], b[3]], "start": { "wetness": 1.0 } })).expect("a rain area");
-                    space_soup_engine::weather::WeatherField::new(&[def], |x, z| physics.raycast_down(Vec3::new(x, 400.0, z), 800.0).map(|(hit, _)| hit.y))
+                    (space_soup_engine::weather::WeatherField::new(&[def], |x, z| physics.raycast_down(Vec3::new(x, 400.0, z), 800.0).map(|(hit, _)| hit.y)), None)
                 }
-                None => crate::weather_render::field(&scene, &physics),
+                None => {
+                    let (field, shores, dropped) = crate::weather_render::layers(&scene, &physics);
+                    if !dropped.is_empty() {
+                        eprintln!("offline frame: WEATHER: {} area(s) of {} found no layer and are not shown", dropped.len(), scene.weather.len());
+                    }
+                    (field, Some(shores))
+                }
             };
             let time: f64 = std::env::var("WEATHER_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(600.0);
             field.set_time(time);
@@ -932,7 +959,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             for (d, _, st) in &field.areas {
                 eprintln!("offline frame: weather {:?} at {time} s: {st:?}", d.name);
             }
-            let shores = crate::weather_render::shores(&scene.water, &physics, field.areas.len());
+            let shores = level_shores.unwrap_or_else(|| crate::weather_render::shores(&scene.water, &physics, field.areas.len()));
             let waves_time: f64 = std::env::var("WATER_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(30.0);
             for s in &shores {
                 eprintln!("offline frame: shore at y={:.2}: {}x{} texels of {:.2} m, {} with sand in the wash", s.sea, s.nx, s.nz, s.cell[0], s.active());
@@ -1308,7 +1335,16 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         let brushes = level.then_some((&vb, &ib, idx.len() as u32));
         shadows.upload_light(&queue, ShadowKind::Sun, m);
         shadows.set_solid_world(terrain.as_ref().and_then(|t| t.world_model.as_ref()).map(|m| &m.bind_group), true);
+        // World brushes cast through the same matrix: the player's frame
+        // from the world (`ShadowMap::set_brush_world`).
+        let brush_model = (level && world_brushes).then(|| {
+            let model = space_soup::renderer::mesh_pipeline::MeshPipeline::new(&device, format, &uniforms.layout).create_model_uniform(&device);
+            model.upload(&queue, Mat4::from_quat(yaw_inv) * Mat4::from_translation(-offset));
+            model
+        });
+        shadows.set_brush_world(brush_model.as_ref().map(|m| &m.bind_group));
         let drawn = shadows.record(&mut encoder, ShadowKind::Sun, solid, brushes, &casters, &[], &[], m);
+        shadows.set_brush_world(None);
         if level {
             eprintln!("offline frame: static sun map {TOD_STATIC_SUN_SIZE}^2 recorded ({drawn} indices)");
         }
@@ -3131,13 +3167,13 @@ mod exposure_calibration {
 mod bench_views {
     use super::*;
 
-    /// The benchmark's viewpoints (`bench_views.json`), as `bench.py` pins
-    /// the headset's camera to them.
-    pub(super) fn bench_views() -> Vec<(String, Vec3, Vec3)> {
+    fn views_doc() -> serde_json::Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bench_views.json");
-        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        doc["views"]
-            .as_array()
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn views_in(list: &serde_json::Value) -> Vec<(String, Vec3, Vec3)> {
+        list.as_array()
             .unwrap()
             .iter()
             .map(|v| {
@@ -3145,6 +3181,60 @@ mod bench_views {
                 (v["name"].as_str().unwrap().to_string(), at("eye"), at("at"))
             })
             .collect()
+    }
+
+    /// The benchmark's viewpoints (`bench_views.json`), as `bench.py` pins
+    /// the headset's camera to them.
+    pub(super) fn bench_views() -> Vec<(String, Vec3, Vec3)> {
+        views_in(&views_doc()["views"])
+    }
+
+    /// The levels `bench_views.json` names beside test_room (`"levels"`), each
+    /// with the views only it has: a stress level made by
+    /// `docs/scale-audit-2026-10-13/make_stress_levels.sh`.
+    pub(super) fn level_views() -> Vec<(String, Vec<(String, Vec3, Vec3)>)> {
+        let doc = views_doc();
+        doc["levels"].as_object().map_or_else(Vec::new, |levels| levels.iter().map(|(name, l)| (name.clone(), views_in(&l["views"]))).collect())
+    }
+
+    /// The views of the level the offline frame opens (`offline_scene`):
+    /// test_room's -- a stress level's home tile IS test_room, at its own
+    /// coordinates -- and then the level's own.
+    pub(super) fn views_of(scene: &str) -> Vec<(String, Vec3, Vec3)> {
+        let mut views = bench_views();
+        views.extend(level_views().into_iter().filter(|(name, _)| name == scene).flat_map(|(_, v)| v));
+        views
+    }
+
+    /// EVERY LEVEL'S OWN VIEWS ARE VIEWS `bench.py` RUNS AND THE RENDERER
+    /// READS: named once across test_room's and the level's, and its lever
+    /// file, written by the script for `--level`, parsed by the renderer --
+    /// a walk's path and speed with it.
+    #[test]
+    fn a_levels_own_views_are_named_once_and_read_by_the_renderer() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bench.py");
+        let levels = level_views();
+        assert!(levels.iter().any(|(name, v)| name == "stress_625" && v.len() >= 6), "the standing stress level and its six views");
+        for (level, own) in levels {
+            let all = views_of(&level);
+            let mut names: Vec<&str> = all.iter().map(|(n, _, _)| n.as_str()).collect();
+            names.sort_unstable();
+            names.dedup();
+            assert_eq!(names.len(), all.len(), "{level}: a view named twice");
+            for (name, eye, at) in own {
+                assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'), "{name}");
+                let run = std::process::Command::new("python3").arg(&script).args(["--level", &level, "--print-levers", &name]).output();
+                let Ok(run) = run else {
+                    eprintln!("skipping: no python3");
+                    return;
+                };
+                assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+                let text = String::from_utf8(run.stdout).unwrap();
+                let levers = space_soup::renderer::levers::Levers::parse(&text).unwrap_or_else(|e| panic!("{name}: {e}\n{text}"));
+                let bench = levers.bench.as_ref().unwrap();
+                assert_eq!((bench.name.as_str(), Vec3::from(bench.eye), Vec3::from(bench.at)), (name.as_str(), eye, at));
+            }
+        }
     }
 
     /// WHAT `bench.py` WRITES INTO THE LEVER FILE IS WHAT THE RENDERER READS.
@@ -3172,8 +3262,7 @@ mod bench_views {
     /// Each viewpoint's flashlight, if it carries one: its glass, where it is
     /// aimed, and whether its torch is drawn.
     fn bench_flashlights() -> std::collections::HashMap<String, (Vec3, Vec3, bool)> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bench_views.json");
-        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let doc = views_doc();
         let v3 = |v: &serde_json::Value| Vec3::from(<[f32; 3]>::try_from(serde_json::from_value::<Vec<f32>>(v.clone()).unwrap()).unwrap());
         doc["views"]
             .as_array()
@@ -3194,7 +3283,9 @@ mod bench_views {
 /// (`EFFECTS=0` leaves them out, `EFFECTS_TIME` sets their clock) and the
 /// water and sky (`WATER=0` leaves them out, `WATER_TIME`). `ONLY=a,b` for
     /// some of them, `CUT=<scene register cut>` for the brushes' scene shader
-    /// with one of its measurement cuts.
+    /// with one of its measurement cuts. `SCENE=<level>` (with `GAME_DIR`,
+    /// the folder it was generated in) opens another level by name --
+    /// `stress_625` -- and adds its own views (`"levels"` in the views file).
     #[test]
     #[ignore]
     fn render_the_bench_views() {
@@ -3203,7 +3294,8 @@ mod bench_views {
         let terrain = std::env::var("TERRAIN").as_deref() != Ok("0");
         let cut = std::env::var("CUT").ok().map(|c| &*Box::leak(c.into_boxed_str()));
         let lights = bench_flashlights();
-        for (name, eye, at) in bench_views() {
+        let scene = offline_scene();
+        for (name, eye, at) in views_of(&scene) {
             if only.as_ref().is_some_and(|o| !o.split(',').any(|n| n == name)) {
                 continue;
             }
@@ -3218,8 +3310,12 @@ mod bench_views {
             // difference at triangle edges from one inside them.
             let base = View::headset(eye, at);
             let samples = std::env::var("MSAA").ok().and_then(|n| n.parse().ok()).unwrap_or(base.samples);
-            let Some(shot) = render_brushes("test_room", View { adapt: true, flashlight, torch, terrain, cut, effects, water, weather, samples, ..base }) else {
-                eprintln!("skipping: no GPU or no test_room");
+            // `YAW=degrees`: the RIG turned, as a snap turn leaves it -- the
+            // same picture, through every turn's worth of posing (the app's,
+            // or the vertex shaders' for geometry kept in the world).
+            let yaw_deg = std::env::var("YAW").ok().and_then(|n| n.parse().ok()).unwrap_or(base.yaw_deg);
+            let Some(shot) = render_brushes(&scene, View { adapt: true, flashlight, torch, terrain, cut, effects, water, weather, samples, yaw_deg, ..base }) else {
+                eprintln!("skipping: no GPU or no {scene} (a level with no brush lightmap is not drawn)");
                 return;
             };
             shot.save(&out.join(format!("bench_{name}.png")));
@@ -3350,7 +3446,8 @@ mod bench_views {
     /// ONE VIEWPOINT from the environment, to look again at something seen on
     /// the headset: `EYE=x,y,z` looking at `AT=x,y,z`, a flashlight held at
     /// `TORCH_AT` and aimed at `TORCH_AIM` if both are set, `CUT` and
-    /// `TERRAIN=0` as for the bench views. `$OUT/$NAME.png` (`view`).
+    /// `TERRAIN=0` as for the bench views, `SCENE` the level (test_room).
+    /// `$OUT/$NAME.png` (`view`).
     #[test]
     #[ignore]
     fn render_one_view() {
@@ -3369,8 +3466,9 @@ mod bench_views {
         let effects = std::env::var("EFFECTS").as_deref() != Ok("0");
         let water = std::env::var("WATER").as_deref() != Ok("0");
         let weather = std::env::var("WEATHER").as_deref() != Ok("0");
-        let Some(shot) = render_brushes("test_room", View { adapt: true, flashlight, terrain, cut, effects, water, weather, ..View::headset(eye, at) }) else {
-            eprintln!("skipping: no GPU or no test_room");
+        let scene = offline_scene();
+        let Some(shot) = render_brushes(&scene, View { adapt: true, flashlight, terrain, cut, effects, water, weather, ..View::headset(eye, at) }) else {
+            eprintln!("skipping: no GPU or no {scene}");
             return;
         };
         shot.save(&out.join(format!("{name}.png")));
@@ -3706,6 +3804,14 @@ mod aliasing {
 /// The game folder the offline frames read: `GAME_DIR` when set -- a frozen
 /// copy, so two renders compare while the level's bakes change -- else the
 /// workspace's.
+/// The level the offline bench views open: `SCENE` when set -- a stress
+/// level generated beside test_room in `GAME_DIR`
+/// (`docs/scale-audit-2026-10-13/make_stress_levels.sh`) -- else test_room.
+#[cfg(test)]
+pub(crate) fn offline_scene() -> String {
+    std::env::var("SCENE").unwrap_or_else(|_| "test_room".into())
+}
+
 pub(crate) fn offline_game_dir() -> std::path::PathBuf {
     std::env::var("GAME_DIR")
         .map(std::path::PathBuf::from)

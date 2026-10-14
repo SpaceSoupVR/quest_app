@@ -23,6 +23,54 @@ pub fn field(scene: &space_soup_engine::scene::Scene, physics: &space_soup_engin
     WeatherField::new(&scene.weather, |x, z| physics.raycast_down(Vec3::new(x, SKY_Y, z), SKY_DROP).map(|(hit, _)| hit.y))
 }
 
+/// A LEVEL'S LAYERS OF THE WEATHER'S MAPS, which hold
+/// `space_soup_engine::weather::MAX_AREAS` of them: THE SEA'S WASHED SHORE
+/// FIRST -- it is one body's and the whole coast's -- then the areas of
+/// weather nearest where the player starts, and which areas (by index in the
+/// scene) found no layer.
+///
+/// The areas took the layers first, in the file's order, and the shore what
+/// was left: on any level with four areas the sea's wet sand was gone, with
+/// nothing said (`docs/scale-audit-2026-10-13.md`, F7: every stress level
+/// above test_room). And an area's ground was found -- a ray a texel -- for
+/// areas there was no layer for.
+pub fn layers(
+    scene: &space_soup_engine::scene::Scene,
+    physics: &space_soup_engine::rigid_physics::PhysicsWorld,
+) -> (WeatherField, Vec<Shore>, Vec<usize>) {
+    let from = scene.objects.iter().find(|o| o.spawn_point.is_some()).map_or([0.0, 0.0], |o| [o.cuboid.position.x, o.cuboid.position.z]);
+    layers_over(
+        &scene.water,
+        &scene.weather,
+        from,
+        |x, z| physics.raycast_down(Vec3::new(x, SKY_Y, z), SKY_DROP).map(|(hit, _)| hit.y),
+        |x, z, top, drop| physics.raycast_down(Vec3::new(x, top, z), drop).is_some(),
+    )
+}
+
+/// [`layers`] over any ground: `cover` the highest thing over a point,
+/// `sand` whether there is ground under (`x`, `z`) between `top` and `drop`
+/// below it (`Shore::find`'s question).
+pub fn layers_over(
+    water: &[WaterDef],
+    weather: &[space_soup_engine::weather::WeatherDef],
+    from: [f32; 2],
+    cover: impl Fn(f32, f32) -> Option<f32>,
+    sand: impl Fn(f32, f32, f32, f32) -> bool,
+) -> (WeatherField, Vec<Shore>, Vec<usize>) {
+    let shores: Vec<Shore> = match crate::water_render::sea_line(water) {
+        Some(sea) => water
+            .iter()
+            .filter(|d| d.swash > 0.0 && d.height == sea)
+            .filter_map(|d| Shore::find(d, &sand))
+            .take(space_soup_engine::weather::MAX_AREAS)
+            .collect(),
+        None => Vec::new(),
+    };
+    let (field, dropped) = WeatherField::nearest(weather, cover, from, space_soup_engine::weather::MAX_AREAS.saturating_sub(shores.len()));
+    (field, shores, dropped)
+}
+
 /// Each area as the GPU takes it.
 pub fn area_params(field: &WeatherField) -> Vec<AreaParams> {
     field
@@ -300,13 +348,24 @@ impl WeatherClient {
         let Ok(scene) = space_soup_engine::scene::Scene::load(&space_soup_engine::Manifest::scene_path(dir, scene_name)) else {
             return Self::default();
         };
-        let field = field(&scene, physics);
+        let (field, shores, dropped) = layers(&scene, physics);
         for (d, g, _) in &field.areas {
             log::info!("WEATHER area {:?}: {:?}, {}x{} texels of {:.2} m", d.name, d.kind, g.nx, g.nz, g.cell);
         }
-        let shores = shores(&scene.water, physics, field.areas.len());
         for s in &shores {
             log::info!("WEATHER shore at y={:.2}: {}x{} texels of {:.2} m, {} with sand in the wash", s.sea, s.nx, s.nz, s.cell[0], s.active());
+        }
+        if !dropped.is_empty() {
+            // LOUD: these areas have no rain, no snow and no wet ground in
+            // this build, wherever the player goes.
+            log::error!(
+                "WEATHER: THE LEVEL HAS {} AREAS OF WEATHER AND {} WASHED SHORE(S); THE MAPS HOLD {} LAYERS. {} area(s) are NOT SHOWN (the ones furthest from where the player starts): {}",
+                scene.weather.len(),
+                shores.len(),
+                space_soup_engine::weather::MAX_AREAS,
+                dropped.len(),
+                dropped.iter().map(|&i| format!("{:?}", scene.weather[i].name)).collect::<Vec<_>>().join(", "),
+            );
         }
         Self { field, shores, refreshed: None, shores_refreshed: None, body_wet: 0.0 }
     }
@@ -367,6 +426,42 @@ mod tests {
 
     fn sea(swash: f32) -> WaterDef {
         serde_json::from_value(serde_json::json!({ "height": 0.0, "bounds": [-20.0, -20.0, 20.0, 20.0], "swash": swash })).unwrap()
+    }
+
+    /// A LEVEL WITH MORE WEATHER THAN THE MAPS HOLD KEEPS ITS WASHED SHORE:
+    /// seven areas of rain and snow across a level and a sea that washes its
+    /// beach. The shore has its layer, the three areas nearest the player's
+    /// start have the rest, in the scene's order, and the four that found
+    /// none are NAMED, not dropped in silence. (As it was: the first four
+    /// areas in the file took every layer, wherever they were, and the sea's
+    /// wet sand was gone on every level with four areas or more.)
+    #[test]
+    fn a_level_with_more_weather_than_the_maps_hold_keeps_its_washed_shore() {
+        let area = |k: usize| -> space_soup_engine::weather::WeatherDef {
+            let x = k as f32 * 120.0 - 360.0;
+            serde_json::from_value(serde_json::json!({ "name": format!("area_{k}"), "bounds": [x, -10.0, x + 30.0, 20.0] })).unwrap()
+        };
+        let weather: Vec<_> = (0..7).map(area).collect();
+        let cover = |_: f32, _: f32| Some(0.0f32);
+        // The player starts beside area 5 (x = 240..270), far from the first four.
+        let (field, shores, dropped) = layers_over(&[sea(0.3)], &weather, [250.0, 0.0], cover, beach);
+        assert_eq!(shores.len(), 1, "the sea's washed shore has its layer");
+        let kept: Vec<&str> = field.areas.iter().map(|(d, _, _)| d.name.as_deref().unwrap_or("")).collect();
+        assert_eq!(kept, ["area_4", "area_5", "area_6"], "the nearest three, in the scene's order");
+        assert_eq!(dropped, [0, 1, 2, 3]);
+        assert_eq!(layer_params(&field, &shores).len(), space_soup_engine::weather::MAX_AREAS);
+        // The old rule's answer on the same level: every layer to the first
+        // four areas, none left for the shore.
+        let first_four = WeatherField::new(&weather, cover);
+        assert_eq!(first_four.areas.len(), space_soup_engine::weather::MAX_AREAS);
+        assert_eq!(space_soup_engine::weather::MAX_AREAS.saturating_sub(first_four.areas.len()), 0);
+        // A level that fits loses nothing and names nothing: test_room's two
+        // areas and its shore.
+        let (field, shores, dropped) = layers_over(&[sea(0.3)], &weather[..2], [250.0, 0.0], cover, beach);
+        assert_eq!((field.areas.len(), shores.len(), dropped.len()), (2, 1, 0));
+        // No sea: all four layers are the weather's.
+        let (field, shores, dropped) = layers_over(&[], &weather, [-350.0, 0.0], cover, beach);
+        assert_eq!((field.areas.len(), shores.len(), dropped), (4, 0, vec![4, 5, 6]));
     }
 
     /// A beach rising a metre in ten along x, the still waterline at x = 0.

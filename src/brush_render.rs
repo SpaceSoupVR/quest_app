@@ -94,6 +94,14 @@ pub struct BrushGeometry {
     vertices: Vec<BrushVertex>,
     indices: Vec<u32>,
     built_for: Option<(Vec3, f32, u64)>,
+    /// The last assembly IN THE WORLD (`assemble_world`): every shown brush's
+    /// vertices as meshed, never posed, and what hidden set it leaves out.
+    world_vertices: Vec<BrushVertex>,
+    world_indices: Vec<u32>,
+    world_built_for: Option<u64>,
+    /// Counts the assemblies in the world that changed anything, so whoever
+    /// keeps a copy (the renderer's buffers) knows when it is stale.
+    world_revision: u64,
     /// Material ids in array-layer order. The renderer's texture array is built
     /// from this, so index i here is layer i there.
     materials: Vec<String>,
@@ -538,6 +546,48 @@ impl BrushGeometry {
             return None;
         }
         Some((&self.vertices, &self.indices))
+    }
+
+    /// THE BRUSHES AS MESHED, IN THE WORLD, for a renderer that poses them
+    /// itself (`XrRenderer::brushes_in_world`): no vertex is touched for the
+    /// rig, wherever it stands or turns. Built again only when the hidden
+    /// set changes -- a wall shot away or back -- and then
+    /// [`Self::world_revision`] moves, so a renderer keeping them on the GPU
+    /// sends them again (`XrRenderer::brushes_changed`).
+    ///
+    /// WHAT IT COSTS: a frame that changes nothing, a hash of the hidden
+    /// ids -- nothing that grows with the level. [`Self::assemble`] re-posed
+    /// every brush vertex of the level on each frame the rig moved.
+    pub fn assemble_world(&mut self, hidden: &[String]) -> Option<(&[BrushVertex], &[u32])> {
+        if self.objects.is_empty() {
+            return None;
+        }
+        let key = hidden_fingerprint(hidden);
+        if self.world_built_for != Some(key) {
+            let skip: HashSet<&str> = hidden.iter().map(String::as_str).collect();
+            self.world_vertices.clear();
+            self.world_indices.clear();
+            for o in &self.objects {
+                if skip.contains(o.id.as_str()) {
+                    continue;
+                }
+                let base = self.world_vertices.len() as u32;
+                self.world_vertices.extend_from_slice(&o.vertices);
+                self.world_indices.extend(o.indices.iter().map(|i| i + base));
+            }
+            self.world_built_for = Some(key);
+            self.world_revision += 1;
+        }
+        if self.world_vertices.is_empty() || self.world_indices.is_empty() {
+            return None;
+        }
+        Some((&self.world_vertices, &self.world_indices))
+    }
+
+    /// How many times [`Self::assemble_world`] has built other brushes than
+    /// it held: another number, another set of walls.
+    pub fn world_revision(&self) -> u64 {
+        self.world_revision
     }
 }
 
@@ -1308,6 +1358,79 @@ mod tests {
         let spans_z = verts.iter().fold(f32::MIN, |a, v| a.max(v.position[2]))
             - verts.iter().fold(f32::MAX, |a, v| a.min(v.position[2]));
         assert!((spans_z - 4.0).abs() < 1e-3, "the 4m span turned onto z: {spans_z}");
+    }
+
+    /// THE WORLD ASSEMBLY IS THE POSED ONE BEFORE ITS POSING: for any rig,
+    /// posing its vertices as `assemble` does -- points moved and turned,
+    /// directions turned -- gives `assemble`'s own, bit for bit, in the same
+    /// order with the same indices. So a shader that poses a world vertex
+    /// draws what the app's posed vertex drew.
+    #[test]
+    fn the_world_assembly_posed_is_the_posed_assembly() {
+        let scene = scene_of((0..40).map(|k| {
+            let mut w = wall_object(&format!("wall_{k}"));
+            w.cuboid.position = Vec3::new(k as f32 * 7.0 - 100.0, 1.0, (k % 5) as f32 * 11.0);
+            w
+        }).collect());
+        let mut world_side = BrushGeometry::load(&scene);
+        let mut posed_side = BrushGeometry::load(&scene);
+        for (offset, yaw) in [(Vec3::ZERO, 0.0f32), (Vec3::new(63.0, 0.2, -41.5), 0.7), (Vec3::new(-250.0, 3.0, 12.0), -2.9)] {
+            let yaw_inv = Quat::from_rotation_y(-yaw);
+            let (world, world_idx) = world_side.assemble_world(&[]).unwrap();
+            let (world, world_idx) = (world.to_vec(), world_idx.to_vec());
+            let (posed, posed_idx) = posed_side.assemble(&[], offset, yaw_inv, yaw).unwrap();
+            assert_eq!(world_idx, posed_idx);
+            assert_eq!(world.len(), posed.len());
+            for (w, p) in world.iter().zip(posed) {
+                assert_eq!((yaw_inv * (Vec3::from(w.position) - offset)).to_array(), p.position);
+                assert_eq!((yaw_inv * Vec3::from(w.normal)).to_array(), p.normal);
+                assert_eq!((yaw_inv * Vec3::new(w.tangent[0], w.tangent[1], w.tangent[2])).to_array(), [p.tangent[0], p.tangent[1], p.tangent[2]]);
+                assert_eq!(w.tangent[3], p.tangent[3]);
+                assert_eq!((yaw_inv * (Vec3::from(w.face_centre) - offset)).to_array(), p.face_centre);
+                assert_eq!((w.uv, w.uv2, w.uv2_rect, w.face_half_extent, w.material, w.tint), (p.uv, p.uv2, p.uv2_rect, p.face_half_extent, p.material, p.tint));
+            }
+        }
+    }
+
+    /// A LEVEL'S BRUSHES ARE ASSEMBLED ONCE IN THE WORLD, however the rig
+    /// walks -- the posed assembly was built again on every frame it moved
+    /// -- and again only when a brush is hidden or shown, which is what the
+    /// revision counts. A level of 400 walls, larger than test_room's 4.
+    #[test]
+    fn the_world_assembly_is_built_once_and_again_only_when_a_brush_is_hidden_or_shown() {
+        let scene = scene_of((0..400).map(|k| {
+            let mut w = wall_object(&format!("wall_{k}"));
+            w.cuboid.position = Vec3::new((k % 20) as f32 * 9.0, 1.0, (k / 20) as f32 * 9.0);
+            w
+        }).collect());
+        let mut g = BrushGeometry::load(&scene);
+        let all = g.assemble_world(&[]).map(|(v, i)| (v.as_ptr(), v.len(), i.len())).unwrap();
+        assert_eq!(g.world_revision(), 1);
+        // Sixty frames of walking and turning: the rig is no part of it.
+        for _ in 0..60 {
+            assert_eq!(g.assemble_world(&[]).map(|(v, i)| (v.as_ptr(), v.len(), i.len())).unwrap(), all);
+        }
+        assert_eq!(g.world_revision(), 1, "built again with nothing changed");
+        // (The posed assembly, for the same walk: built every frame.)
+        let mut posed = BrushGeometry::load(&scene);
+        let mut first = None;
+        for step in 0..3 {
+            let (v, _) = posed.assemble(&[], Vec3::new(step as f32 * 0.02, 0.0, 0.0), Quat::IDENTITY, 0.0).unwrap();
+            let x = v[0].position[0];
+            assert_ne!(first.replace(x), Some(x), "the posed assembly follows the rig");
+        }
+        // A wall shot away, then back.
+        let hidden = vec!["wall_7".to_string()];
+        let fewer = g.assemble_world(&hidden).map(|(v, i)| (v.len(), i.len())).unwrap();
+        assert!(fewer.0 < all.1 && fewer.1 < all.2);
+        assert_eq!(g.world_revision(), 2);
+        assert_eq!(g.assemble_world(&hidden).map(|(v, i)| (v.len(), i.len())).unwrap(), fewer);
+        assert_eq!(g.world_revision(), 2);
+        assert_eq!(g.assemble_world(&[]).map(|(v, i)| (v.len(), i.len())).unwrap(), (all.1, all.2));
+        assert_eq!(g.world_revision(), 3);
+        // Every index names a vertex of the assembly it is in.
+        let (v, i) = g.assemble_world(&hidden).unwrap();
+        assert!(i.iter().all(|&k| (k as usize) < v.len()));
     }
 
     #[test]
