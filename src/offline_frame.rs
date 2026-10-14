@@ -155,6 +155,12 @@ pub struct View {
     pub weather: bool,
     /// The hinged doors left out, for a test about the brushes alone.
     pub no_doors: bool,
+    /// A PLANAR WATER MIRROR'S IMAGE (`planar_water`): the view mirrored in
+    /// the still surface at this world height, drawn linear at this frame
+    /// exposure times `planar_water::HEADROOM`, flipped left to right so
+    /// every winding stays as the ordinary pipelines take it (the water
+    /// flips it back). Set by the harness itself under `PLANAR_WATER=1`.
+    pub mirror_in: Option<(f32, f32)>,
 }
 
 impl View {
@@ -185,6 +191,7 @@ impl View {
             water: false,
             weather: false,
             no_doors: false,
+            mirror_in: None,
         }
     }
 }
@@ -647,6 +654,16 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         0.0,
     ));
     let view_proj = shift * proj * Mat4::look_at_rh(eye_p, at_p, up);
+    // Mirrored in a still surface (`View::mirror_in`): the mirrored camera,
+    // flipped left to right, and the mirrored eye the shading sees from.
+    let (view_proj, eye_shading) = match view.mirror_in {
+        Some((surface, _)) => {
+            let gl = Mat4::perspective_rh_gl(view.fov_y.to_radians(), view.width as f32 / view.height as f32, 0.03, 1000.0);
+            let (vp, eye) = space_soup::renderer::planar_water::mirror_camera(Mat4::look_at_rh(eye_p, at_p, up), gl, surface - offset.y);
+            (Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0)) * vp, eye)
+        }
+        None => (view_proj, eye_p),
+    };
     let mut probes = space_soup::renderer::uniforms::select_resident_probes(&volumes, view.eye, |_, _| true);
     probes.fill_brightness(&brightness);
     probes.fill_volumes(&rooms);
@@ -768,10 +785,11 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         }
         _ => 0.0,
     };
+    let exposure = view.mirror_in.map_or(exposure, |(_, e)| e * space_soup::renderer::planar_water::HEADROOM);
     uniforms.upload_scene_with_probes(
         &queue,
         view_proj,
-        eye_p,
+        eye_shading,
         &{
             let upload = sun_map.map_or_else(ShadowUpload::disabled, |m| ShadowUpload {
                 sun_view_proj: m,
@@ -786,7 +804,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         &SkyUpload::from(&irradiance),
         &PostUpload {
             exposure,
-            tonemap: if view.linear {
+            tonemap: if view.linear || view.mirror_in.is_some() {
                 space_soup::renderer::tonemap::ToneMapping::None
             } else {
                 Default::default()
@@ -795,7 +813,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             // faded out past that distance, as the lever does on the headset.
             terrain_detail_distance: std::env::var("TERRAIN_DETAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
             reflection_share: false,
-            night_vision: tod_night_vision,
+            night_vision: if view.mirror_in.is_some() { 0.0 } else { tod_night_vision },
         },
         &PlayerUpload {
             offset,
@@ -1294,10 +1312,31 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                 let up = glam::Quat::from_axis_angle((view.at - view.eye).normalize(), view.roll_deg.to_radians()) * Vec3::Y;
                 [space_soup::renderer::shadow::frustum_planes(shift * proj * Mat4::look_at_rh(view.eye, view.at, up))]
             };
+            // `PLANAR_WATER=1`: the first body authored as a mirror that
+            // covers `planar_water::ON_SHARE` of the view mirrors the scene
+            // drawn mirrored in it, as `Levers::planar_water` has it on the
+            // headset; not with the eye in the water.
+            let planar_on = std::env::var("PLANAR_WATER").as_deref() == Ok("1") && in_water.is_none() && view.mirror_in.is_none();
+            let world_clip = {
+                let up = glam::Quat::from_axis_angle((view.at - view.eye).normalize(), view.roll_deg.to_radians()) * Vec3::Y;
+                shift * proj * Mat4::look_at_rh(view.eye, view.at, up)
+            };
+            let mut planar_taken: Option<(usize, f32)> = None;
             let bodies: Vec<_> = crate::water_render::build(&scene.water, source.as_deref())
                 .into_iter()
-                .map(|mut b| {
+                .enumerate()
+                .map(|(index, mut b)| {
                     let bounds = space_soup::renderer::water_pipeline::water_bounds(&b.world, &b.waves);
+                    if planar_on && planar_taken.is_none() && b.uniform.mirror[0] > 0.5 && view.eye.y > b.uniform.extinction[3] {
+                        use space_soup::renderer::planar_water;
+                        let (lo, hi) = planar_water::surface_box(bounds, b.uniform.extinction[3]);
+                        let share = planar_water::screen_rect(world_clip, lo, hi).map_or(0.0, planar_water::share);
+                        eprintln!("offline frame: mirror body {index} covers {:.1}% of the view", 100.0 * share);
+                        if share >= planar_water::ON_SHARE {
+                            planar_taken = Some((index, b.uniform.extinction[3]));
+                            b.uniform.mirror = planar_water::uniform_lane(true, true, exposure, true);
+                        }
+                    }
                     let whole = space_soup::renderer::water_runs::lifted(bounds, &[view.eye]);
                     let hidden = horizon.as_mut().is_some_and(|(g, h)| h.hides(g, whole.0, whole.1));
                     if hidden {
@@ -1384,14 +1423,57 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                 bodies.len(),
                 if pipeline.dual_source { "dual-source" } else { "one-alpha" }
             );
-            Some((pipeline, bodies, time))
+            // THE MIRROR IMAGE, drawn by this harness again from the same
+            // eye mirrored in the body -- at the headset's share of the eye's
+            // resolution, without the water, the effects or the weather, as
+            // the headset's mirror pass leaves them out -- and bound as the
+            // mirror twins' group 2.
+            let planar = planar_taken.and_then(|(index, surface)| {
+                let scale = space_soup::renderer::planar_water::SCALE;
+                let mirror_view = View {
+                    width: ((view.width as f32 * scale).round() as u32).max(1),
+                    height: ((view.height as f32 * scale).round() as u32).max(1),
+                    samples: 1,
+                    water: false,
+                    effects: false,
+                    weather: false,
+                    adapt: false,
+                    flashlight: None,
+                    torch: false,
+                    mirror_in: Some((surface, exposure)),
+                    ..view
+                };
+                let shot = render_brushes(scene_name, mirror_view)?;
+                let texture = device.create_texture_with_data(
+                    &queue,
+                    &wgpu::TextureDescriptor {
+                        label: Some("offline_planar_mirror"),
+                        size: wgpu::Extent3d { width: shot.width, height: shot.height, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    },
+                    wgpu::util::TextureDataOrder::LayerMajor,
+                    &shot.rgba,
+                );
+                if let Ok(path) = std::env::var("PLANAR_IMAGE") {
+                    let _ = image::save_buffer(&path, &shot.rgba, shot.width, shot.height, image::ColorType::Rgba8);
+                }
+                let group = pipeline.mirror_group(&device, &texture.create_view(&wgpu::TextureViewDescriptor::default()));
+                eprintln!("offline frame: body {index} mirrors a {}x{} image of the scene", shot.width, shot.height);
+                Some((index, group))
+            });
+            Some((pipeline, bodies, time, planar))
         }
         _ => None,
     };
     // THE VIEW FROM UNDER THE WATER, when the eye is in it: the veil (with
     // the probe pass's depth), the underside, the film.
     let underwater = match (&in_water, &water, &probe_pass) {
-        (Some((i, state, _)), Some((_, bodies, _)), Some(_)) => {
+        (Some((i, state, _)), Some((_, bodies, _, _)), Some(_)) => {
             let pipes = space_soup::renderer::underwater::UnderwaterPipelines::new(&device, format, &uniforms.layout, &probe_layout, view.samples);
             let (waves, _, _, _, _, ub) = &bodies[*i];
             let groups = pipes.water_groups(&device, ub, waves);
@@ -1406,7 +1488,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         _ => None,
     };
     let film = match (film_age, &water, &probe_pass) {
-        (Some(_), Some((_, bodies, _)), Some(_)) if underwater.is_none() && !bodies.is_empty() => {
+        (Some(_), Some((_, bodies, _, _)), Some(_)) if underwater.is_none() && !bodies.is_empty() => {
             let pipes = space_soup::renderer::underwater::UnderwaterPipelines::new(&device, format, &uniforms.layout, &probe_layout, view.samples);
             let (waves, _, _, _, _, ub) = &bodies[0];
             let groups = pipes.water_groups(&device, ub, waves);
@@ -1416,7 +1498,8 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         }
         _ => None,
     };
-    let sky = view.water.then(|| {
+    // (And in a mirror image, which leaves the water out but not the sky.)
+    let sky = (view.water || view.mirror_in.is_some()).then(|| {
         use space_soup::renderer::sky::{Sky, SkyPipeline, AMBIENT};
         let pipeline = SkyPipeline::new(&device, format, &uniforms.layout, view.samples);
         let mut sky = match &sky_pano {
@@ -1484,7 +1567,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             eprintln!("offline frame: static sun map {TOD_STATIC_SUN_SIZE}^2 recorded ({drawn} indices)");
         }
     }
-    if let Some((_, bodies, time)) = &water {
+    if let Some((_, bodies, time, _)) = &water {
         for (waves, ..) in bodies {
             waves.update(&queue, &mut encoder, *time);
         }
@@ -1693,7 +1776,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         // underside -- before its own surface, which keeps only what is seen
         // from above, along a waterline. See `space_soup::renderer::underwater`.
         let mut under_body = None;
-        if let (Some((pipes, groups, _, group, i, state)), Some((_, bodies, _)), Some((_, target, _))) = (&underwater, &water, &probe_pass) {
+        if let (Some((pipes, groups, _, group, i, state)), Some((_, bodies, _, _)), Some((_, target, _))) = (&underwater, &water, &probe_pass) {
             let (waves, _, vb, ib, count, _) = &bodies[*i];
             let water_group = &groups[waves.current()];
             // `UW_SKIP=veil|underside`: one of them left out, to see what each draws.
@@ -1717,7 +1800,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             pass.set_bind_group(1, &sky.bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
-        if let Some((pipeline, bodies, water_time)) = &water {
+        if let Some((pipeline, bodies, water_time, planar)) = &water {
             // The splashes' twin as the headset picks it: raining while their
             // drops land (`WaterPipeline::for_rings`).
             let splashes = space_soup::renderer::effects::splash_rings::<{ space_soup::renderer::water_pipeline::RINGS }>(&splash_at(*water_time), *water_time, view.eye);
@@ -1736,15 +1819,22 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                 let cut = std::env::var("WATER_CUT").ok().map(|c| {
                     pipeline.with_cut(&device, &c).unwrap_or_else(|| panic!("no water cut {c}, or it no longer matches"))
                 });
+                // The frame's planar mirror: its mirror twin over the image.
+                let mirror = planar.as_ref().filter(|(i, _)| *i == b && cut.is_none());
                 pass.set_pipeline(if line {
                     &pipeline.waterline
                 } else if let Some(cut) = cut.as_ref() {
                     cut
+                } else if mirror.is_some() {
+                    if std::env::var("SPLASH").is_ok() { pipeline.mirrored_for_rings(&splashes.rings[0], &splashes.drops) } else { &pipeline.mirrored[0] }
                 } else if std::env::var("SPLASH").is_ok() {
                     ringed
                 } else {
                     &pipeline.ringless
                 });
+                if let Some((_, group)) = mirror {
+                    pass.set_bind_group(2, group, &[]);
+                }
                 pass.set_bind_group(1, &groups[waves.current()], &[]);
                 pass.set_vertex_buffer(0, vb.slice(..));
                 pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
@@ -1773,7 +1863,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             }
         }
         // The wet film after surfacing, over everything.
-        if let (Some((pipes, groups, _, group)), Some((_, target, _)), Some((_, bodies, _))) = (&film, &probe_pass, &water) {
+        if let (Some((pipes, groups, _, group)), Some((_, target, _)), Some((_, bodies, _, _))) = (&film, &probe_pass, &water) {
             pipes.draw_film(&mut pass, [&uniforms.bind_group, &groups[bodies[0].0.current()], &target.bind_group, group]);
         }
     }
