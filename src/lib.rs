@@ -309,6 +309,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         loaded_terrain.as_ref().and_then(|(t, _)| t.height_grid(static_scene.terrain.as_ref(), &dir)),
     );
     // What the ground hides. See `space_soup::renderer::ground_horizon`.
+    // The ground's chunks and the tree a frame asks which of them it draws.
+    renderer.set_ground_lod(loaded_terrain.as_ref().map(|(t, _)| t.lod.clone()));
     renderer.set_ground_horizon(loaded_terrain.as_ref().and_then(|(t, _)| {
         Some((t.ground_occluder(static_scene.terrain.as_ref())?, t.chunk_world_bounds()))
     }));
@@ -1126,6 +1128,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 renderer.set_terrain_heights(
                     loaded_terrain.as_ref().and_then(|(t, _)| t.height_grid(static_scene.terrain.as_ref(), &dir)),
                 );
+                renderer.set_ground_lod(loaded_terrain.as_ref().map(|(t, _)| t.lod.clone()));
                 renderer.set_ground_horizon(loaded_terrain.as_ref().and_then(|(t, _)| {
                     Some((t.ground_occluder(static_scene.terrain.as_ref())?, t.chunk_world_bounds()))
                 }));
@@ -1650,36 +1653,24 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         // reads as "the room is sliding around" rather than as a terrain bug.
         // (Water poses itself, in its vertex shader.)
 
-        // Assembled once for its side effect, so the chunk bounds are rebuilt
-        // into the player's frame, then read as an OWNED list before the slices
-        // are taken -- `assemble` borrows mutably and `caster_chunks` borrows
-        // shared, and the two cannot overlap. The second `assemble` is the
-        // cached path and costs a comparison.
+        // The ground's vertices, indices and chunks in one borrow
+        // (`TerrainGeometry::frame`). The chunks are EVERY run of the index
+        // buffer, boxes in the world, the same each frame: which of them the
+        // frame draws, and their boxes in the player's frame, the renderer
+        // asks of the tree it was handed at load (`set_ground_lod`) -- the
+        // app no longer poses every chunk's box each frame the rig moves,
+        // nor copies the list.
         // (Timed: what posing the static geometry for the rig costs a frame,
         // `WindowRecord::cpu`'s `pose_ms`.)
         let pose_clock = std::time::Instant::now();
         // IN THE WORLD, untouched, where the renderer poses the ground itself
-        // (`XrRenderer::ground_in_world`): only its chunks' boxes follow the
-        // rig then, from a few vertices each.
+        // (`XrRenderer::ground_in_world`).
         let ground_world = renderer.ground_in_world();
-        if let Some((t, _)) = loaded_terrain.as_mut() {
-            if ground_world {
-                t.assemble_world(offset, yaw_inv, locomotion.player_yaw);
-            } else {
-                t.assemble(offset, yaw_inv, locomotion.player_yaw);
-            }
-        }
-        let terrain_chunks: Vec<space_soup::renderer::shadow::CasterChunk> = loaded_terrain
-            .as_ref()
-            .map(|(t, _)| t.caster_chunks())
-            .unwrap_or_default();
-        let terrain_arg = loaded_terrain
-            .as_mut()
-            .map(|(g, _)| g)
-            .and_then(|t| match ground_world {
-                true => t.assemble_world(offset, yaw_inv, locomotion.player_yaw),
-                false => t.assemble(offset, yaw_inv, locomotion.player_yaw),
-            });
+        let (terrain_arg, terrain_chunks): (Option<(&[space_soup::renderer::cuboid::SolidVertex], &[u32])>, &[space_soup::renderer::shadow::CasterChunk]) =
+            match loaded_terrain.as_mut().and_then(|(t, _)| t.frame(ground_world, offset, yaw_inv, locomotion.player_yaw)) {
+                Some((vertices, indices, chunks)) => (Some((vertices, indices)), chunks),
+                None => (None, &[]),
+            };
         // Transformed into the player's frame here rather than at load, and
         // only when something moved -- see BrushGeometry::assemble.
         // IN THE WORLD, untouched, where the renderer poses the brushes
@@ -1845,8 +1836,7 @@ fn load_entry_scene(game_dir: &std::path::Path, scene_name: &str) -> Option<spac
 #[cfg(target_os = "android")]
 fn prepare_ground(renderer: &mut space_soup::renderer::xr_renderer::XrRenderer, terrain: Option<&mut terrain_render::TerrainGeometry>, when: &str) {
     let Some(t) = terrain.filter(|_| renderer.ground_in_world()) else { return };
-    t.assemble_world(Vec3::ZERO, Quat::IDENTITY, 0.0);
-    let chunks = t.caster_chunks();
+    let chunks = t.caster_chunks().to_vec();
     if let Some((vertices, indices)) = t.assemble_world(Vec3::ZERO, Quat::IDENTITY, 0.0) {
         renderer.prepare_ground(vertices, indices, &chunks, when);
     }

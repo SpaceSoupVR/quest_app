@@ -990,6 +990,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
             weather.as_ref().map(|_| &weather_layout),
             &probes,
             std::env::var("HORIZON").is_ok_and(|v| v == "1").then_some(view.eye),
+            view.eye,
         ),
         (_, true) => {
             eprintln!("offline frame: the ground is drawn only with half-resolution reflections and deferred lookups");
@@ -2170,10 +2171,54 @@ fn offline_terrain(
     weather: Option<&wgpu::BindGroupLayout>,
     probes: &space_soup::renderer::uniforms::ProbeUpload,
     horizon_eye: Option<Vec3>,
+    head: Vec3,
 ) -> Option<OfflineTerrain> {
     use space_soup::renderer::terrain_pipeline::{self as tp, TerrainImage, TerrainPipeline};
     use wgpu::util::DeviceExt;
+    // `GROUND_LOD=1`: the ground by distance from the view's eye, as the
+    // headset draws it under `Levers::ground_lod` (the level's load building
+    // the coarser lists, `ground_lod::LISTS`): each node of the chunks'
+    // quadtree at the step the eye's place gives it, borders stitched.
+    // `GROUND_LOD=lists`: the lists built and the lever OFF -- step 1, to
+    // show the lists in the buffer change nothing drawn.
+    let lod_env = std::env::var("GROUND_LOD").ok().filter(|v| v != "0");
+    space_soup::renderer::ground_lod::LISTS.store(lod_env.is_some(), std::sync::atomic::Ordering::Relaxed);
+    // `GROUND_LOD=1` is the lever as it comes: no node coarser than its
+    // error allows at any distance (`Levers::ground_lod_strict`, on).
+    // `GROUND_LOD=caps`: with the design's distance caps as well (that lever
+    // off).
+    let lod_caps = lod_env.as_deref() == Some("caps");
+    let lod_strict = !lod_caps;
+    let lod_on = lod_env.as_deref() == Some("1") || lod_caps;
+    // `GROUND_ORDER=rows`: the chunks in the buffer row by row, as before
+    // 2026-10-13 (`ground_lod::ROW_ORDER`): the control for what their order
+    // alone does to these pictures.
+    space_soup::renderer::ground_lod::ROW_ORDER.store(std::env::var("GROUND_ORDER").as_deref() == Ok("rows"), std::sync::atomic::Ordering::Relaxed);
     let (mut geometry, splat) = crate::load_scene_terrain(game, scene_name)?;
+    // What this view draws of the index buffer, where it holds more than
+    // step 1: every chunk the eye's choice gives (no frustum: the shadow and
+    // reflection passes here draw the same sheet).
+    let lod_runs: Option<Vec<(u32, u32)>> = geometry.lod.has_lists().then(|| {
+        geometry.lod.set_strict(lod_strict);
+        let chosen = geometry.lod.select(head, &[], lod_on);
+        let mut by_step = [0u32; 5];
+        for (n, _) in &chosen.nodes {
+            by_step[geometry.lod.nodes[*n as usize].level.min(4) as usize] += 1;
+        }
+        let runs: Vec<(u32, u32)> = chosen.units.iter().map(|u| (geometry.lod.units[*u as usize].first, geometry.lod.units[*u as usize].count)).collect();
+        eprintln!(
+            "offline frame: ground by level {} -- {} triangles in {} runs of {} nodes (steps 1/2/4/8/16: {:?}), of {} at step 1; error at most {:.2} mrad",
+            if chosen.lod { "ON" } else { "off" },
+            runs.iter().map(|r| r.1 as u64).sum::<u64>() / 3,
+            runs.len(),
+            chosen.nodes.len(),
+            by_step,
+            geometry.step1_len() / 3,
+            chosen.error_rad * 1000.0,
+        );
+        runs
+    });
+    let horizon_eye = horizon_eye.filter(|_| !lod_on);
     // `HORIZON=1`: the chunks the ground hides from this eye left out, as the
     // headset leaves them out under `Levers::ground_horizon` -- to prove the
     // picture is the same without them.
@@ -2365,6 +2410,15 @@ fn offline_terrain(
     let (verts, idx) = match world_ground {
         true => geometry.assemble_world(offset, yaw_inv, yaw)?,
         false => geometry.assemble(offset, yaw_inv, yaw)?,
+    };
+    // The runs chosen, end to end (with the lever off: step 1's, as they lie).
+    let chosen_idx: Vec<u32>;
+    let idx: &[u32] = match &lod_runs {
+        Some(runs) => {
+            chosen_idx = runs.iter().flat_map(|&(first, count)| idx[first as usize..(first + count) as usize].iter().copied()).collect();
+            &chosen_idx
+        }
+        None => idx,
     };
     // What poses it in the shadow passes, where its vertices are the world's.
     let world_model = world_ground.then(|| {
@@ -3699,7 +3753,8 @@ mod aliasing {
         let num = |k: &str| std::env::var(k).ok().and_then(|x| x.parse::<f32>().ok());
         let (eye, at) = match (std::env::var("VIEW"), std::env::var("FAR")) {
             (Ok(name), _) => {
-                let views = super::bench_views::bench_views();
+                // (`SCENE=<level>`: its own views too, as the bench views' render takes them.)
+                let views = super::bench_views::views_of(&super::offline_scene());
                 let v = views.iter().find(|v| v.0 == name).unwrap_or_else(|| panic!("no bench view {name}"));
                 (v.1, v.2)
             }
@@ -3709,6 +3764,12 @@ mod aliasing {
             }
             _ => panic!("set VIEW=<bench view> or FAR=ex,ey,ez,ax,ay,az"),
         };
+        // `GROUND=1`: the ground drawn (with the water and the sky), which
+        // this measure leaves out otherwise -- for a ground that is drawn
+        // coarser with distance (`GROUND_LOD=1`), against the frame at K
+        // times the pixels. `SCENE` / `GAME_DIR` open another level.
+        let ground = std::env::var("GROUND").as_deref() == Ok("1");
+        let scene = super::offline_scene();
         let k = num("K").map_or(3, |x| x as u32);
         let shifts = num("SHIFTS").map_or(6, |x| x as usize);
         let tile = num("TILE").map_or(32, |x| x as u32);
@@ -3718,6 +3779,8 @@ mod aliasing {
             terminator_aa: std::env::var("TERMINATOR_AA").as_deref() != Ok("0"),
             cut: std::env::var("CUT").ok().map(|c| &*Box::leak(c.into_boxed_str())),
             roll_deg: num("ROLL").unwrap_or(0.0),
+            terrain: ground,
+            water: ground,
             ..View::headset(eye, at)
         };
         let (w, h) = (base.width, base.height);
@@ -3727,12 +3790,12 @@ mod aliasing {
         let mut first: Option<(Shot, Shot)> = None;
         for i in 0..shifts {
             let s = i as f32 / shifts as f32;
-            let Some(frame) = render_brushes("test_room", View { jitter_px: [s, s], ..base }) else {
-                eprintln!("skipping: no GPU or no test_room");
+            let Some(frame) = render_brushes(&scene, View { jitter_px: [s, s], ..base }) else {
+                eprintln!("skipping: no GPU or no {scene}");
                 return;
             };
             let big = render_brushes(
-                "test_room",
+                &scene,
                 View { width: w * k, height: h * k, jitter_px: [s * k as f32, s * k as f32], ..base },
             )
             .expect("the reference renders where the frame did");
