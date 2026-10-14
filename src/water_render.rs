@@ -78,6 +78,10 @@ pub fn build(
             },
             &waves,
         );
+        // A body authored as a mirror (`WaterDef::mirror`) may be the
+        // frame's planar mirror (`Levers::planar_water`).
+        let mut uniform = uniform;
+        uniform.mirror[0] = if def.mirror { 1.0 } else { 0.0 };
         log::info!(
             "water at y={:.2}: {} vertices, {} triangles; {:.1} m/s over {:.0} m, waves {:.2} m high, {:.1} m deep",
             def.height,
