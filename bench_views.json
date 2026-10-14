@@ -559,5 +559,50 @@
       "spin": 45.0,
       "note": "hall_back's eye turning on the spot, 45 degrees a second."
     }
-  ]
+  ],
+  "levels": {
+    "stress_625": {
+      "why": "The standing stress level (docs/scale-audit-2026-10-13.md section 5; made by docs/scale-audit-2026-10-13/make_stress_levels.sh, never committed): 625 x 625 terrain samples, 268 m a side, 3 copies of test_room and a wild tile with a mountain, a lake, a hut, 8 lamps and 4 fires. Its home tile IS test_room at test_room's own coordinates, so every view above is also a view of it: the same picture with 5.9 times the level behind it. A cost that moves between the two is a cost that follows the level, not the picture. These are the views only the large level has. `bench.py --level stress_625`; offline, `SCENE=stress_625 GAME_DIR=<the scratch game folder>`.",
+      "views": [
+        {
+          "name": "stress_field",
+          "eye": [0.0, 1.6, 6.0],
+          "at": [6.0, 0.8, 14.0],
+          "note": "test_room's outdoors_field, in the stress level: the same picture, 5.9 times the level. Read against outdoors_field on test_room: the difference is the per-frame work that follows the whole level."
+        },
+        {
+          "name": "stress_hilltop",
+          "eye": [-51.13, 29.1, 173.59],
+          "at": [55.0, 0.0, 55.0],
+          "note": "On the level's highest ground (27.5 m) looking at its middle: every chunk in the frustum, 85% of the ground's triangles past 60 m. What a distance LOD is for (F2)."
+        },
+        {
+          "name": "stress_corner",
+          "eye": [-59.06, 5.78, -59.06],
+          "at": [55.0, 2.0, 55.0],
+          "note": "20 m in from a corner, looking at the middle: the longest sight line, the far sea, the sun map's texel on far walls (F3)."
+        },
+        {
+          "name": "stress_far_building",
+          "eye": [110.0, 1.6, 10.0],
+          "at": [0.0, 1.8, 3.7],
+          "note": "In front of the site one tile east (110 m from home), looking back at home's building: the one sun map's texel, the 16 lights chosen by distance, the buildings' reflection table, the model draw range (F3, F5, F6, F8)."
+        },
+        {
+          "name": "stress_lamps",
+          "eye": [124.0, 23.4, 110.0],
+          "at": [110.0, 16.0, 110.0],
+          "note": "In the wild tile's lamp ring, across its lake: 8 lamps, 4 fires, the hut's lamps, the sun and (with a torch) its beam and bounce -- more than 16 lights in reach (F5): which are chosen, and whether they pop."
+        },
+        {
+          "name": "stress_walk",
+          "eye": [0.0, 1.6, 6.0],
+          "at": [0.0, 1.7, 36.0],
+          "path": [[0.0, 1.7, 36.0]],
+          "speed": 3.0,
+          "note": "A 10 s walk at 3 m/s on a fixed line from the home hall's door toward the beach, then round and back: the rig moves every frame, so whatever is still re-posed or re-sent for the whole level shows here and in no standing view (F1)."
+        }
+      ]
+    }
+  }
 }

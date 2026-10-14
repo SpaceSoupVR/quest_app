@@ -137,14 +137,25 @@ def find_quest() -> Device:
     )
 
 
-def load_views(names: str | None) -> list:
+def load_views(names: str | None, level: str | None = None) -> list:
+    """The views to run. `level`: a level of bench_views.json's "levels" --
+    its own views are known by name beside test_room's (its home tile IS
+    test_room, so those are views of it too), and with no names it is its own
+    views that run. The headset must have been given that level as its game's
+    entry scene (docs/scale-audit-2026-10-13/make_stress_levels.sh)."""
     doc = json.loads(VIEWS_FILE.read_text())
     views = doc["views"]
-    by_name = {v["name"]: v for v in views}
-    if len(by_name) != len(views):
+    own = []
+    if level:
+        levels = doc.get("levels", {})
+        if level not in levels:
+            raise BenchError("no level %r; bench_views.json has: %s" % (level, ", ".join(levels) or "none"))
+        own = levels[level]["views"]
+    by_name = {v["name"]: v for v in views + own}
+    if len(by_name) != len(views) + len(own):
         raise BenchError("bench_views.json names a view twice")
     if not names:
-        return views
+        return own if level else views
     picked = []
     for name in [n.strip() for n in names.split(",") if n.strip()]:
         view = None
@@ -864,6 +875,7 @@ def restore(dev: Device, changed: list, warnings: list) -> None:
 def main(argv: list | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--views", help="comma-separated view names (default: every view in bench_views.json)")
+    ap.add_argument("--level", help="a level of bench_views.json's \"levels\" (stress_625): its views by name, and the default set")
     ap.add_argument("--ab", action="store_true", help="run the perf_ab schedule at each view")
     ap.add_argument("--passes", type=int, default=3, help="passes through the schedule with --ab (default 3)")
     ap.add_argument("--windows", type=int, default=3, help="windows a view without --ab (default 3)")
@@ -933,7 +945,7 @@ def main(argv: list | None = None) -> int:
         return 2
 
     try:
-        views = load_views(args.print_levers or args.views)
+        views = load_views(args.print_levers or args.views, args.level)
     except BenchError as e:
         print("bench: %s" % e, file=sys.stderr)
         return 2

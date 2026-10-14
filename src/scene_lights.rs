@@ -62,6 +62,16 @@ pub(crate) fn stationary_channels(game_dir: &std::path::Path, scene_name: &str) 
             None => log::warn!("stationary: '{}' has no mask channel; it shades unshadowed", lamp.id()),
         }
     }
+    // LOUD, once: a lamp with no channel is lit through every wall.
+    let unshadowed = assigned.iter().filter(|(_, c)| c.is_none()).count();
+    if unshadowed > 0 {
+        log::error!(
+            "STATIONARY: {unshadowed} OF '{scene_name}''S {} STATIONARY LAMPS HAVE NO SHADOW MASK CHANNEL and shine through walls ({} channels a texel, {} lamps a level at most): make some of them Baked, or move them apart",
+            assigned.len(),
+            space_soup_engine::stationary::MAX_STATIONARY_CHANNELS,
+            crate::level_limits::MAX_STATIONARY_LAMPS,
+        );
+    }
     assigned.into_iter().filter_map(|(lamp, c)| Some((lamp.id(), c?))).collect()
 }
 
