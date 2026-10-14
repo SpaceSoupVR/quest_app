@@ -110,7 +110,18 @@ pub(crate) fn placed(game_dir: &std::path::Path, scene_name: &str) -> Vec<Placed
         .iter()
         .filter_map(|o| {
             let e = o.effect.as_ref()?;
-            let asset = e.asset.as_deref().filter(|a| names_an_asset(game_dir, a))?;
+            let named = e.asset.as_deref().filter(|a| !a.is_empty())?;
+            let Some(asset) = Some(named).filter(|a| names_an_asset(game_dir, a)) else {
+                // Said out loud: a missing file draws the built-in kind, which
+                // looks like a working effect (the pond's fog drew as smoke on
+                // the headset for a day because run.sh never pushed effects/).
+                log::warn!(
+                    "EFFECTS: '{}' names asset '{named}' but {} is missing -- drawing its built-in kind instead",
+                    o.id,
+                    game_dir.join("effects").join(format!("{named}.json")).display(),
+                );
+                return None;
+            };
             let c = &o.cuboid;
             Some(PlacedEffect {
                 object: o.id.clone(),

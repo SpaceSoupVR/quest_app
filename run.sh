@@ -543,7 +543,13 @@ if $WANT_DEPLOY; then
     # level loads, and it renders black. The sky is the worst of the three
     # because an HDRI is the BACKGROUND and most of the LIGHT at once, so its
     # absence is not a missing picture, it is a missing light source.
-    for group in materials skies textures terrain; do
+    #
+    # `effects` (authored particle assets) joined this list on 10-14: until
+    # then every placed asset effect fell back to its built-in `kind` on the
+    # headset -- the pond's fog slab drew as plain smoke -- while the host,
+    # the offline harness and the editor all read game/effects and looked
+    # right. `rig_profiles` was missing the same way.
+    for group in materials skies textures terrain effects rig_profiles; do
         [ -d "$GAME_DIR/$group" ] || continue
         while IFS= read -r -d '' d; do
             rel="${d#"$GAME_DIR"/"$group"}"
