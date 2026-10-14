@@ -69,7 +69,26 @@ pub struct SplashWatch {
     /// raised.
     told: Vec<u64>,
     count: u64,
+    /// FLOATING THINGS: each one's height and when it was last seen to
+    /// move, how fast it was going up or down then, and the fastest it has
+    /// sunk since its last bob.
+    bobbing: HashMap<String, Bob>,
 }
+
+#[derive(Clone, Copy)]
+struct Bob {
+    y: f32,
+    at: f64,
+    vy: f32,
+    sunk: f32,
+}
+
+/// A FLOATING THING'S BOB makes its own small rings: the slowest sinking,
+/// m/s, that does, and how near the waterline its middle must be (in its
+/// half heights). A crate settling after it is thrown in bobs at a few
+/// tenths of a metre a second for a few seconds.
+const BOB_SPEED: f32 = 0.06;
+const BOB_REACH: f32 = 1.3;
 
 /// A splash older than this when first heard of is not raised: its drops
 /// would appear in mid-air. The server tells of one for half a second.
@@ -200,6 +219,57 @@ impl SplashWatch {
         out
     }
 
+    /// THINGS FLOATING, BOBBING: each time a thing at the waterline turns
+    /// from sinking to rising -- the bottom of a bob -- its push into the
+    /// water is raised as a gentle splash (`held`: no jet, too slow for a
+    /// crown or drops), whose rings the renderer works out as for any other
+    /// (`effects::splash_rings`). Every object, whoever tells of entries:
+    /// the server tells of going in, not of bobbing. `things` as in
+    /// [`Self::step`].
+    pub fn bob<'a>(&mut self, now: f64, surface: &dyn Fn(f32, f32) -> Option<f32>, sunlit: &dyn Fn(Vec3) -> f32, things: impl Iterator<Item = (&'a str, Vec3, Vec3, Quat)>) -> Vec<Splash> {
+        let mut out = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        for (id, centre, half, rotation) in things {
+            seen.push(id.to_string());
+            let extent = world_half_extents(half, rotation);
+            let Some(level) = surface(centre.x, centre.z) else {
+                self.bobbing.remove(id);
+                continue;
+            };
+            let afloat = (centre.y - level).abs() <= BOB_REACH * extent.y.max(0.01);
+            let Some(was) = self.bobbing.get(id).copied() else {
+                self.bobbing.insert(id.to_string(), Bob { y: centre.y, at: now, vy: 0.0, sunk: 0.0 });
+                continue;
+            };
+            // A networked thing moves when an update arrives: its speed is
+            // the move over the time since it last moved.
+            if centre.y == was.y {
+                continue;
+            }
+            let vy = ((centre.y - was.y) / (now - was.at).max(1e-3) as f32).clamp(-20.0, 20.0);
+            let mut next = Bob { y: centre.y, at: now, vy, sunk: was.sunk.max(-vy) };
+            if afloat && was.vy < 0.0 && vy >= 0.0 && next.sunk >= BOB_SPEED {
+                self.count += 1;
+                let position = Vec3::new(centre.x, level, centre.z);
+                out.push(Splash {
+                    sunlit: sunlit(position + Vec3::Y * 0.05),
+                    depth: 30.0,
+                    calm: 1.0,
+                    held: 1.0,
+                    seed: self.count.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0xb0b,
+                    ..Splash::new(position, now, Vec3::new(0.0, -next.sunk, 0.0), (extent.x * extent.z).sqrt().clamp(0.01, 2.0), space_soup_engine::rigid_physics::default_mass(half))
+                });
+                next.sunk = 0.0;
+            }
+            if !afloat {
+                next.sunk = 0.0;
+            }
+            self.bobbing.insert(id.to_string(), next);
+        }
+        self.bobbing.retain(|id, _| seen.contains(id));
+        out
+    }
+
     /// THINGS THE SERVER SAW GO IN: the entries in its latest snapshot
     /// (`WireWorld::water_entries`; none while there is no snapshot). Each is
     /// in every snapshot for half a second, under its own number: a splash is
@@ -284,6 +354,36 @@ mod tests {
             .map(|k| w.step(k as f64 * dt as f64, dt, &sea, &bed, &sun, Some((Vec3::new(-5.0, 0.0, k as f32 * 1.3 * dt), Vec3::Z)), [None, None], none()).len())
             .sum();
         assert_eq!(dry, 0);
+    }
+
+    /// A crate bobbing at the waterline raises a gentle splash at the bottom
+    /// of each bob -- rings, no jet -- and one resting, or high and dry,
+    /// none.
+    #[test]
+    fn a_floating_thing_bobbing_makes_its_own_rings() {
+        let mut w = SplashWatch::default();
+        let half = Vec3::splat(0.2);
+        let mut bobs = Vec::new();
+        // Updates at 20 Hz: a bob of 4 cm at 1.2 Hz, dying away over 4 s.
+        for k in 0..200 {
+            let t = k as f64 * 0.05;
+            let y = -0.05 + 0.04 * (-(t as f32) / 4.0).exp() * (std::f32::consts::TAU * 1.2 * t as f32).cos();
+            bobs.extend(w.bob(t, &sea, &sun, std::iter::once(("crate", Vec3::new(5.0, y, 0.0), half, Quat::IDENTITY))));
+        }
+        assert!((3..=12).contains(&bobs.len()), "{} bobs", bobs.len());
+        assert!(bobs.iter().all(|s| s.held == 1.0 && s.velocity.y < -BOB_SPEED && s.velocity.y > -0.5 && s.position.y == 0.0), "{:?}", bobs[0]);
+        assert!(bobs.windows(2).all(|p| p[1].born - p[0].born > 0.6), "one a bob");
+        // Its rings, and nothing thrown.
+        let shape = space_soup::renderer::effects::splash_shape(&bobs[0]);
+        assert!(shape.ring_height > 1e-4 && shape.jet_height == 0.0 && shape.drops == 0 && shape.petals == 0, "{shape:?}");
+        // Resting, or on land: nothing.
+        let mut w = SplashWatch::default();
+        let still: usize = (0..100).map(|k| w.bob(k as f64 * 0.05, &sea, &sun, std::iter::once(("crate", Vec3::new(5.0, -0.05, 0.0), half, Quat::IDENTITY))).len()).sum();
+        let mut w = SplashWatch::default();
+        let dry: usize = (0..100)
+            .map(|k| w.bob(k as f64 * 0.05, &sea, &sun, std::iter::once(("crate", Vec3::new(-5.0, 0.04 * (k as f32 * 0.4).cos(), 0.0), half, Quat::IDENTITY))).len())
+            .sum();
+        assert_eq!((still, dry), (0, 0));
     }
 
     #[test]

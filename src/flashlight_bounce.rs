@@ -101,6 +101,9 @@ pub(crate) struct BeamRay {
     pub theta: f32,
     pub phi: f32,
     pub flux: f32,
+    /// The solid angle it stands for, steradians, unweighted: its ring's
+    /// share. With `flux`, how bright its landing is (`Landings::meter_samples`).
+    pub omega: f32,
 }
 
 /// The beam as rays: the centre, then rings round it, each ray standing for
@@ -131,11 +134,12 @@ pub(crate) fn beam_rays(cone_deg: f32, hotspot_deg: f32) -> Vec<BeamRay> {
         }
         let theta = if ring == 0 || flux <= 0.0 { 0.5 * (a + b) * (ring as f32).min(1.0) } else { moment / flux };
         let n = counts[ring];
+        let omega = std::f32::consts::TAU * (a.cos() - b.cos()) / n as f32;
         for k in 0..n {
             // Each ring turned half a step against the last, so no ray hides
             // behind another along the same azimuth.
             let phi = std::f32::consts::TAU * (k as f32 + 0.5 * (ring % 2) as f32) / n as f32;
-            out.push(BeamRay { theta, phi, flux: flux / n as f32 });
+            out.push(BeamRay { theta, phi, flux: flux / n as f32, omega });
         }
     }
     out
@@ -173,6 +177,10 @@ struct Hit {
     weight: f32,
     /// How far from the glass.
     along: f32,
+    /// The beam's solid angle it stands for, and the cosine it meets the
+    /// surface at: how large its landing is (`Landings::meter_samples`).
+    omega: f32,
+    cos_in: f32,
 }
 
 /// What the beam lands on this instant, ray by ray: what its bounce
@@ -224,13 +232,46 @@ pub(crate) fn landings(
         let sent = l.albedo * brought;
         let weight = luminance(sent);
         if weight > 0.0 {
-            hits.push(Hit { point: l.point, normal: l.normal, sent, brought, weight, along });
+            let cos_in = l.normal.dot(-dir).abs();
+            hits.push(Hit { point: l.point, normal: l.normal, sent, brought, weight, along, omega: r.omega, cos_in });
         }
     }
     Landings { hits, lens, forward, right }
 }
 
 impl Landings {
+    /// WHAT THE BEAM'S POOL PUTS IN FRONT OF THE EYE at `head` (WORLD), as
+    /// the eye's meter takes light the probes' photographs never saw
+    /// (`space_soup::renderer::exposure::EyeAdaptation::meter_with`): each
+    /// landing as (direction from the head, luminance, solid angle). Its
+    /// luminance is the light it sends back per unit area -- the albedo times
+    /// the beam's light there, `albedo I cos / d^2`, as the lamps' units have
+    /// it -- and its size is its ray's share of the beam laid on the surface,
+    /// seen from the head. A landing facing away from the head is not seen.
+    ///
+    /// Without it the eye adapted to the dark room alone: a torch a hand's
+    /// width from pale stone lit it 1,000 times brighter than the room, at
+    /// the room's exposure x12, and its pool drew flat white with only the
+    /// mortar's cracks left in it (headset, 2026-10-13). An eye looking at
+    /// that pool adapts to it and keeps the stone's texture.
+    pub(crate) fn meter_samples(&self, head: Vec3) -> Vec<(Vec3, f32, f32)> {
+        self.hits
+            .iter()
+            .filter_map(|h| {
+                let to_head = head - h.point;
+                let d = to_head.length();
+                let cos_view = h.normal.dot(to_head) / d.max(1e-6);
+                if d < 1e-3 || cos_view <= 0.0 || h.omega <= 0.0 {
+                    return None;
+                }
+                // Its area on the surface, and the light it sends back over
+                // that area: `weight` is that light times the area already.
+                let area = h.omega * h.along * h.along / h.cos_in.max(0.05);
+                Some((-to_head / d, h.weight / area, area * cos_view / (d * d)))
+            })
+            .collect()
+    }
+
     /// The patches its bounce stands at. See [`patches`].
     pub(crate) fn patches(&self) -> Vec<Patch> {
         patches_of(&self.hits, self.forward)
@@ -652,6 +693,59 @@ mod tests {
                 Landing { point: o + dir * t, normal: Vec3::Z, albedo: a }
             })
         }
+    }
+
+    /// THE EYE IS SHOWN THE TORCH'S POOL (2026-10-13): seen from the glass,
+    /// the landings on a wall square to the beam fill the cone's solid angle,
+    /// the one on the axis is as bright as `albedo I / d^2` says, a wall twice
+    /// as far is a quarter as bright and as large, and a landing facing away
+    /// from the head is not seen. And the meter it feeds closes the eye down
+    /// for a pool a hand's width off, where it took the dark room alone.
+    #[test]
+    fn the_eye_is_shown_the_torchs_pool() {
+        let a = Vec3::splat(0.4);
+        let near = landings(Vec3::ZERO, Quat::IDENTITY, &rays(), wall(0.5, a)).meter_samples(Vec3::ZERO);
+        let far = landings(Vec3::ZERO, Quat::IDENTITY, &rays(), wall(1.0, a)).meter_samples(Vec3::ZERO);
+        assert_eq!(near.len(), rays().len());
+        let cone = std::f32::consts::TAU * (1.0 - (0.5 * flashlight::CONE_DEG).to_radians().cos());
+        let total: f32 = near.iter().map(|s| s.2).sum();
+        assert!((total - cone).abs() < 1e-3 * cone, "the pool fills the cone seen from the glass: {total} sr against {cone}");
+        let axis = near[0];
+        assert!((axis.0 - Vec3::NEG_Z).length() < 1e-5, "{axis:?}");
+        // The centre ray stands for a disc 0.7 of the hot spot wide: its mean
+        // falloff is a little under 1, and the window at 0.5 m all but 1.
+        let lit = 0.4 * flashlight::INTENSITY / 0.25;
+        assert!(axis.1 > 0.97 * lit && axis.1 <= lit * 1.0001, "on the axis: {} against {lit}", axis.1);
+        assert!((far[0].1 * 4.0 - axis.1).abs() < 0.01 * axis.1, "a quarter as bright twice as far: {} {}", far[0].1, axis.1);
+        let far_total: f32 = far.iter().map(|s| s.2).sum();
+        assert!((far_total - total).abs() < 1e-3 * total, "as large seen from the glass: {far_total}");
+        // From behind the wall nothing of it is seen.
+        assert!(landings(Vec3::ZERO, Quat::IDENTITY, &rays(), wall(0.5, a)).meter_samples(Vec3::new(0.0, 0.0, -2.0)).is_empty());
+
+        // The meter: a room photographed dark everywhere, then with the pool.
+        use space_soup::renderer::exposure::{exposure_for, EyeAdaptation};
+        let res = 8u32;
+        let dark = 0.012f32;
+        let texel: Vec<u8> = [dark, dark, dark, 1.0].iter().flat_map(|v| space_soup::renderer::sky::f32_to_f16(*v).to_le_bytes()).collect();
+        let faces: Vec<u8> = (0..6 * res * res).flat_map(|_| texel.iter().copied()).collect();
+        let desc = space_soup::renderer::probe_stream::ProbeDesc {
+            centre: Vec3::new(0.0, 1.5, 0.0),
+            min: Vec3::new(-5.0, 0.0, -5.0),
+            max: Vec3::new(5.0, 3.0, 5.0),
+            volume: 0,
+            has_depth: true,
+            room_light: None,
+        };
+        let eye = EyeAdaptation::from_probes(&[(&faces, res, desc)], space_soup::renderer::sky::SkyIrradiance::flat(0.0));
+        let head = Vec3::new(0.0, 1.5, 0.0);
+        let room = eye.meter(head, Vec3::NEG_Z);
+        let pool: Vec<(Vec3, f32, f32)> =
+            landings(head, Quat::IDENTITY, &rays(), |o, d| wall(0.5, a)(o - head, d).map(|l| Landing { point: l.point + head, ..l }))
+                .meter_samples(head);
+        let lit_room = eye.meter_with(head, Vec3::NEG_Z, &pool);
+        eprintln!("meter: room {room:.4} (exposure x{:.2}), with the pool {lit_room:.3} (x{:.2})", exposure_for(room), exposure_for(lit_room));
+        assert!(exposure_for(room) >= 11.9, "the dark room alone opens the eye all the way: {room}");
+        assert!(exposure_for(lit_room) < 1.0, "a pool a hand's width off closes it: {lit_room}");
     }
 
     /// The rays carry the whole beam: their shares add up to the cone's

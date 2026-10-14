@@ -558,6 +558,188 @@
       "at": [0.4, 2.4, 3.7],
       "spin": 45.0,
       "note": "hall_back's eye turning on the spot, 45 degrees a second."
+    },
+    {
+      "name": "steep_scarp",
+      "eye": [-0.5, 1.6, 13.0],
+      "at": [3.0, 0.3, 16.0],
+      "note": "The low grass scarp east of the field path (a one-cell 0.8 m step), from 4 m: headset shots 213245-213247, the pale V of two triangles (docs/steep-lines-2026-10-13)."
+    },
+    {
+      "name": "steep_ridge_up",
+      "eye": [11.0, 0.9, 30.0],
+      "at": [9.0, 6.0, 27.0],
+      "note": "From the beach up the cliff's knife ridge: shots 213330/213331 (herringbone along the crest) and 213526/213527 (one-pixel vertical lines)."
+    },
+    {
+      "name": "steep_cliff_foot",
+      "eye": [14.0, 0.9, 30.5],
+      "at": [16.5, 0.0, 28.5],
+      "note": "The buttress beside the cave's front mouth where the cliff meets flat sand: shots 213325-213328, 213332, 213333 (comb teeth at the foot)."
+    },
+    {
+      "name": "steep_beach_cliff",
+      "eye": [3.0, 2.8, 24.5],
+      "at": [8.0, 1.5, 29.0],
+      "note": "The cliff above the beach from the field's edge: shots 213300-213302 (dark triangle facets)."
+    },
+    {
+      "name": "steep_beach_band",
+      "eye": [6.0, 4.2, 25.5],
+      "at": [7.5, 0.5, 30.0],
+      "note": "Down the same cliff from its rim: the face seen along its fall line, where a stretched plane shows as streaks."
+    },
+    {
+      "name": "steep_back_cliff",
+      "eye": [36.0, 3.4, 38.0],
+      "at": [32.0, 6.0, 39.5],
+      "note": "The cliff's inland side by the cave's back mouth: shots 213452-213459 (streaked faces)."
+    },
+    {
+      "name": "steep_back_mouth",
+      "eye": [33.0, 2.0, 29.5],
+      "at": [30.5, 3.0, 31.0],
+      "note": "Close under the back mouth's rock: one-cell 13 m rises a metre from the eye."
+    },
+    {
+      "name": "shine_beside",
+      "eye": [17.1, 1.6, -1.0],
+      "at": [17.7, 1.6, -1.0],
+      "flashlight": {"at": [17.2, 1.35, -0.75], "aim": [17.7, 1.8, -1.6], "torch": true},
+      "note": "The brick hall's east wall from 0.6 m, the torch in the right hand aimed up and left: its pool beside the gaze, as the headset's 230739-230801 (user, 2026-10-13: 'shinier than it should be when i have the flashlight on close to the wall'). Before 2026-10-13 a patch of white speckle stood at the mirror point between the eye and the hand: the glass seen from outside its beam."
+    },
+    {
+      "name": "shine_square_05",
+      "eye": [17.2, 1.6, -1.0],
+      "at": [17.7, 1.6, -1.0],
+      "flashlight": {"at": [17.25, 1.35, -0.8], "aim": [17.7, 1.55, -1.1], "torch": true},
+      "note": "The same wall square on from 0.5 m, the pool in the middle of the view: the pool's texture, and the eye adapted to it (the pool was flat white at the room's exposure x12)."
+    },
+    {
+      "name": "shine_square_1",
+      "eye": [16.7, 1.6, -1.0],
+      "at": [17.7, 1.6, -1.0],
+      "flashlight": {"at": [16.75, 1.35, -0.8], "aim": [17.7, 1.55, -1.1], "torch": true},
+      "note": "Square on from 1 m: the pool, its highlight and the eye."
+    },
+    {
+      "name": "shine_square_2",
+      "eye": [15.7, 1.6, -1.0],
+      "at": [17.7, 1.6, -1.0],
+      "flashlight": {"at": [15.75, 1.35, -0.8], "aim": [17.7, 1.5, -1.1], "torch": true},
+      "note": "Square on from 2 m."
+    },
+    {
+      "name": "shine_45_1",
+      "eye": [16.95, 1.6, -0.25],
+      "at": [17.7, 1.6, -1.0],
+      "flashlight": {"at": [17.0, 1.35, 0.0], "aim": [17.7, 1.5, -1.0], "torch": true},
+      "note": "The wall at 45 degrees from 1 m, the torch aimed along the gaze."
+    },
+    {
+      "name": "shine_grazing",
+      "eye": [17.3, 1.6, 1.5],
+      "at": [17.7, 1.5, -1.5],
+      "flashlight": {"at": [17.35, 1.35, 1.6], "aim": [17.7, 1.5, -0.5], "torch": true},
+      "note": "Along the wall at about 8 degrees from 0.4 m off it: the pool stretched along the stone; before 2026-10-13 the glass's image ran down the wall as a white streak (230754, 231024)."
+    },
+    {
+      "name": "shine_hallway_rock",
+      "eye": [6.5, 1.6, -2.4],
+      "at": [6.5, 1.5, -1.8],
+      "flashlight": {"at": [6.75, 1.35, -2.45], "aim": [6.4, 1.6, -1.8], "torch": true},
+      "note": "The hallway's rock wall (Rock063) from 0.6 m with the torch."
+    },
+    {
+      "name": "shine_cliff_rock",
+      "eye": [33.0, 2.0, 29.5],
+      "at": [30.5, 3.0, 31.0],
+      "flashlight": {"at": [33.2, 1.75, 29.7], "aim": [31.5, 2.6, 30.6], "torch": true},
+      "note": "The cliff under the cave's back mouth with the torch: ground rock under a torch, as 230604-230637."
+    },
+    {
+      "name": "shine_streak",
+      "eye": [17.2, 1.6, -1.0],
+      "at": [17.7, 1.6, -1.0],
+      "flashlight": {"at": [17.35, 1.35, -0.8], "aim": [17.7, 1.4, -2.6], "torch": true},
+      "note": "The wall from 0.5 m, the torch aimed along it to the left: before 2026-10-13 its glass showed in the stone at the mirror point as a narrow upright streak (230754, 231024), seen from 63 degrees off its beam."
+    },
+    {
+      "name": "day_cliff",
+      "eye": [11.0, 1.7, 38.0],
+      "at": [14.0, 2.5, 31.0],
+      "note": "On the beach in full sun, facing the cliff the sea cave is built into (its mouth on the right). Read against day_sea, the same spot turned to the horizon: before 2026-10-14 the eye re-exposed 0.67 stops between the two (user, 10-14)."
+    },
+    {
+      "name": "day_sea",
+      "eye": [11.0, 1.7, 38.0],
+      "at": [11.0, 1.4, 80.0],
+      "note": "day_cliff's spot turned to the sea horizon. The two must meter the same: in daylight under open sky the eye does not follow the gaze."
+    },
+    {
+      "name": "cave_lit_speck",
+      "eye": [26.0, 1.2, 33.5],
+      "at": [27.55, 2.4, 32.6],
+      "note": "Inside the chamber at the south wall's slivers (27.55, 2.52, 32.52): a 10 cm patch of rock lit as open sky in the dark (headset 004828-004843, 2026-10-14) -- the cave lightmap's unwritten neutral (alpha 1) under slivers along an authored chart's edge."
+    },
+    {
+      "name": "cave_back_door_in",
+      "eye": [33.5, 2.2, 34.8],
+      "at": [30.0, 1.5, 33.2],
+      "note": "Walking back into the back mouth from the lawn (headset 004852-004854, 2026-10-14): the north jamb in its own shade (the sun is north-east) and the ditch the cave carve dug along its floor tongue."
+    },
+    {
+      "name": "marble_pendant_reflection",
+      "eye": [-1.0, 1.6, -3.4],
+      "at": [2.7, 0.9, -4.4],
+      "note": "The marble hall's east wall left of the hallway doors (headset 005516-005519, 010552-010610, 2026-10-14): the reflection of the floor under hall_spot_1, green while the probe bake took the heightfield 0.2 mm over the floor for the floor."
+    },
+    {
+      "name": "door_frames_hallway",
+      "eye": [5.5, 1.6, -3.3],
+      "at": [2.85, 1.1, -3.0],
+      "note": "From the hallway at the swing doors into the marble hall (headset 005521-005523, 2026-10-14): frames and leaves as models, the frame lit by the room the eye is in."
+    },
+    {
+      "name": "door_hall_shut",
+      "eye": [-1.0, 1.6, -3.4],
+      "at": [3.0, 1.2, -3.0],
+      "doors": [0.0, 0.0, 0.0, 0.0],
+      "note": "hall_to_doors with every door held shut (BenchPose::doors, scene order: hall south, hall north, brick south, brick north): the base for the door lag (headset 2026-10-14: 'bad lag with opening the doors, especially in the marble room'). docs/grab-and-lag-status-2026-10-14.md B1."
+    },
+    {
+      "name": "door_hall_open",
+      "eye": [-1.0, 1.6, -3.4],
+      "at": [3.0, 1.2, -3.0],
+      "doors": [80.0, 80.0, 0.0, 0.0],
+      "note": "The same with the hall's two swing leaves held 80 degrees open and still: what an OPEN doorway costs (the hallway and what its doorways show, the leaves' tiles and reflection proxies turned out into the room)."
+    },
+    {
+      "name": "door_hall_swing",
+      "eye": [-1.0, 1.6, -3.4],
+      "at": [3.0, 1.2, -3.0],
+      "doors": [80.0, 80.0, 0.0, 0.0],
+      "door_swing": 3.0,
+      "note": "The same leaves swinging shut -> 80 degrees -> shut every 3 s (BenchPose::door_swing): what a MOVING door costs over door_hall_open, and the portal cull flipping each time a leaf leaves shut."
+    },
+    {
+      "name": "motes_center",
+      "eye": [0.0, 1.6, -4.5],
+      "at": [0.0, 1.3, -8.5],
+      "note": "Standing in the middle of hall_dust (half size 1.2 x 1.45 x 1.2 m at 0, 1.55, -4.5) looking down the hall through it (headset 2026-10-14: 'pretty bad lag when standing in the center of the dust motes effect'). A/B lever effects."
+    },
+    {
+      "name": "rain_puddles_ripples_down",
+      "eye": [-17.0, 1.65, 0.0],
+      "at": [-17.1, 0.0, -0.7],
+      "note": "Looking straight down at the rain's puddles at the feet (headset 2026-10-14: 'looking down at the rain puddle ripples'): the puddle reader (terrain_weather_snowless_gentle_read_baked_spotless) over most of the screen."
+    },
+    {
+      "name": "torch_hand_shadow_rain",
+      "eye": [-17.0, 1.65, 0.0],
+      "at": [-17.1, 0.0, -0.7],
+      "flashlight": {"at": [-16.85, 1.25, -0.3], "aim": [-17.1, 0.0, -1.2], "torch": true},
+      "note": "rain_puddles_ripples_down with the torch lit and aimed at the puddles: a spot casts, so the frame draws the NON-spotless weather twins (+190 proxy units; the puddle reader past the 3,387 instruction cache without ground_twins::TORCH_WEATHER_SKY_WALK). The bench draws no hand, so not the hand's shadow itself; the reader is the same. Launch A/B: setprop debug.spacesoup.torchskywalk 0."
     }
   ],
   "levels": {

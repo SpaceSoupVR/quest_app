@@ -254,6 +254,9 @@ pub(crate) fn handle_input(
     elapsed: f32,
     // Last frame's posed part transforms, published by render_prep.
     part_transforms: &HashMap<String, HashMap<String, ([f32; 3], [f32; 4])>>,
+    // What each hand will take, lit this frame (`grab_reach`): a press takes
+    // exactly that, a loose thing or a door by its handle.
+    targets: &space_soup_engine::grab_target::GrabTargets,
 ) -> InputFrame {
     let mut input = InputFrame::default();
 
@@ -297,18 +300,18 @@ pub(crate) fn handle_input(
             info!("GRAB R: '{id}' via grip point '{point}'");
             grabbed_ids[hand_idx(Hand::Right)] = Some(id.clone());
             input.grabbed.push((id, Hand::Right, point));
-        } else if let Some(id) = static_scene.doors.handle_near(p).map(str::to_string) {
-            // A door's handle: the hand holds it and swings the leaf
-            // (`PhysicsWorld::grab_door`, `ClientDoors::update_held`).
-            info!("GRAB R: door '{id}' by its handle");
-            grabbed_ids[hand_idx(Hand::Right)] = Some(id.clone());
-            input.grabbed.push((id, Hand::Right, "handle".to_string()));
-        } else if let Some(id) =
-            grab_detect::nearest_grabbable_object_to(live_objects, static_scene, p)
-        {
-            info!("GRAB R: '{id}' via proximity (no grip point)");
-            grabbed_ids[hand_idx(Hand::Right)] = Some(id.clone());
-            input.grabbed.push((id, Hand::Right, String::new()));
+        } else if let Some(c) = targets.choice(hand_idx(Hand::Right)) {
+            // WHAT IS LIT: the hand's choice (`grab_reach`), within its reach
+            // and pointed at. A door by its handle (`PhysicsWorld::grab_door`,
+            // `ClientDoors::update_held`), or a loose thing, which the hold's
+            // spring brings to the hand (`PhysicsWorld::grab_free`).
+            let point = match c.kind {
+                space_soup_engine::grab_target::TakeKind::Handle => "handle".to_string(),
+                space_soup_engine::grab_target::TakeKind::Loose => String::new(),
+            };
+            info!("GRAB R: '{}' ({:?}, cost {:.2})", c.id, c.kind, c.cost);
+            grabbed_ids[hand_idx(Hand::Right)] = Some(c.id.clone());
+            input.grabbed.push((c.id.clone(), Hand::Right, point));
         } else {
             info!(
                 "GRAB R: pressed, nothing in range (hand {:.2},{:.2},{:.2}; {} live objs)",
@@ -348,18 +351,18 @@ pub(crate) fn handle_input(
             info!("GRAB L: '{id}' via grip point '{point}'");
             grabbed_ids[hand_idx(Hand::Left)] = Some(id.clone());
             input.grabbed.push((id, Hand::Left, point));
-        } else if let Some(id) = static_scene.doors.handle_near(p).map(str::to_string) {
-            // A door's handle: the hand holds it and swings the leaf
-            // (`PhysicsWorld::grab_door`, `ClientDoors::update_held`).
-            info!("GRAB L: door '{id}' by its handle");
-            grabbed_ids[hand_idx(Hand::Left)] = Some(id.clone());
-            input.grabbed.push((id, Hand::Left, "handle".to_string()));
-        } else if let Some(id) =
-            grab_detect::nearest_grabbable_object_to(live_objects, static_scene, p)
-        {
-            info!("GRAB L: '{id}' via proximity (no grip point)");
-            grabbed_ids[hand_idx(Hand::Left)] = Some(id.clone());
-            input.grabbed.push((id, Hand::Left, String::new()));
+        } else if let Some(c) = targets.choice(hand_idx(Hand::Left)) {
+            // WHAT IS LIT: the hand's choice (`grab_reach`), within its reach
+            // and pointed at. A door by its handle (`PhysicsWorld::grab_door`,
+            // `ClientDoors::update_held`), or a loose thing, which the hold's
+            // spring brings to the hand (`PhysicsWorld::grab_free`).
+            let point = match c.kind {
+                space_soup_engine::grab_target::TakeKind::Handle => "handle".to_string(),
+                space_soup_engine::grab_target::TakeKind::Loose => String::new(),
+            };
+            info!("GRAB L: '{}' ({:?}, cost {:.2})", c.id, c.kind, c.cost);
+            grabbed_ids[hand_idx(Hand::Left)] = Some(c.id.clone());
+            input.grabbed.push((c.id.clone(), Hand::Left, point));
         } else {
             info!(
                 "GRAB L: pressed, nothing in range (hand {:.2},{:.2},{:.2}; {} live objs)",

@@ -261,7 +261,7 @@ def levers_for(view: dict, ab: bool, extra: dict, synced: bool = False) -> dict:
     if "sway" in view:
         levers["bench"]["sway"] = view["sway"]
     # A walk along a path, or a turn on the spot (BenchPose::path, speed, spin).
-    for key in ("path", "speed", "spin"):
+    for key in ("path", "speed", "spin", "doors", "door_swing"):
         if key in view:
             levers["bench"][key] = view[key]
     # The player's flashlight held still at a place in the world (BenchPose::flashlight).
