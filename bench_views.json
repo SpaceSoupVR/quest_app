@@ -352,6 +352,20 @@
       "note": "The flashlight held 3 m right of the eye and shone past the marble pillar, so the pillar's shadow falls behind and left of it -- on the floor and the west wall -- in plain view (user, 2026-10-06: the marble column did not seem to cast a shadow from the flashlight)."
     },
     {
+      "name": "torch_pillar_line_w",
+      "eye": [-1.0, 1.6, -5.0],
+      "at": [0.2, 4.2, -9.5],
+      "flashlight": {"at": [-0.7, 1.25, -5.1], "aim": [-0.3, 2.6, -7.2]},
+      "note": "West of the marble pillar, looking up past it, the torch in the right hand 30 cm right of and 35 cm below the eye and aimed at the pillar's top: the thin dark line beside the pillar (headset 152644-46, 155040; the user: 'nothing visible to cast it'). The pinned head leaves the avatar where the real headset is, so only the scene casts here."
+    },
+    {
+      "name": "torch_pillar_line_e",
+      "eye": [1.0, 1.6, -5.0],
+      "at": [-0.2, 4.2, -9.5],
+      "flashlight": {"at": [1.3, 1.25, -5.1], "aim": [0.3, 2.6, -7.2]},
+      "note": "torch_pillar_line_w from the east of the pillar."
+    },
+    {
       "name": "torch_pendant",
       "eye": [0.4, 1.6, -0.5],
       "at": [0.0, 2.3, 2.5],
