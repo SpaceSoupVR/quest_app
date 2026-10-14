@@ -12,8 +12,9 @@
 
 use glam::{Quat, Vec3};
 use space_soup::renderer::cuboid::SolidVertex;
+use space_soup::renderer::ground_lod::{self, GroundLod};
 use space_soup_engine::brush::{contains_point, BrushDef, BrushSolid};
-use space_soup_engine::terrain::{TerrainDef, TerrainSource};
+use space_soup_engine::terrain::TerrainDef;
 
 /// How far below the terrain surface to look for a structure that buries it.
 ///
@@ -220,76 +221,48 @@ fn bury_indexed(positions: &mut [Vec3], indices: &[u32], solids: &SolidIndex) ->
 /// Ground vertices and indices in the renderer's own format.
 ///
 /// `vertices` are WORLD space, as loaded. `assemble` produces the player-frame
-/// copy the renderer actually draws.
+/// copy for a renderer that does not pose the ground itself.
 pub struct TerrainGeometry {
     pub vertices: Vec<SolidVertex>,
-    /// Triangles REORDERED so each spatial chunk is one contiguous run.
+    /// THE GROUND'S INDEX BUFFER AS `ground_lod` LAYS IT: every chunk's
+    /// step-1 triangles, the chunks 32 cells a side and in Morton order of
+    /// their grid (the first [`Self::step1_len`] indices -- all a frame draws
+    /// with `Levers::ground_lod` off), then the coarser lists where a level's
+    /// load built them (`ground_lod::LISTS`).
     ///
-    /// The order is what makes frustum culling possible at all: a chunk has to
-    /// be drawable as a single `draw_indexed` range, and a row-major grid
+    /// The order is what makes culling possible at all: a chunk has to be
+    /// drawable as a single `draw_indexed` range, and a row-major grid
     /// scatters any square patch across the whole buffer.
     pub indices: Vec<u32>,
     /// Player-frame copy, rebuilt only when the player has actually moved.
     posed: Vec<SolidVertex>,
     built_for: Option<(Vec3, f32)>,
-    /// `(first_index, index_count)` per chunk, into `indices`.
-    chunk_ranges: Vec<(u32, u32)>,
-    /// Player-frame bounds per chunk, rebuilt alongside `posed`.
-    chunk_bounds: Vec<(Vec3, Vec3)>,
-    /// Per chunk, the vertices that can be its box's extremes at ANY turn of
-    /// the rig: its hull seen from above, and its lowest and highest. Found
-    /// once, on the first frame that wants them (`assemble_world`).
-    chunk_extremes: Vec<Vec<u32>>,
-}
-
-/// How far a chunk's box from its extremes is let out, metres: more than a
-/// turn's arithmetic can put another of its vertices past them.
-pub const CHUNK_BOX_SLACK: f32 = 1e-4;
-
-/// The points of `vertices` (by index, each once) that are corners of their
-/// hull seen from above (x, z), with the lowest and the highest: whatever the
-/// turn about the vertical, the box of these is the box of all.
-fn extremes_of(positions: &dyn Fn(u32) -> Vec3, vertices: &[u32]) -> Vec<u32> {
-    let mut ids: Vec<u32> = vertices.to_vec();
-    ids.sort_unstable();
-    ids.dedup();
-    if ids.len() <= 3 {
-        return ids;
-    }
-    let key = |i: u32| {
-        let p = positions(i);
-        (p.x, p.z)
-    };
-    let mut by_x = ids.clone();
-    by_x.sort_by(|&a, &b| key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal));
-    let cross = |o: u32, a: u32, b: u32| {
-        let (o, a, b) = (key(o), key(a), key(b));
-        (a.0 as f64 - o.0 as f64) * (b.1 as f64 - o.1 as f64) - (a.1 as f64 - o.1 as f64) * (b.0 as f64 - o.0 as f64)
-    };
-    // Andrew's chain, keeping points ON an edge out.
-    let mut hull: Vec<u32> = Vec::new();
-    for pass in 0..2 {
-        let start = hull.len();
-        let order: Box<dyn Iterator<Item = &u32>> = if pass == 0 { Box::new(by_x.iter()) } else { Box::new(by_x.iter().rev()) };
-        for &i in order {
-            while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], i) <= 0.0 {
-                hull.pop();
-            }
-            hull.push(i);
-        }
-        hull.pop();
-    }
-    let by_height = |a: &&u32, b: &&u32| positions(**a).y.partial_cmp(&positions(**b).y).unwrap_or(std::cmp::Ordering::Equal);
-    hull.extend(ids.iter().min_by(by_height));
-    hull.extend(ids.iter().max_by(by_height));
-    hull.sort_unstable();
-    hull.dedup();
-    hull
+    /// The chunks, the quadtree over them and the lists (its indices are
+    /// `indices` above): what a frame asks which chunks it draws, and at
+    /// which step (`GroundLod::frame`). The renderer is handed a copy
+    /// (`XrRenderer::set_ground_lod`).
+    pub lod: GroundLod,
+    /// Every run of `indices` the slope split sorts, its box in the WORLD:
+    /// the same list every frame ([`Self::caster_chunks`]).
+    units: Vec<space_soup::renderer::shadow::CasterChunk>,
 }
 
 impl TerrainGeometry {
     pub fn is_empty(&self) -> bool {
         self.vertices.is_empty() || self.indices.is_empty()
+    }
+
+    /// How many of `indices`, from the first, are the ground at step 1 --
+    /// "the ground's triangles" for anything that is not a draw (the
+    /// horizon's occluder, a census): past them lie other lists of the same
+    /// ground.
+    pub fn step1_len(&self) -> usize {
+        (self.lod.level0_len() as usize).min(self.indices.len())
+    }
+
+    /// The ground's triangles at step 1.
+    pub fn step1(&self) -> &[u32] {
+        &self.indices[..self.step1_len()]
     }
 
     /// Ground in the player's frame, the way every other kind of geometry is
@@ -304,6 +277,10 @@ impl TerrainGeometry {
     /// Cached on (offset, yaw) exactly like `BrushGeometry::assemble`: standing
     /// still costs nothing, and a heightfield is static so there is never a
     /// re-mesh, only a rotate and a subtract per vertex.
+    ///
+    /// (The chunks' boxes are not made here any more: the renderer poses the
+    /// boxes of the chunks a frame draws, from their boxes in the world --
+    /// `GroundLod::posed`.)
     pub fn assemble(
         &mut self,
         offset: Vec3,
@@ -328,62 +305,26 @@ impl TerrainGeometry {
                 out.normal = n.to_array();
                 self.posed.push(out);
             }
-            // Bounds follow the vertices into the player's frame. Recomputed
-            // here rather than rotated: an AABB does not survive a rotation --
-            // rotating the eight corners and re-fitting grows the box every
-            // time, and a box that grows every frame stops culling anything.
-            self.chunk_bounds.clear();
-            for &(first, count) in &self.chunk_ranges {
-                let mut lo = Vec3::splat(f32::INFINITY);
-                let mut hi = Vec3::splat(f32::NEG_INFINITY);
-                for i in first..first + count {
-                    let p = Vec3::from(self.posed[self.indices[i as usize] as usize].position);
-                    lo = lo.min(p);
-                    hi = hi.max(p);
-                }
-                self.chunk_bounds.push((lo, hi));
-            }
             self.built_for = Some(key);
         }
         Some((&self.posed, &self.indices))
     }
 
     /// THE GROUND AS LOADED, IN THE WORLD, for a renderer that poses it
-    /// itself (`XrRenderer::ground_in_world`): no vertex is touched. Only
-    /// the chunks' boxes follow the rig into the player's frame, from each
-    /// chunk's few extreme vertices (`extremes_of`) and not from all of
-    /// them -- on a frame the rig moved, where [`Self::assemble`] re-posed
-    /// every vertex and walked every index.
-    pub fn assemble_world(&mut self, offset: Vec3, yaw_inv: Quat, player_yaw: f32) -> Option<(&[SolidVertex], &[u32])> {
+    /// itself (`XrRenderer::ground_in_world`): nothing is touched and
+    /// nothing follows the rig here -- not a vertex, and (since 2026-10-13)
+    /// not a chunk's box either: every chunk's was posed on each frame the
+    /// rig moved, 64 of them on any level then, 4,096 at 2,049 samples with
+    /// chunks of a fixed size. The frame poses the boxes of the chunks it
+    /// draws (`GroundLod::posed`).
+    pub fn assemble_world(&mut self, _offset: Vec3, _yaw_inv: Quat, _player_yaw: f32) -> Option<(&[SolidVertex], &[u32])> {
         if self.is_empty() {
             return None;
         }
-        if self.chunk_extremes.len() != self.chunk_ranges.len() {
-            let (vertices, indices) = (&self.vertices, &self.indices);
-            let position = |i: u32| Vec3::from(vertices[i as usize].position);
-            self.chunk_extremes = self
-                .chunk_ranges
-                .iter()
-                .map(|&(first, count)| extremes_of(&position, &indices[first as usize..(first + count) as usize]))
-                .collect();
-            self.built_for = None;
-        }
-        let key = (offset, player_yaw);
-        if self.built_for != Some(key) || self.chunk_bounds.len() != self.chunk_ranges.len() {
-            // The posed copy is not kept beside the world's.
+        // The posed copy is not kept beside the world's.
+        if !self.posed.is_empty() {
             self.posed = Vec::new();
-            self.chunk_bounds.clear();
-            for extremes in &self.chunk_extremes {
-                let mut lo = Vec3::splat(f32::INFINITY);
-                let mut hi = Vec3::splat(f32::NEG_INFINITY);
-                for &i in extremes {
-                    let p = yaw_inv * (Vec3::from(self.vertices[i as usize].position) - offset);
-                    lo = lo.min(p);
-                    hi = hi.max(p);
-                }
-                self.chunk_bounds.push((lo - Vec3::splat(CHUNK_BOX_SLACK), hi + Vec3::splat(CHUNK_BOX_SLACK)));
-            }
-            self.built_for = Some(key);
+            self.built_for = None;
         }
         Some((&self.vertices, &self.indices))
     }
@@ -430,23 +371,12 @@ impl TerrainGeometry {
         (lo, hi)
     }
 
-    /// Each chunk's first index and its WORLD bounds, from the unposed
-    /// vertices: what a weather area is tested against
-    /// (`weather_render::chunk_flags`).
+    /// Each run's first index and its WORLD bounds (its chunk's, or its
+    /// node's for a coarser list): what a weather area is tested against
+    /// (`weather_render::chunk_flags`) and the horizon is asked with, entry
+    /// for entry with [`Self::caster_chunks`].
     pub fn chunk_world_bounds(&self) -> Vec<(u32, (Vec3, Vec3))> {
-        self.chunk_ranges
-            .iter()
-            .map(|&(first, count)| {
-                let mut lo = Vec3::splat(f32::INFINITY);
-                let mut hi = Vec3::splat(f32::NEG_INFINITY);
-                for &i in &self.indices[first as usize..(first + count) as usize] {
-                    let p = Vec3::from(self.vertices[i as usize].position);
-                    lo = lo.min(p);
-                    hi = hi.max(p);
-                }
-                (first, (lo, hi))
-            })
-            .collect()
+        self.units.iter().map(|c| (c.first_index, (c.min, c.max))).collect()
     }
 
     /// THE DRAWN GROUND AS WHAT IT HIDES, for the renderer's horizon test
@@ -462,7 +392,8 @@ impl TerrainGeometry {
             None => [256, 256],
         };
         let positions: Vec<[f32; 3]> = self.vertices.iter().map(|v| v.position).collect();
-        space_soup::renderer::ground_horizon::GroundOccluder::from_triangles(&positions, &self.indices, cells)
+        // (Step 1's triangles: the coarser lists are the same ground again.)
+        space_soup::renderer::ground_horizon::GroundOccluder::from_triangles(&positions, self.step1(), cells)
     }
 
     /// The index runs of the chunks the ground hides from an eye at `eye` in
@@ -480,25 +411,53 @@ impl TerrainGeometry {
         use space_soup::renderer::ground_horizon::{Horizon, REACH};
         let ground = self.ground_occluder(def)?;
         let mut horizon = Horizon::new(&ground, eye, REACH, caves);
-        let bounds = self.chunk_world_bounds();
+        // The chunks at step 1: the first runs of the buffer.
+        let step1 = self.step1_len() as u32;
         let runs = self
-            .chunk_ranges
+            .units
             .iter()
-            .zip(&bounds)
-            .filter(|(_, (_, (lo, hi)))| horizon.hides_ground(&ground, *lo, *hi))
-            .map(|(run, _)| *run)
+            .take_while(|c| c.first_index < step1)
+            .filter(|c| horizon.hides_ground(&ground, c.min, c.max))
+            .map(|c| (c.first_index, c.index_count))
             .collect();
         Some((runs, ground, horizon))
     }
 
-    pub fn caster_chunks(&self) -> Vec<space_soup::renderer::shadow::CasterChunk> {
-        self.chunk_ranges
-            .iter()
-            .zip(self.chunk_bounds.iter())
-            .map(|(&(first_index, index_count), &(min, max))| {
-                space_soup::renderer::shadow::CasterChunk { first_index, index_count, min, max }
-            })
-            .collect()
+    /// EVERY run of the index buffer as a chunk -- each chunk at step 1,
+    /// then the coarser lists' -- with its box in the WORLD: what the slope
+    /// split is built over (`XrRenderer::prepare_ground`) and a frame hands
+    /// the renderer. The same slice every frame; which of them a frame draws,
+    /// and their boxes in the player's frame, come from [`Self::lod`].
+    pub fn caster_chunks(&self) -> &[space_soup::renderer::shadow::CasterChunk] {
+        &self.units
+    }
+
+    /// WHAT A FRAME HANDS THE RENDERER: the vertices (the world's own where
+    /// `world`, posed for the rig otherwise), the index buffer and every run
+    /// of it as a chunk -- three borrows of one ground, so the list of runs
+    /// is not copied each frame (tens of thousands on a large level with the
+    /// coarser lists built).
+    pub fn frame(
+        &mut self,
+        world: bool,
+        offset: Vec3,
+        yaw_inv: Quat,
+        player_yaw: f32,
+    ) -> Option<(&[SolidVertex], &[u32], &[space_soup::renderer::shadow::CasterChunk])> {
+        if world {
+            self.assemble_world(offset, yaw_inv, player_yaw)?;
+            Some((&self.vertices, &self.indices, &self.units))
+        } else {
+            self.assemble(offset, yaw_inv, player_yaw)?;
+            Some((&self.posed, &self.indices, &self.units))
+        }
+    }
+
+    /// A ground from its parts, cut into chunks as [`load`] cuts it.
+    fn from_parts(vertices: Vec<SolidVertex>, mut lod: GroundLod) -> Self {
+        let units = lod.all_units();
+        let indices = std::mem::take(&mut lod.indices);
+        Self { vertices, indices, posed: Vec::new(), built_for: None, lod, units }
     }
 }
 
@@ -528,56 +487,6 @@ pub fn plugging_caves(scene: &space_soup_engine::scene::Scene, game_dir: &std::p
     boxes
 }
 
-/// Reorder triangles so that spatially-near ones are adjacent in the buffer.
-///
-/// A grid-bucket sort on each triangle's centroid in x/z. Ground is a
-/// heightfield, so two triangles near each other on the map are near each other
-/// in space, and `CHUNK_TARGET` buckets per axis is enough resolution that a
-/// small spot cone touches only a few of them.
-///
-/// Deliberately not a full spatial tree: this runs once per level load, the
-/// gain is bounded by how tight the chunks are rather than by how clever the
-/// structure is, and a flat grid is trivially correct to re-derive.
-fn chunk_indices(
-    vertices: &[SolidVertex],
-    indices: &[u32],
-    buckets_per_axis: u32,
-) -> (Vec<u32>, Vec<(u32, u32)>) {
-    let n = buckets_per_axis.max(1);
-    let mut lo = Vec3::splat(f32::INFINITY);
-    let mut hi = Vec3::splat(f32::NEG_INFINITY);
-    for v in vertices {
-        let p = Vec3::from(v.position);
-        lo = lo.min(p);
-        hi = hi.max(p);
-    }
-    let extent = hi - lo;
-    let sx = if extent.x.abs() > 1e-6 { n as f32 / extent.x } else { 0.0 };
-    let sz = if extent.z.abs() > 1e-6 { n as f32 / extent.z } else { 0.0 };
-
-    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); (n * n) as usize];
-    for tri in indices.chunks_exact(3) {
-        let c = (Vec3::from(vertices[tri[0] as usize].position)
-            + Vec3::from(vertices[tri[1] as usize].position)
-            + Vec3::from(vertices[tri[2] as usize].position))
-            / 3.0;
-        let bx = (((c.x - lo.x) * sx) as u32).min(n - 1);
-        let bz = (((c.z - lo.z) * sz) as u32).min(n - 1);
-        buckets[(bz * n + bx) as usize].extend_from_slice(tri);
-    }
-
-    let mut out = Vec::with_capacity(indices.len());
-    let mut ranges = Vec::new();
-    for b in buckets {
-        if b.is_empty() {
-            continue;
-        }
-        ranges.push((out.len() as u32, b.len() as u32));
-        out.extend_from_slice(&b);
-    }
-    (out, ranges)
-}
-
 /// Load a scene's terrain and convert it for the solid pipeline.
 ///
 /// Returns `None` rather than failing the frame when the asset is missing: a
@@ -591,6 +500,12 @@ pub fn load(
     // lowered in the rendered copy; see `bury_under_structures`.
     structures: &[&BrushDef],
 ) -> Option<TerrainGeometry> {
+    // The coarser lists when the launch asked for them (`ground_lod::LISTS`).
+    load_with(def, game_dir, step, structures, ground_lod::LISTS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// [`load`], with the ground's coarser lists built or not as `lists` says.
+pub fn load_with(def: &TerrainDef, game_dir: &std::path::Path, step: u32, structures: &[&BrushDef], lists: bool) -> Option<TerrainGeometry> {
     let source = match space_soup_engine::terrain::load(def, game_dir) {
         Ok(s) => s,
         Err(e) => {
@@ -657,36 +572,44 @@ pub fn load(
         patch.positions.len(),
         patch.indices.len() / 3
     );
-    // 8x8 buckets over the footprint. On a 110 m field that is ~14 m a side --
-    // comfortably smaller than the sun's box and larger than a small spot's
-    // cone, so a 4 m lamp touches one or two chunks instead of all 32k
-    // triangles.
-    // (MEASUREMENT: another count from `debug.spacesoup.chunks`.)
+    // CHUNKS OF A FIXED SIZE, 32 cells a side (13.75 m on test_room's cells,
+    // 8 a side there as before; 20 a side at 625 samples, 64 at 2,049, where
+    // "8 a side whatever the size" made each chunk 110 m of ground): small
+    // enough that a 4 m lamp touches one or two, and that a frustum or the
+    // ground's own horizon leaves most of a large level out. In Morton order
+    // of the chunk grid, with a quadtree over them, and -- where the load
+    // was asked for them -- the coarser lists. See `ground_lod`.
+    // (MEASUREMENT: another count a side from `debug.spacesoup.chunks`.)
     let asked = space_soup::renderer::ground_horizon::CHUNKS_A_SIDE.load(std::sync::atomic::Ordering::Relaxed);
-    let (indices, chunk_ranges) = chunk_indices(&vertices, &kept_indices, if asked > 0 { asked } else { CHUNK_TARGET });
+    let lod = match source.as_heightfield().filter(|_| step.max(1) == 1) {
+        Some(field) => {
+            let cells = field.meshed_cells();
+            let chunk_cells = if asked > 0 { cells[0].max(cells[1]).div_ceil(asked).max(1) } else { ground_lod::CHUNK_CELLS };
+            let open = |ix: u32, iz: u32| field.cell_is_open(ix, iz);
+            GroundLod::build(&ground_lod::GridInput {
+                cells,
+                positions: &positions,
+                triangles: &kept_indices,
+                open: field.holes().map(|_| &open as &dyn Fn(u32, u32) -> bool),
+                chunk_cells,
+                lists: asked == 0 && lists,
+            })
+        }
+        // Not a grid of samples at step 1: the whole of it as one chunk.
+        None => GroundLod::build(&ground_lod::GridInput { cells: [0, 0], positions: &positions, triangles: &kept_indices, open: None, chunk_cells: 1, lists: false }),
+    };
+    let lod = if lod.units.is_empty() { GroundLod::single(&positions, &kept_indices) } else { lod };
     log::info!(
-        "terrain_render: {} caster chunks over {} triangles",
-        chunk_ranges.len(),
-        indices.len() / 3,
+        "terrain_render: {} chunk(s) of {} cells a side ({} x {}) over {} triangles{}",
+        lod.units.iter().filter(|u| u.first < lod.level0_len()).count(),
+        if asked > 0 { "a count asked for".to_string() } else { ground_lod::CHUNK_CELLS.to_string() },
+        lod.chunks()[0],
+        lod.chunks()[1],
+        lod.level0_len() / 3,
+        if lod.has_lists() { format!("; with the coarser lists {} indices in {} runs", lod.indices.len(), lod.units.len()) } else { String::new() },
     );
-    Some(TerrainGeometry {
-        vertices,
-        indices,
-        posed: Vec::new(),
-        built_for: None,
-        chunk_ranges,
-        chunk_bounds: Vec::new(),
-        chunk_extremes: Vec::new(),
-    })
+    Some(TerrainGeometry::from_parts(vertices, lod))
 }
-
-/// Buckets per axis for shadow-caster chunking.
-///
-/// A tradeoff with no sharp optimum: more chunks cull tighter and cost more
-/// per-frame bounds work and more draw calls. Eight squares the field into 64,
-/// which on a tile GPU is a handful of extra draws against tens of thousands of
-/// triangles saved.
-const CHUNK_TARGET: u32 = 8;
 
 /// Area-weighted vertex normals from the triangles.
 ///
@@ -850,9 +773,8 @@ mod player_frame_tests {
             indices: vec![0, 1, 2],
             posed: Vec::new(),
             built_for: None,
-            chunk_ranges: Vec::new(),
-            chunk_bounds: Vec::new(),
-            chunk_extremes: Vec::new(),
+            lod: GroundLod::default(),
+            units: Vec::new(),
         }
     }
 
@@ -902,58 +824,56 @@ mod player_frame_tests {
         assert_eq!(n, [0.0, 1.0, 0.0]);
     }
 
-    /// Handed over in the world, no vertex is posed; and each chunk's box,
-    /// from its few extreme vertices, is the box of all its vertices posed --
-    /// at any turn and any place of the rig, let out by a hair and no more.
+    /// Handed over in the world, no vertex is posed and nothing is kept
+    /// beside the world's copy; and a chunk's box as the frame poses it
+    /// (`GroundLod::posed`, from its box in the world) holds all its
+    /// vertices posed -- at any turn and any place of the rig.
     #[test]
-    fn a_chunks_box_from_its_extremes_is_the_box_of_all_its_vertices_at_any_turn() {
-        // A bumpy 24 x 24 patch in two chunks.
-        let n = 24u32;
+    fn handed_over_in_the_world_nothing_is_posed_and_a_drawn_chunks_box_holds_it_at_any_turn() {
+        // A bumpy 72 x 72 cell patch: nine chunks of 32 cells (the last a part).
+        let cells = 72u32;
+        let n = cells + 1;
         let mut positions = Vec::new();
         for z in 0..n {
             for x in 0..n {
                 let h = ((x * 7 + z * 13) % 11) as f32 * 0.37 + (x as f32 * 0.9).sin() * 2.0;
-                positions.push([x as f32 * 1.5 - 9.0, h, z as f32 * 1.5 + 4.0]);
+                positions.push(Vec3::new(x as f32 * 1.5 - 9.0, h, z as f32 * 1.5 + 4.0));
             }
         }
         let mut indices = Vec::new();
-        for z in 0..n - 1 {
-            for x in 0..n - 1 {
+        for z in 0..cells {
+            for x in 0..cells {
                 let a = z * n + x;
                 indices.extend_from_slice(&[a, a + n, a + 1, a + 1, a + n, a + n + 1]);
             }
         }
-        let half = (indices.len() / 6 * 3) as u32;
-        let mut world = geometry(&positions);
-        world.indices = indices.clone();
-        world.chunk_ranges = vec![(0, half), (half, indices.len() as u32 - half)];
-        let mut posed = geometry(&positions);
-        posed.indices = indices.clone();
-        posed.chunk_ranges = world.chunk_ranges.clone();
+        let lod = GroundLod::build(&ground_lod::GridInput { cells: [cells, cells], positions: &positions, triangles: &indices, open: None, chunk_cells: ground_lod::CHUNK_CELLS, lists: false });
+        let vertices: Vec<SolidVertex> = positions.iter().map(|p| SolidVertex { position: p.to_array(), normal: [0.0, 1.0, 0.0], color: [1.0; 4], uv2: [0.0; 2], reflectivity: 0.0 }).collect();
+        let mut world = TerrainGeometry::from_parts(vertices, lod);
+        assert_eq!(world.caster_chunks().len(), 9);
+        assert_eq!(world.step1_len(), indices.len());
         for k in 0..200 {
             let yaw = k as f32 * 0.173;
             let offset = Vec3::new(k as f32 * 0.31 - 20.0, (k % 7) as f32 * 0.4, 3.0 - k as f32 * 0.11);
             let yaw_inv = Quat::from_rotation_y(yaw).inverse();
             let (v, i) = world.assemble_world(offset, yaw_inv, yaw).unwrap();
             assert_eq!(v.len(), positions.len());
-            assert!(v.iter().zip(&positions).all(|(v, p)| v.position == *p), "a vertex was touched");
-            assert_eq!(i, &indices[..]);
-            posed.assemble(offset, yaw_inv, yaw).unwrap();
-            let (ours, exact) = (world.caster_chunks(), posed.caster_chunks());
-            assert_eq!(ours.len(), 2);
-            for (a, b) in ours.iter().zip(&exact) {
-                assert_eq!((a.first_index, a.index_count), (b.first_index, b.index_count));
-                assert!(a.min.cmple(b.min).all() && a.max.cmpge(b.max).all(), "turn {k}: a vertex outside its chunk's box");
-                assert!((b.min - a.min).max_element() <= 3.0 * CHUNK_BOX_SLACK && (a.max - b.max).max_element() <= 3.0 * CHUNK_BOX_SLACK, "turn {k}: the box is loose");
+            assert!(v.iter().zip(&positions).all(|(v, p)| Vec3::from(v.position) == *p), "a vertex was touched");
+            assert_eq!(i.len(), indices.len());
+            let frame = world.lod.frame(Vec3::ZERO, &[], false, offset, yaw, 0);
+            assert_eq!(frame.chunks.len(), 9);
+            for c in &frame.chunks {
+                for v in &world.indices[c.first_index as usize..(c.first_index + c.index_count) as usize] {
+                    let p = yaw_inv * (positions[*v as usize] - offset);
+                    assert!(p.cmpge(c.min).all() && p.cmple(c.max).all(), "turn {k}: a vertex outside its chunk's box");
+                }
             }
         }
-        // Far fewer vertices than the chunk has.
-        assert!(world.chunk_extremes.iter().all(|e| e.len() >= 4 && e.len() < 80), "{:?}", world.chunk_extremes.iter().map(Vec::len).collect::<Vec<_>>());
-        // Standing still, nothing is done again.
-        let before = world.built_for;
+        assert!(world.posed.is_empty());
+        // The posed way still poses every vertex, and going back drops the copy.
+        world.assemble(Vec3::ONE, Quat::IDENTITY, 0.0);
+        assert_eq!(world.posed.len(), positions.len());
         world.assemble_world(Vec3::ONE, Quat::IDENTITY, 0.0);
-        world.assemble_world(Vec3::ONE, Quat::IDENTITY, 0.0);
-        assert_ne!(before, world.built_for);
         assert!(world.posed.is_empty());
     }
 
@@ -975,9 +895,8 @@ mod player_frame_tests {
             indices: Vec::new(),
             posed: Vec::new(),
             built_for: None,
-            chunk_ranges: Vec::new(),
-            chunk_bounds: Vec::new(),
-            chunk_extremes: Vec::new(),
+            lod: GroundLod::default(),
+            units: Vec::new(),
         };
         assert!(g.assemble(Vec3::ZERO, Quat::IDENTITY, 0.0).is_none());
     }
@@ -1450,8 +1369,7 @@ pub(crate) mod horizon_tests {
         let structures: Vec<&BrushDef> = scene.objects.iter().filter_map(|o| o.brush.as_ref()).collect();
         let geometry = load(def, &game, 1, &structures)?;
         let occluder = geometry.ground_occluder(Some(def))?;
-        let bounds = geometry.chunk_world_bounds();
-        let chunks = geometry.chunk_ranges.iter().zip(&bounds).map(|(&(first, count), &(_, b))| (first, count, b)).collect();
+        let chunks = geometry.caster_chunks().iter().map(|c| (c.first_index, c.index_count, (c.min, c.max))).collect();
         let caves = plugging_caves(&scene, &game);
         let mut rock = Vec::new();
         for obj in scene.objects.iter().filter(|o| !o.hidden && o.terrain_collider.is_some()) {
@@ -1807,5 +1725,150 @@ pub(crate) mod horizon_tests {
             }
             println!("{name:<20} {in_view:>9} {by_first:>8} {by_chunk:>8} {:>8} {:>8} {:>8} {:>7} {} {}", by_part[0], by_part[1], by_part[2], h.walked, if h.plugged() { "plugged" } else { "" }, if level.caves.iter().any(|(lo, hi)| eye.cmpge(*lo).all() && eye.cmple(*hi).all()) { "in a cave's box" } else { "" });
         }
+    }
+}
+
+/// THE SHIPPED LEVEL'S GROUND BY LEVEL (`ground_lod`): its real holes, its
+/// cave's patch and the ground hidden under its buildings, through the load
+/// the headset runs.
+#[cfg(test)]
+mod lod_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    fn shipped(lists: bool) -> Option<(TerrainGeometry, space_soup_engine::scene::Scene)> {
+        let game = crate::offline_frame::offline_game_dir();
+        let scene = space_soup_engine::scene::Scene::load(&game.join("scenes/test_room.json")).ok()?;
+        let def = scene.terrain.as_ref()?;
+        let structures: Vec<&BrushDef> = scene.objects.iter().filter_map(|o| o.brush.as_ref()).collect();
+        let geometry = load_with(def, &game, 1, &structures, lists)?;
+        Some((geometry, scene))
+    }
+
+    /// The directed edges of a triangle list with no partner the other way;
+    /// a sliver (both ways round in the buffer) counted the way that closes.
+    fn open_edges(position: &dyn Fn(u32) -> Vec3, idx: &[u32]) -> Vec<(u32, u32)> {
+        let mut edges: HashMap<(u32, u32), i32> = HashMap::new();
+        let mut slivers: HashSet<[u32; 3]> = HashSet::new();
+        for t in idx.chunks_exact(3) {
+            let p = |k: usize| position(t[k]);
+            let area = (p(1).x - p(0).x) * (p(2).z - p(0).z) - (p(1).z - p(0).z) * (p(2).x - p(0).x);
+            let mut s = [t[0], t[1], t[2]];
+            s.sort_unstable();
+            if area == 0.0 && idx.chunks_exact(3).len() < usize::MAX {
+                slivers.insert(s);
+                continue;
+            }
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                *edges.entry((a, b)).or_default() += 1;
+            }
+        }
+        for [a, b, c] in slivers {
+            let closes = |t: [u32; 3]| [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])].iter().filter(|(x, y)| edges.get(&(*y, *x)).copied().unwrap_or(0) > edges.get(&(*x, *y)).copied().unwrap_or(0)).count();
+            let t = if closes([a, b, c]) >= closes([a, c, b]) { [a, b, c] } else { [a, c, b] };
+            for (x, y) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                *edges.entry((x, y)).or_default() += 1;
+            }
+        }
+        edges.iter().filter(|((a, b), n)| edges.get(&(*b, *a)).copied().unwrap_or(0) != **n).map(|(e, _)| *e).collect()
+    }
+
+    /// STEP 1 ON THE SHIPPED LEVEL: 64 chunks of 32 cells, as before, every
+    /// triangle once; and with the lists built the first of the buffer is
+    /// the same indices, which is all the lever-off frame draws.
+    #[test]
+    fn the_shipped_ground_is_64_chunks_and_the_lists_leave_step_1_as_it_is() {
+        let (Some((plain, _)), Some((mut with, _))) = (shipped(false), shipped(true)) else {
+            eprintln!("skipping: no test_room");
+            return;
+        };
+        assert_eq!(plain.lod.chunks(), [8, 8]);
+        assert_eq!(plain.caster_chunks().len(), 64, "64 chunks, as before the chunks had a fixed size");
+        assert_eq!(plain.step1_len(), plain.indices.len());
+        assert!(with.lod.has_lists() && with.indices.len() > plain.indices.len());
+        assert_eq!(with.step1(), &plain.indices[..]);
+        assert_eq!(&with.caster_chunks()[..64].iter().map(|c| (c.first_index, c.index_count)).collect::<Vec<_>>(), &plain.caster_chunks().iter().map(|c| (c.first_index, c.index_count)).collect::<Vec<_>>());
+        // The lever off draws the 64, whatever else is in the buffer.
+        let off = with.lod.select(Vec3::new(0.0, 1.6, 6.0), &[], false);
+        assert_eq!(off.units, (0..64).collect::<Vec<u32>>());
+    }
+
+    /// STEP 2 ON THE SHIPPED LEVEL: drawn by level from anywhere -- by the
+    /// design's rule and by the strict one -- the ground has NO CRACK the
+    /// step-1 ground has not: every open edge ends at vertices that are open
+    /// at step 1 too (the level's outline, a cave mouth's rim, the rim of
+    /// ground hidden under a floor) or that step 1 does not draw at all.
+    /// Neighbouring chunks differ by one level at most, and a chunk with a
+    /// hole or the cave's patch is at step 1 within 60 m.
+    #[test]
+    fn the_shipped_ground_by_level_has_no_crack_step_1_has_not() {
+        let Some((mut g, _)) = shipped(true) else {
+            eprintln!("skipping: no test_room");
+            return;
+        };
+        let positions: Vec<Vec3> = g.vertices.iter().map(|v| Vec3::from(v.position)).collect();
+        let position = |v: u32| positions[v as usize];
+        let step1 = g.step1().to_vec();
+        let mut may_be_open: HashSet<u32> = open_edges(&position, &step1).into_iter().flat_map(|(a, b)| [a, b]).collect();
+        let drawn_at_step1: HashSet<u32> = step1.iter().copied().collect();
+        may_be_open.extend((0..positions.len() as u32).filter(|v| !drawn_at_step1.contains(v)));
+        let (lo, hi) = g.world_bounds();
+        let holes: Vec<usize> = (0..64).filter(|n| g.lod.nodes[*n].holes).collect();
+        assert!(!holes.is_empty(), "test_room has a cave: some chunk has a hole");
+        let mut coarse_seen = false;
+        for strict in [false, true] {
+            g.lod.set_strict(strict);
+            let mut heads = vec![
+                Vec3::new(0.0, 1.6, 6.0),
+                Vec3::new(lo.x + 1.0, hi.y + 2.0, lo.z + 1.0),
+                Vec3::new(hi.x - 1.0, hi.y + 2.0, lo.z + 1.0),
+                Vec3::new(lo.x - 150.0, 30.0, (lo.z + hi.z) * 0.5),
+                Vec3::new((lo.x + hi.x) * 0.5, 80.0, hi.z + 400.0),
+                Vec3::new(lo.x - 3000.0, 100.0, lo.z - 3000.0),
+            ];
+            // And a walk across the level, so the hysteresis is in play.
+            heads.extend((0..40).map(|k| Vec3::new(lo.x + (hi.x - lo.x) * k as f32 / 39.0, 3.0, lo.z + (hi.z - lo.z) * (0.3 + 0.01 * k as f32))));
+            for head in heads {
+                let chosen = g.lod.select(head, &[], true);
+                let idx: Vec<u32> = chosen.units.iter().flat_map(|u| {
+                    let unit = g.lod.units[*u as usize];
+                    g.indices[unit.first as usize..(unit.first + unit.count) as usize].to_vec()
+                }).collect();
+                let cracks: Vec<(u32, u32)> = open_edges(&position, &idx).into_iter().filter(|(a, b)| !(may_be_open.contains(a) && may_be_open.contains(b))).collect();
+                assert!(cracks.is_empty(), "strict {strict}, head {head}: {} open edge(s) step 1 does not have, first {:?} at {}", cracks.len(), cracks[0], position(cracks[0].0));
+                let mut level_of = [u8::MAX; 64];
+                for (n, _) in &chosen.nodes {
+                    let node = &g.lod.nodes[*n as usize];
+                    coarse_seen |= node.level > 0;
+                    let span = 1u32 << node.level;
+                    for j in node.at[1] * span..((node.at[1] + 1) * span).min(8) {
+                        for i in node.at[0] * span..((node.at[0] + 1) * span).min(8) {
+                            assert_eq!(level_of[(j * 8 + i) as usize], u8::MAX, "a chunk drawn twice");
+                            level_of[(j * 8 + i) as usize] = node.level;
+                        }
+                    }
+                }
+                for j in 0..8usize {
+                    for i in 0..8usize {
+                        let here = level_of[j * 8 + i] as i32;
+                        assert_ne!(here, u8::MAX as i32, "a chunk not drawn");
+                        if i + 1 < 8 {
+                            assert!((here - level_of[j * 8 + i + 1] as i32).abs() <= 1, "head {head}: neighbours two levels apart");
+                        }
+                        if j + 1 < 8 {
+                            assert!((here - level_of[(j + 1) * 8 + i] as i32).abs() <= 1, "head {head}: neighbours two levels apart");
+                        }
+                    }
+                }
+                for n in &holes {
+                    let node = &g.lod.nodes[*n];
+                    let d = (head.clamp(node.lo, node.hi) - head).length();
+                    if d < ground_lod::HOLE_FLOOR {
+                        assert_eq!(level_of[*n], 0, "head {head}: a chunk with a hole {d:.0} m off is not at step 1");
+                    }
+                }
+            }
+        }
+        assert!(coarse_seen, "some view drew a coarser node");
     }
 }
