@@ -9,6 +9,7 @@
 use glam::Vec3;
 use space_soup::renderer::effects::stack::{Placed, PlacedEffect};
 use space_soup::renderer::effects::{EffectEmitter, EffectKind, Variation};
+use space_soup::renderer::levers::Levers;
 use space_soup_engine::scene::{EffectKindDef, Scene};
 use space_soup_engine::Manifest;
 
@@ -71,6 +72,24 @@ pub(crate) fn load(game_dir: &std::path::Path, scene_name: &str) -> Vec<EffectEm
         .collect()
 }
 
+/// EFFECTS BEHIND A LEVER, for an A/B on the headset: a scene object (by
+/// id) whose effect is drawn only while the renderer lever says so. Off by
+/// default, so the shipped level loads without them.
+pub(crate) const LEVER_GATED: &[(&str, fn(&Levers) -> bool)] = &[
+    // The dust round the cave's bonfire, to judge with the torch through it.
+    ("fx_cave_dust", |l| l.cave_dust),
+];
+
+/// Which of [`LEVER_GATED`]'s levers are on.
+pub(crate) fn gate(levers: &Levers) -> Vec<bool> {
+    LEVER_GATED.iter().map(|(_, on)| on(levers)).collect()
+}
+
+/// The level's emitters less those whose lever is off.
+pub(crate) fn gated(emitters: &[EffectEmitter], levers: &Levers) -> Vec<EffectEmitter> {
+    emitters.iter().filter(|e| LEVER_GATED.iter().all(|(id, on)| e.id != *id || on(levers))).cloned().collect()
+}
+
 /// Whether `game/effects/<name>.json` exists: an asset the library can hold.
 fn names_an_asset(game_dir: &std::path::Path, name: &str) -> bool {
     !name.is_empty() && !name.contains(['/', '\\', '.']) && game_dir.join("effects").join(format!("{name}.json")).is_file()
@@ -103,6 +122,15 @@ pub(crate) fn placed(game_dir: &std::path::Path, scene_name: &str) -> Vec<Placed
                     scale: e.scale.max(0.0),
                     rate: e.rate.max(0.0),
                     tint: [srgb_to_linear(e.tint.0), srgb_to_linear(e.tint.1), srgb_to_linear(e.tint.2)],
+                    // (`find_sunlit`, once the physics scene is up.)
+                    sunlit: 0.0,
+                    // Its box across the world's x and z: what a disc that
+                    // fills its object spans (a pond's mist, by the pond's box).
+                    footprint: {
+                        let ext = [c.rotation * Vec3::X * c.half_size.x, c.rotation * Vec3::Y * c.half_size.y, c.rotation * Vec3::Z * c.half_size.z];
+                        let across = |k: usize| ext.iter().map(|v| v[k].abs()).sum::<f32>();
+                        [across(0), across(2)]
+                    },
                 },
             })
         })
@@ -130,13 +158,28 @@ pub(crate) fn budget_problems(game_dir: &std::path::Path, emitters: &[EffectEmit
                 assets.insert(p.asset.clone(), text);
             }
         }
-        items.push(json!({ "object": p.object, "asset": p.asset, "position": p.position.to_array(), "scale": p.placed.scale, "rate": p.placed.rate }));
+        items.push(json!({ "object": p.object, "asset": p.asset, "position": p.position.to_array(), "scale": p.placed.scale, "rate": p.placed.rate, "footprint": p.placed.footprint }));
     }
     if items.is_empty() {
         return Vec::new();
     }
     let verdict = space_soup::renderer::effects::authoring::scene_json(&serde_json::Value::Array(items), &assets);
     ["over", "issues"].iter().flat_map(|k| verdict[*k].as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_str().map(str::to_string)).collect()
+}
+
+/// HOW MUCH SUN REACHES each placed effect (`Placed::sunlit`), found once at
+/// load: a ray toward the sun (`toward`, world) from where its particles are
+/// -- the object and 0.5 m and 1.5 m over it -- through the physics scene,
+/// as `find_ceilings` casts up (`blocked(from, toward)`: true when it meets
+/// something). The share that reach open sky; 0 with no sun. A cave or a room
+/// gives 0, so their particles stay lit by their lamps alone.
+pub(crate) fn find_sunlit(placed: &mut [PlacedEffect], toward: Option<Vec3>, blocked: impl Fn(Vec3, Vec3) -> bool) {
+    for p in placed.iter_mut() {
+        p.placed.sunlit = match toward.and_then(|d| d.try_normalize()) {
+            Some(d) => [0.05, 0.5, 1.5].iter().filter(|&&h| !blocked(p.position + Vec3::Y * h, d)).count() as f32 / 3.0,
+            None => 0.0,
+        };
+    }
 }
 
 /// A placed effect's source: its object's id, hashed (FNV-1a), so its seed
@@ -264,6 +307,34 @@ mod tests {
             let down = physics.raycast(at, Vec3::NEG_Y, 40.0).map(|(hit, _)| hit.y);
             let up = physics.raycast(at, Vec3::Y, 40.0).map(|(hit, _)| hit.y);
             eprintln!("POINT {p}: floor {down:?} ceiling {up:?}");
+        }
+    }
+
+    /// The cave's dust is behind the lever `cave_dust`, off as shipped.
+    #[test]
+    fn the_cave_dust_waits_for_its_lever() {
+        let dust = |id: &str| EffectEmitter { id: id.into(), ..any_emitter() };
+        let all = [dust("fx_cave_dust"), dust("hall_dust")];
+        let off = Levers::default();
+        assert!(!off.cave_dust);
+        assert_eq!(gated(&all, &off).iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["hall_dust"]);
+        let on = Levers { cave_dust: true, ..Levers::default() };
+        assert_eq!(gated(&all, &on).len(), 2);
+        assert_ne!(gate(&off), gate(&on));
+    }
+
+    fn any_emitter() -> EffectEmitter {
+        EffectEmitter {
+            id: String::new(),
+            kind: EffectKind::Dust,
+            position: Vec3::ZERO,
+            direction: Vec3::Y,
+            extent: [Vec3::X, Vec3::Y, Vec3::Z],
+            scale: 1.0,
+            rate: 1.0,
+            tint: [1.0; 3],
+            ceiling: None,
+            variation: Variation::default(),
         }
     }
 

@@ -362,6 +362,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut server_player_yaw: Option<f32> = None;
 
     let mut locomotion = Locomotion::new(LocomotionMode::Smooth);
+    // The walk and the run, from the game (`LocomotionSettings`).
+    locomotion.apply_settings(&space_soup_engine::locomotion::LocomotionSettings::load(&dir, &entry_scene));
+    info!("LOCOMOTION walk {:.2} m/s, run {:.2} m/s", locomotion.move_speed, locomotion.run_speed);
 
     // BAKED LIGHTING FROM DISK, BEFORE ANY NETWORKING.
     //
@@ -453,7 +456,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     // as its lights are. See `scene_effects`.
     let mut level_effects = scene_effects::load(&dir, &static_scene.scene_name);
     scene_effects::find_ceilings(&mut level_effects, |p| static_scene.physics.raycast(p, Vec3::Y, 40.0).map(|(hit, _)| hit.y));
-    renderer.set_effects(level_effects.clone());
+    // Those behind a lever (`scene_effects::LEVER_GATED`) only while it is on.
+    let mut effect_gate = scene_effects::gate(&renderer.frame_levers());
+    renderer.set_effects(scene_effects::gated(&level_effects, &renderer.frame_levers()));
     // THE EFFECTS AN EVENT CAN RAISE (`game/effects`: a shot's flash and
     // smoke), compiled now so the first shot draws at once; and the test
     // that fires them from the right hand. See `muzzle_test`.
@@ -462,7 +467,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     renderer.set_effect_library(effect_library);
     // Objects whose effect names an asset (`effect.asset`): placed, streaming
     // for as long as the level is loaded; and the scene's fill budget.
-    let placed_effects = scene_effects::placed(&dir, &static_scene.scene_name);
+    let mut placed_effects = scene_effects::placed(&dir, &static_scene.scene_name);
+    scene_effects::find_sunlit(&mut placed_effects, renderer.sun_toward(), |p, d| static_scene.physics.raycast(p, d, 300.0).is_some());
     scene_effects::budget_problems(&dir, &level_effects, &placed_effects).iter().for_each(|p| log::error!("EFFECTS over the scene's budget: {p}"));
     renderer.place_effects(&placed_effects);
     let mut muzzle = muzzle_test::MuzzleTest::default();
@@ -473,6 +479,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     renderer.set_weather(&weather.texels(), weather.chunk_firsts(loaded_terrain.as_ref().map(|(t, _)| t)));
     // SPLASHES: feet, hands and things striking the water. See `splashes`.
     let mut splash_watch = splashes::SplashWatch::default();
+    let mut wake_watch = splashes::WakeWatch::default();
     // WHICH LAMPS GLARE, from which sides. See `glare_fixtures`.
     let mut lamp_glare = glare_fixtures::load(&dir, &static_scene.scene_name, &glare_measured);
 
@@ -984,8 +991,16 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         // off, lighting sources (`SOURCES_VIEW`: red baked, green probe, blue
         // direct), then SSR (blue too rough, red left frame, green out of
         // steps, magenta facing the viewer, grey a hit). The SSR view only
-        // shows while SSR is on. The tester's build toggles off <-> sources.
-        if cs.l_stick_click && !prev_l_stick_click {
+        // shows while SSR is on. The tester's build reaches them by the lever
+        // file instead (`Levers::debug_view`: "sources", "ssr", "off").
+        // THE RUN: in the tester's build the left stick's click runs until the
+        // stick is let go (`Locomotion::toggle_run`); the developer's keeps
+        // the debug views below on it.
+        if !DEVELOPER_TOGGLES && cs.l_stick_click && !prev_l_stick_click {
+            locomotion.toggle_run();
+            info!("RUN -> {} by left stick click", if locomotion.is_running() { "on" } else { "off" });
+        }
+        if DEVELOPER_TOGGLES && cs.l_stick_click && !prev_l_stick_click {
             let now = renderer.debug_view();
             let view = if DEVELOPER_TOGGLES { now.next() } else { now.toggle_sources() };
             renderer.set_debug_view(view);
@@ -1103,6 +1118,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     static_scene.scene_name, w.scene_name
                 );
                 static_scene = grab_detect::StaticScene::load(&dir, &w.scene_name);
+                locomotion.apply_settings(&space_soup_engine::locomotion::LocomotionSettings::load(&dir, &w.scene_name));
                 if let Some(scene) = load_entry_scene(&dir, &w.scene_name) {
                     level_limits::report(&w.scene_name, &scene);
                 }
@@ -1121,8 +1137,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 static_meshes = scene_meshes::load(&dir, &w.scene_name);
                 level_effects = scene_effects::load(&dir, &w.scene_name);
                 scene_effects::find_ceilings(&mut level_effects, |p| static_scene.physics.raycast(p, Vec3::Y, 40.0).map(|(hit, _)| hit.y));
-                renderer.set_effects(level_effects.clone());
-                let placed_effects = scene_effects::placed(&dir, &w.scene_name);
+                renderer.set_effects(scene_effects::gated(&level_effects, &renderer.frame_levers()));
+                let mut placed_effects = scene_effects::placed(&dir, &w.scene_name);
+                scene_effects::find_sunlit(&mut placed_effects, renderer.sun_toward(), |p, d| static_scene.physics.raycast(p, d, 300.0).is_some());
                 scene_effects::budget_problems(&dir, &level_effects, &placed_effects).iter().for_each(|p| log::error!("EFFECTS over the scene's budget: {p}"));
                 renderer.place_effects(&placed_effects);
                 weather = weather_render::WeatherClient::load(&dir, &w.scene_name, &static_scene.physics);
@@ -1246,6 +1263,16 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             for s in splash_watch.bob(sim_time as f64, &surface, &sunlit, floating) {
                 renderer.add_splash(s);
             }
+            // What moves through the water pushes a continuous wake
+            // (`splashes::WakeWatch`, `XrRenderer::stir_water`).
+            let floating = live_objects.by_id.iter().map(|(id, c)| (id.as_str(), c.position, c.half_size, c.rotation));
+            renderer.stir_water(&wake_watch.sources(sim_time as f64, &surface, Some((floor, facing)), hands, floating));
+        }
+        // A LEVER-GATED EFFECT switched (`scene_effects::LEVER_GATED`, the
+        // lever `cave_dust`): the level's emitters handed over again.
+        if scene_effects::gate(&renderer.frame_levers()) != effect_gate {
+            effect_gate = scene_effects::gate(&renderer.frame_levers());
+            renderer.set_effects(scene_effects::gated(&level_effects, &renderer.frame_levers()));
         }
         // THE MUZZLE TEST (lever `muzzle_test`): the right hand's A fires the
         // selected effect from its aim, B steps to the next. See `muzzle_test`.
@@ -1332,6 +1359,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
         // Held still while pinned: a stick knocked on the desk must not walk
         // the benchmark out of its viewpoint.
+        let loco_before = (locomotion.player_offset, locomotion.player_yaw);
         if frame_bench.is_none() {
             movement::step_locomotion(
                 cs,
@@ -1348,6 +1376,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 &net,
             );
         }
+        // THE RIG WHERE THE PLAYER NOW IS: it was built before the step, and
+        // the camera is drawn after it -- the body and hands trailed the eyes
+        // by a step (`PlayerRig::carried`).
+        let loco_after = (locomotion.player_offset, locomotion.player_yaw);
+        let rig = if loco_after != loco_before { rig.carried(loco_before, loco_after) } else { rig };
 
         // The other players see this player's flashlight while it is lit --
         // its beam, its glass and its glare -- from the right hand's aim, as
@@ -1423,6 +1456,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         if let Some((_, model)) = local_direct_mesh.as_ref() {
             model.set_wetness(renderer.queue(), weather.body_wet);
         }
+        // Which of the body's shaders draws it: wet or dry (`set_body_wet`).
+        renderer.set_body_wet(weather.body_wet > 0.0);
         if let Some((_, model)) = avatar_mesh_cache.get(&local_player) {
             model.set_wetness(renderer.queue(), weather.body_wet);
         }
@@ -1533,7 +1568,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 &avatar_mesh_cache,
                 // Not while pinned: the controllers on the desk would carry the
                 // player's hands into the benchmark's view (and its cost).
-                if frame_bench.is_some() { &None } else { &local_direct_mesh },
+                if frame_bench.is_some() && !bench_pose.as_ref().is_some_and(|(p, _)| p.body == Some(true)) { &None } else { &local_direct_mesh },
                 local_player,
                 &world,
                 &static_scene,
@@ -1682,6 +1717,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     emissive_drive: flashlight::lens_drive(),
                     own_light: None,
                     tile_caster: false,
+                    moves: true,
                 });
             }
         } else {
@@ -1720,6 +1756,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     emissive_drive: flashlight::lens_drive(),
                     own_light: None,
                     tile_caster: false,
+                    moves: true,
                 });
             }
         }
