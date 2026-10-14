@@ -297,6 +297,12 @@ pub(crate) fn handle_input(
             info!("GRAB R: '{id}' via grip point '{point}'");
             grabbed_ids[hand_idx(Hand::Right)] = Some(id.clone());
             input.grabbed.push((id, Hand::Right, point));
+        } else if let Some(id) = static_scene.doors.handle_near(p).map(str::to_string) {
+            // A door's handle: the hand holds it and swings the leaf
+            // (`PhysicsWorld::grab_door`, `ClientDoors::update_held`).
+            info!("GRAB R: door '{id}' by its handle");
+            grabbed_ids[hand_idx(Hand::Right)] = Some(id.clone());
+            input.grabbed.push((id, Hand::Right, "handle".to_string()));
         } else if let Some(id) =
             grab_detect::nearest_grabbable_object_to(live_objects, static_scene, p)
         {
@@ -342,6 +348,12 @@ pub(crate) fn handle_input(
             info!("GRAB L: '{id}' via grip point '{point}'");
             grabbed_ids[hand_idx(Hand::Left)] = Some(id.clone());
             input.grabbed.push((id, Hand::Left, point));
+        } else if let Some(id) = static_scene.doors.handle_near(p).map(str::to_string) {
+            // A door's handle: the hand holds it and swings the leaf
+            // (`PhysicsWorld::grab_door`, `ClientDoors::update_held`).
+            info!("GRAB L: door '{id}' by its handle");
+            grabbed_ids[hand_idx(Hand::Left)] = Some(id.clone());
+            input.grabbed.push((id, Hand::Left, "handle".to_string()));
         } else if let Some(id) =
             grab_detect::nearest_grabbable_object_to(live_objects, static_scene, p)
         {

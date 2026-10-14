@@ -21,12 +21,18 @@ pub struct LiveCuboid {
 #[derive(Default)]
 pub struct LiveObjects {
     pub by_id: HashMap<String, LiveCuboid>,
+    /// The same boxes filed by where they are, so a grab asks what is near
+    /// the hand and not every object in the level. An object that has not
+    /// moved costs the grid one comparison. See `space_soup_engine::grab_index`.
+    pub near: space_soup_engine::grab_index::GrabGrid,
 }
 
 impl LiveObjects {
     pub fn update(&mut self, object_bounds: &[WireObjectBounds]) {
         self.by_id.clear();
+        self.near.begin();
         for b in object_bounds {
+            self.near.set(&b.id, Vec3::from(b.position), Quat::from_array(b.rotation), Vec3::from(b.half_size));
             self.by_id.insert(
                 b.id.clone(),
                 LiveCuboid {
@@ -36,6 +42,7 @@ impl LiveObjects {
                 },
             );
         }
+        self.near.end();
     }
 }
 
@@ -76,6 +83,11 @@ pub struct StaticScene {
     /// The scene's doors: where each leaf is drawn, collided and shadowed this
     /// frame. See `client_doors`.
     pub doors: crate::client_doors::ClientDoors,
+    /// The scene's objects a bare hand cannot pick up: everything it was
+    /// authored with but its loose bodies (a Dynamic rigid body that is not
+    /// a door). What the scene does not name -- spawned while it runs -- is
+    /// not in here, and can be. See `nearest_grabbable_object_to`.
+    pub fixed: std::collections::HashSet<String>,
 }
 
 impl StaticScene {
@@ -88,8 +100,18 @@ impl StaticScene {
         let mut terrain = None;
         let mut reflection_probes = Vec::new();
         let mut doors = crate::client_doors::ClientDoors::default();
+        let mut fixed = std::collections::HashSet::new();
         let (grip_points, part_animations) = match Scene::load(&path) {
             Ok(scene) => {
+                fixed = scene
+                    .objects
+                    .iter()
+                    .filter(|o| {
+                        let loose = o.rigid_body.as_ref().is_some_and(|b| b.mode == space_soup_engine::BodyMode::Dynamic);
+                        !loose || o.door.is_some()
+                    })
+                    .map(|o| o.id.clone())
+                    .collect();
                 physics.rebuild(&scene, game_dir);
                 doors = crate::client_doors::ClientDoors::from_scene(&scene);
                 sky = scene.sky.clone();
@@ -154,6 +176,7 @@ impl StaticScene {
             terrain,
             reflection_probes,
             doors,
+            fixed,
         }
     }
 }
@@ -191,18 +214,19 @@ pub fn nearest_object_to(live: &LiveObjects, point: Vec3) -> Option<String> {
 /// Excluding it means such a grab now fails, visibly, instead of succeeding
 /// wrongly -- which is the right failure, and points at the authoring (another
 /// grip point, or a wider grab_range) rather than hiding it.
+///
+/// ONLY WHAT IS LOOSE. It used to take the nearest of EVERY object the server
+/// sends, so a grip pressed near a wall grabbed the room (`StaticScene::fixed`
+/// is what it may not take), and it measured the hand against all of them;
+/// now it asks the grid for what is within reach (`LiveObjects::near`).
 pub fn nearest_grabbable_object_to(
     live: &LiveObjects,
     static_scene: &StaticScene,
     point: Vec3,
 ) -> Option<String> {
-    live.by_id
-        .iter()
-        .filter(|(id, _)| !static_scene.grip_points.contains_key(id.as_str()))
-        .map(|(id, c)| (id.clone(), distance_to_box(c, point)))
-        .filter(|(_, d)| *d <= GRAB_RANGE)
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-        .map(|(id, _)| id)
+    live.near
+        .nearest(point, GRAB_RANGE, |id| !static_scene.grip_points.contains_key(id) && !static_scene.fixed.contains(id))
+        .map(|(id, _)| id.to_string())
 }
 
 /// The posed transform of the part a grip rides, if it rides one.
