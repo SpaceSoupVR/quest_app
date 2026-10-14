@@ -153,6 +153,8 @@ pub struct View {
     /// twins over its areas and the falling rain and snow, as they stand
     /// `WEATHER_TIME` seconds after the level opened (600 by default).
     pub weather: bool,
+    /// The hinged doors left out, for a test about the brushes alone.
+    pub no_doors: bool,
 }
 
 impl View {
@@ -182,6 +184,7 @@ impl View {
             effects: false,
             water: false,
             weather: false,
+            no_doors: false,
         }
     }
 }
@@ -357,6 +360,29 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     // (this frame's own exposure is metered after its lights are listed;
     // without one the light is raised).
     let mut shots = crate::muzzle_test::offline_bursts(&game);
+    // The scene's PLACED EFFECTS (`effect.asset`), standing since the level
+    // loaded (the effects' clock 0), as `XrRenderer::place_effects` stands them.
+    let placed_effects = if view.effects { crate::scene_effects::placed(&game, scene_name) } else { Vec::new() };
+    if !placed_effects.is_empty() {
+        let (lib, set) = shots.get_or_insert_with(|| {
+            let (lib, errors) = space_soup::renderer::effects::stack::EffectLibrary::from_dir(&game.join("effects"));
+            errors.iter().for_each(|e| eprintln!("offline frame: {e}"));
+            (lib, space_soup::renderer::effects::stack::BurstSet::default())
+        });
+        // (`PLACED_SOURCE=n`: every placed effect seeded as the editor's preview
+        // seeds its one, 7, for a side-by-side.)
+        let source = std::env::var("PLACED_SOURCE").ok().and_then(|s| s.parse::<u64>().ok());
+        for p in &placed_effects {
+            match lib.id(&p.asset) {
+                Some(id) => set.place(lib, id, p.position, p.direction, source.unwrap_or(p.source), p.placed),
+                None => eprintln!("offline frame: `{}` names the effect `{}`, which the library does not hold", p.object, p.asset),
+            }
+        }
+        for l in set.live.iter_mut().filter(|l| l.standing.is_some()) {
+            (l.born, l.frames) = (Some(0.0), 1);
+        }
+        eprintln!("offline frame: {} placed effects", placed_effects.len());
+    }
     if let Some((lib, set)) = shots.as_mut() {
         let judged = std::env::var("BURST_EXPOSURE").ok().and_then(|v| v.parse().ok()).unwrap_or(f32::MAX);
         lights.extend(set.lights(lib, judged, offset, yaw_inv));
@@ -555,7 +581,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     let doors = OfflineDoors::new(
         &device,
         &queue,
-        &game,
+        (&game, scene_name),
         &scene,
         (format, view.samples),
         &uniforms.layout,
@@ -563,7 +589,8 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         &lights,
         to_player(view.eye),
         &descs,
-    );
+    )
+    .filter(|_| !view.no_doors);
     lights_uniform.set_tile_lamps(&doors.as_ref().map(OfflineDoors::tile_lamps).unwrap_or_default());
     lights_uniform.upload_frame(&queue, &lights, &[], sun.is_some());
     let pool_mips = space_soup::renderer::brush_pipeline::probe_pass::MirrorMips::new(&device);
@@ -1158,6 +1185,10 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                 let reaches =
                     |e: &effects::EffectEmitter, i: usize| effects::lamp_in_room(&descs, e.position, turn * lights[i].position + offset);
                 let ambient = |w: Vec3| effects::room_ambient_now(&descs, w, &relit);
+                // What each splash is lit by, to hold against the water's light there.
+                for s in &splashes {
+                    eprintln!("SPLASH_AMBIENT at {:?}: {:?} (baked {:?}), exposure {exposure}", s.position, ambient(s.position), effects::room_ambient(&descs, s.position));
+                }
                 let at = effects::Surroundings {
                     head: eye_p,
                     offset,
@@ -1167,6 +1198,24 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                     ambient: &ambient,
                     exposure,
                 };
+                // What each placed effect is lit by, in the WORLD's frame, for
+                // the editor's preview to be given the same (a side-by-side).
+                for p in &placed_effects {
+                    let lamps: Vec<String> = (0..lights.len())
+                        .filter_map(|i| {
+                            let w = turn * lights[i].position + offset;
+                            (w.distance(p.position) < lights[i].range && effects::lamp_in_room(&descs, p.position, w)).then(|| {
+                                let (c, d) = (lights[i].color, turn * lights[i].direction);
+                                format!(
+                                    "{{\"position\":[{},{},{}],\"direction\":[{},{},{}],\"kind\":\"{:?}\",\"color\":[{},{},{},255],\"intensity\":{},\"range\":{},\"cone_angle_deg\":{},\"inner_cone_angle_deg\":{},\"source_radius\":{}}}",
+                                    w.x, w.y, w.z, d.x, d.y, d.z, lights[i].kind, c.0, c.1, c.2, lights[i].intensity, lights[i].range, lights[i].cone_angle_deg, lights[i].inner_cone_angle_deg, lights[i].source_radius
+                                )
+                            })
+                        })
+                        .collect();
+                    let a = ambient(p.position);
+                    eprintln!("PLACED_SURROUNDINGS {{\"object\":\"{}\",\"origin\":[{},{},{}],\"ambient\":[{},{},{}],\"exposure\":{exposure},\"lights\":[{}]}}", p.object, p.position.x, p.position.y, p.position.z, a.x, a.y, a.z, lamps.join(","));
+                }
                 let frame = match shots.as_mut() {
                     Some((lib, set)) => {
                         let drawn = set.frame(lib, time, &[], view.eye);
@@ -1601,8 +1650,12 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         }
         // The water after everything opaque, then the sky where nothing was
         // drawn, as the headset's scene pass has them.
-        if let Some((pipeline, bodies, _)) = &water {
-            pass.set_pipeline(if std::env::var("SPLASH").is_ok() { &pipeline.pipeline } else { &pipeline.ringless });
+        if let Some((pipeline, bodies, water_time)) = &water {
+            // The splashes' twin as the headset picks it: raining while their
+            // drops land (`WaterPipeline::for_rings`).
+            let splashes = space_soup::renderer::effects::splash_rings::<{ space_soup::renderer::water_pipeline::RINGS }>(&splash_at(*water_time), *water_time, view.eye);
+            let ringed = pipeline.for_rings(&splashes.rings[0], &splashes.drops);
+            pass.set_pipeline(if std::env::var("SPLASH").is_ok() { ringed } else { &pipeline.ringless });
             pass.set_bind_group(0, &uniforms.bind_group, &[]);
             for (b, (waves, groups, vb, ib, count, _)) in bodies.iter().enumerate() {
                 if under_body == Some((b, space_soup::renderer::underwater::EyeWater::Under)) {
@@ -1621,7 +1674,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                 } else if let Some(cut) = cut.as_ref() {
                     cut
                 } else if std::env::var("SPLASH").is_ok() {
-                    &pipeline.pipeline
+                    ringed
                 } else {
                     &pipeline.ringless
                 });
@@ -1777,7 +1830,8 @@ struct OfflineDoors {
     /// tile: each door's lever on its leaf, the doorways' frames, and the
     /// level's loose props (rocks, crates) where the scene puts them. The
     /// harness draws no other model.
-    dressing: Vec<(space_soup::renderer::mesh::GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform)>,
+    /// With a frame's own baked lightmap and lamp masks where it has them.
+    dressing: Vec<(space_soup::renderer::mesh::GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform, Option<space_soup::renderer::mesh::LoadedTexture>)>,
     lightmap: space_soup::renderer::mesh::LoadedTexture,
     tiles: Vec<(usize, Mat4)>,
     /// The leaves as the renderer takes them, for their reflection proxies.
@@ -1789,7 +1843,7 @@ impl OfflineDoors {
     fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        game: &std::path::Path,
+        (game, scene_name): (&std::path::Path, &str),
         scene: &space_soup_engine::scene::Scene,
         (format, samples): (wgpu::TextureFormat, u32),
         uniform_layout: &wgpu::BindGroupLayout,
@@ -1837,6 +1891,7 @@ impl OfflineDoors {
                 yaw,
             );
             model.upload_lit_bulb(queue, mesh.model_matrix(), 0.0, 0.0, &room, None, 0.0);
+            eprintln!("offline frame: door {id} reads its light at {:.2} ({:?})", light_at, &room[..1]);
             leaves.push((mesh, model));
         }
         // THE DRESSING: levers where their leaves carry them, then frames
@@ -1848,6 +1903,35 @@ impl OfflineDoors {
             o.door.is_none() && !o.hidden && (loose || frame) && !riders.iter().any(|(id, ..)| *id == o.id)
         });
         let mut dressing = Vec::new();
+        // A frame's own lightmap and lamp masks, as the headset binds a baked
+        // model's: the masks were baked with its leaves shut.
+        let lm = space_soup_engine::lightmaps::load_scene_lightmaps(game, scene_name);
+        let channels = crate::scene_lights::stationary_channels(game, scene_name);
+        let own_lightmap = |id: &str| {
+            let object = |id: &str| lm.iter().find(|l| l.target == space_soup_engine::lightmaps::LightmapTarget::Object && l.object_id == id);
+            let base = object(id)?;
+            let masks = crate::scene_lights::usable_stationary_masks(
+                (0..space_soup_engine::stationary::MAX_STATIONARY_LAYERS)
+                    .map_while(|k| object(&space_soup_engine::lightmaps::mesh_stationary_id(id, k)))
+                    .collect(),
+                &channels,
+            );
+            let layers: Vec<&[u8]> = masks.iter().map(|m| m.rgba.as_slice()).collect();
+            Some(space_soup::renderer::mesh::create_lightmap_texture_full(
+                device,
+                queue,
+                &pipeline.lightmap_layout,
+                match &base.linear {
+                    Some(lin) => space_soup::renderer::mesh::LightmapLight::Linear(lin),
+                    None => space_soup::renderer::mesh::LightmapLight::Srgb8(&base.rgba),
+                },
+                base.width,
+                base.height,
+                None,
+                None,
+                masks.first().map(|m| (layers.as_slice(), m.width, m.height)),
+            ))
+        };
         for (id, position, rotation) in riders.iter().cloned().chain(standing.map(|o| (o.id.clone(), o.cuboid.position, o.cuboid.rotation))) {
             let Some(mref) = scene.find_object(&id).and_then(|o| o.mesh.clone()) else { continue };
             let Ok(mut mesh) = space_soup::renderer::mesh::GltfMesh::load(device, queue, &pipeline.texture_layout, &game.join(&mref.path)) else {
@@ -1858,9 +1942,12 @@ impl OfflineDoors {
             mesh.rotation = yaw_inv * rotation * mref.rotation_offset;
             mesh.scale = mref.scale;
             let model = pipeline.create_model_uniform(device);
-            let room = space_soup::renderer::room_light::turned_to_player(&space_soup::renderer::room_light::room_light_at(descs, position), yaw);
+            // A frame or lever reads the room the eye is in, as the headset does.
+            let light_at = space_soup::renderer::doors::doorway_light_point(&doors.views(), position, Quat::from_rotation_y(yaw) * eye + offset);
+            let room = space_soup::renderer::room_light::turned_to_player(&space_soup::renderer::room_light::room_light_at(descs, light_at), yaw);
             model.upload_lit_bulb(queue, mesh.model_matrix(), 0.0, 0.0, &room, None, 0.0);
-            dressing.push((mesh, model));
+            let baked = (std::env::var("FRAME_LIGHTMAPS").as_deref() != Ok("0")).then(|| own_lightmap(&id)).flatten();
+            dressing.push((mesh, model, baked));
         }
         let casters: Vec<space_soup::renderer::shadow::DoorCaster> = doors
             .views()
@@ -1943,11 +2030,12 @@ impl OfflineDoors {
     fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, uniforms: &'a wgpu::BindGroup) {
         pass.set_pipeline(&self.pipeline.pipeline);
         pass.set_bind_group(0, uniforms, &[]);
-        for (mesh, model) in self.leaves.iter().chain(&self.dressing) {
+        let leaves = self.leaves.iter().map(|(mesh, model)| (mesh, model, None));
+        for (mesh, model, baked) in leaves.chain(self.dressing.iter().map(|(mesh, model, baked)| (mesh, model, baked.as_ref()))) {
             for prim in mesh.primitives.iter().filter(|p| !p.blended) {
                 pass.set_bind_group(1, &model.bind_group, &[]);
                 pass.set_bind_group(2, &prim.texture.bind_group, &[]);
-                pass.set_bind_group(3, &self.lightmap.bind_group, &[]);
+                pass.set_bind_group(3, &baked.unwrap_or(&self.lightmap).bind_group, &[]);
                 pass.set_vertex_buffer(0, prim.vertex_buffer.slice(..));
                 pass.set_index_buffer(prim.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..prim.indices.len() as u32, 0, 0..1);
@@ -2044,8 +2132,11 @@ impl OfflineBakedCaves {
         if caves.is_empty() {
             return None;
         }
-        let pipelines = space_soup::renderer::baked_cave::BakedCavePipelines::new(
-            device, format, uniform_layout, material_layout, &mesh_pipeline.lightmap_layout, samples, false,
+        // `CAVE_DEBUG=<name>`: the cave answering with one of its diagnostic
+        // pictures (`baked_cave::CAVE_DEBUG_VIEWS`, or `edit:<from>=><to>`).
+        let debug = std::env::var("CAVE_DEBUG").ok();
+        let pipelines = space_soup::renderer::baked_cave::BakedCavePipelines::new_debug(
+            device, format, uniform_layout, material_layout, &mesh_pipeline.lightmap_layout, samples, false, debug.as_deref(),
         );
         Some(Self { pipelines, caves })
     }
@@ -2903,6 +2994,12 @@ mod tests {
 
     #[test]
     fn no_single_pixel_probe_lines_along_the_room_seams() {
+        // THE BRUSHES ALONE. The open hall door stands in this view, and the
+        // beads of its panels, a few millimetres deep, are sub-pixel bright
+        // strips here: the single-sampled render catches them only where a
+        // pixel centre falls inside (white dots), 4x MSAA as grey dashes beside
+        // them -- real geometry this rule cannot bound (2026-10-14).
+        let back_to_front = || View { no_doors: true, ..back_to_front() };
         let Some(msaa) = render_brushes("test_room", View { sources: true, ..back_to_front() }) else {
             eprintln!("skipping: no GPU or no test_room");
             return;
@@ -3277,6 +3374,37 @@ mod exposure_calibration {
                 })
                 .collect();
             eprintln!("{name}, x:exposure: {}", line.join(" "));
+        }
+    }
+
+    /// DIAGNOSTIC (daylight adaptation, 2026-10-14): at each spot round the
+    /// sea cave, the exposure facing every way, and its spread in stops.
+    #[test]
+    #[ignore]
+    fn print_daylight_turning() {
+        let Some(eye) = test_room_eye() else { return };
+        let spots = std::env::var("SPOTS").unwrap_or_else(|_| {
+            "13.5,1.6,32.5;11,1.7,31;12.5,1.0,35;35.5,2.0,35.5;0,1.7,24;0,1.6,12;0,1.6,8;0,1.6,3;19.6,1.0,33.3;26,1.2,33.5;-1.3,1.6,-14.5;-0.5,1.6,1;6.5,1.6,-3;14,1.6,-2"
+                .into()
+        });
+        for spot in spots.split(';') {
+            let v: Vec<f32> = spot.split(',').filter_map(|c| c.trim().parse().ok()).collect();
+            let at = Vec3::new(v[0], v[1], v[2]);
+            let mut line = Vec::new();
+            let (mut lo, mut hi) = (f32::MAX, 0.0f32);
+            for i in 0..16 {
+                let a = i as f32 * std::f32::consts::TAU / 16.0;
+                let e = exposure_for(eye.meter(at, Vec3::new(a.sin(), -0.1, a.cos())));
+                lo = lo.min(e);
+                hi = hi.max(e);
+                line.push(format!("{e:.2}"));
+            }
+            eprintln!(
+                "{spot:>16}: gaze-free {:.2}, spread {:.2} stops; from +z toward +x: {}",
+                eye.gaze_free_share(at),
+                (hi / lo).log2(),
+                line.join(" ")
+            );
         }
     }
 

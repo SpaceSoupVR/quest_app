@@ -7,6 +7,7 @@
 //! (`space_soup::renderer::effects`), so the emitter's few numbers are the
 //! whole of it.
 use glam::Vec3;
+use space_soup::renderer::effects::stack::{Placed, PlacedEffect};
 use space_soup::renderer::effects::{EffectEmitter, EffectKind, Variation};
 use space_soup_engine::scene::{EffectKindDef, Scene};
 use space_soup_engine::Manifest;
@@ -25,6 +26,11 @@ pub(crate) fn load(game_dir: &std::path::Path, scene_name: &str) -> Vec<EffectEm
         .iter()
         .filter_map(|o| {
             let e = o.effect.as_ref()?;
+            // An effect that names an asset `game/effects` holds is drawn by
+            // it (`placed`); its kind stays the shorthand for one that does not.
+            if e.asset.as_deref().is_some_and(|a| names_an_asset(game_dir, a)) {
+                return None;
+            }
             let c = &o.cuboid;
             Some(EffectEmitter {
                 id: o.id.clone(),
@@ -65,6 +71,80 @@ pub(crate) fn load(game_dir: &std::path::Path, scene_name: &str) -> Vec<EffectEm
         .collect()
 }
 
+/// Whether `game/effects/<name>.json` exists: an asset the library can hold.
+fn names_an_asset(game_dir: &std::path::Path, name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', '\\', '.']) && game_dir.join("effects").join(format!("{name}.json")).is_file()
+}
+
+/// THE LEVEL'S PLACED EFFECTS: every object whose effect names an asset of
+/// `game/effects` (`effect.asset`), at the object along its up, in the WORLD's
+/// frame. Its `scale`, `rate` and `tint` multiply the asset's sprites, streams
+/// and colour (the tint decoded from sRGB). One that names no such file is
+/// left to `load`, which draws its kind.
+pub(crate) fn placed(game_dir: &std::path::Path, scene_name: &str) -> Vec<PlacedEffect> {
+    let Ok(mut scene) = Scene::load(&Manifest::scene_path(game_dir, scene_name)) else {
+        return Vec::new();
+    };
+    scene.resolve_world_transforms();
+    scene
+        .objects
+        .iter()
+        .filter_map(|o| {
+            let e = o.effect.as_ref()?;
+            let asset = e.asset.as_deref().filter(|a| names_an_asset(game_dir, a))?;
+            let c = &o.cuboid;
+            Some(PlacedEffect {
+                object: o.id.clone(),
+                asset: asset.to_string(),
+                position: c.position,
+                direction: c.rotation * Vec3::Y,
+                source: object_key(&o.id),
+                placed: Placed {
+                    scale: e.scale.max(0.0),
+                    rate: e.rate.max(0.0),
+                    tint: [srgb_to_linear(e.tint.0), srgb_to_linear(e.tint.1), srgb_to_linear(e.tint.2)],
+                },
+            })
+        })
+        .collect()
+}
+
+/// THE SCENE'S FILL BUDGET at load, by the check the editor runs
+/// (`authoring::scene_json`): the kinds' templates and the placed assets
+/// within 8 m of one another, and the level's live particles. Empty when
+/// inside it; otherwise what is over, for the log. The editor refuses to
+/// save such a scene, so this catches only one written by hand.
+pub(crate) fn budget_problems(game_dir: &std::path::Path, emitters: &[EffectEmitter], placed: &[PlacedEffect]) -> Vec<String> {
+    use serde_json::json;
+    let mut items: Vec<serde_json::Value> = emitters
+        .iter()
+        .map(|e| {
+            let volume = 8.0 * e.extent[0].length() * e.extent[1].length() * e.extent[2].length();
+            json!({ "object": e.id, "kind": format!("{:?}", e.kind).to_ascii_lowercase(), "position": e.position.to_array(), "scale": e.scale, "rate": e.rate, "volume": volume })
+        })
+        .collect();
+    let mut assets = std::collections::HashMap::new();
+    for p in placed {
+        if !assets.contains_key(&p.asset) {
+            if let Ok(text) = std::fs::read_to_string(game_dir.join("effects").join(format!("{}.json", p.asset))) {
+                assets.insert(p.asset.clone(), text);
+            }
+        }
+        items.push(json!({ "object": p.object, "asset": p.asset, "position": p.position.to_array(), "scale": p.placed.scale, "rate": p.placed.rate }));
+    }
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let verdict = space_soup::renderer::effects::authoring::scene_json(&serde_json::Value::Array(items), &assets);
+    ["over", "issues"].iter().flat_map(|k| verdict[*k].as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_str().map(str::to_string)).collect()
+}
+
+/// A placed effect's source: its object's id, hashed (FNV-1a), so its seed
+/// and the governor's key stay the object's across loads.
+fn object_key(id: &str) -> u64 {
+    id.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
 /// The ceiling over each fire and smoke emitter, by a ray straight up from it
 /// (`cast` gives the height it meets, if any): a cave's roof or a hall's
 /// ceiling, which smoke spreads out under. Dust needs none.
@@ -102,6 +182,89 @@ mod tests {
         let fx = load(&game, "test_room");
         assert!(fx.iter().any(|e| e.kind == EffectKind::Fire));
         assert!(fx.iter().all(|e| e.variation == Variation::default()), "{:?}", fx.iter().map(|e| e.variation).collect::<Vec<_>>());
+    }
+
+    /// A scratch game: `game/effects/steam_vent.json` and a scene of `objects`.
+    fn scratch_game(tag: &str, objects: serde_json::Value) -> std::path::PathBuf {
+        let real = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game");
+        let dir = std::env::temp_dir().join(format!("scene_effects_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("effects")).unwrap();
+        std::fs::create_dir_all(dir.join("scenes")).unwrap();
+        std::fs::copy(real.join("effects/steam_vent.json"), dir.join("effects/steam_vent.json")).unwrap();
+        let scene = serde_json::json!({ "name": "s", "sky": null, "objects": objects });
+        std::fs::write(dir.join("scenes/s.json"), serde_json::to_string(&scene).unwrap()).unwrap();
+        dir
+    }
+
+    fn marker(id: &str, x: f32, effect: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "uuid": format!("0f000000-0000-4000-8000-{:012x}", object_key(id) & 0xffff_ffff_ffff),
+            "cuboid": { "color": [200, 200, 200, 255], "half_size": [0.1, 0.1, 0.1], "position": [x, 0.1, 0.0],
+                "rotation": [0.0, 0.0, 0.0, 1.0], "style": "Solid", "wire_color": [0, 0, 0, 0] },
+            "hidden": true, "effect": effect,
+        })
+    }
+
+    #[test]
+    fn an_effect_naming_an_asset_is_placed_and_its_kind_is_the_fallback() {
+        let dir = scratch_game(
+            "place",
+            serde_json::json!([
+                marker("vent", 1.0, serde_json::json!({ "kind": "smoke", "asset": "steam_vent", "scale": 1.5, "rate": 0.5, "tint": [128, 255, 255, 255] })),
+                marker("lost", 3.0, serde_json::json!({ "kind": "smoke", "asset": "no_such_effect" })),
+                marker("plain", 5.0, serde_json::json!({ "kind": "embers" })),
+            ]),
+        );
+        let placed = placed(&dir, "s");
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        let p = &placed[0];
+        assert_eq!((p.object.as_str(), p.asset.as_str()), ("vent", "steam_vent"));
+        assert_eq!(p.position, Vec3::new(1.0, 0.1, 0.0));
+        assert_eq!(p.direction, Vec3::Y);
+        assert_eq!((p.placed.scale, p.placed.rate), (1.5, 0.5));
+        // The tint decoded from sRGB, as the kinds' are.
+        assert!((p.placed.tint[0] - 0.2158).abs() < 1e-3 && p.placed.tint[1] == 1.0, "{:?}", p.placed.tint);
+        assert_eq!(p.source, object_key("vent"));
+        // The placed one is not drawn twice; one naming no file draws its kind.
+        let kinds = load(&dir, "s");
+        assert_eq!(kinds.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["lost", "plain"]);
+        assert!(budget_problems(&dir, &kinds, &placed).is_empty(), "{:?}", budget_problems(&dir, &kinds, &placed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scene_crowded_with_effects_is_reported_at_load() {
+        // Forty vents, each at forty times its rate, within a metre: far over
+        // the neighbourhood's fill and the level's particles.
+        let objects: Vec<_> = (0..40).map(|k| marker(&format!("v{k}"), k as f32 * 0.02, serde_json::json!({ "kind": "smoke", "asset": "steam_vent", "rate": 40.0 }))).collect();
+        let dir = scratch_game("crowd", serde_json::Value::Array(objects));
+        let placed = placed(&dir, "s");
+        assert_eq!(placed.len(), 40);
+        let problems = budget_problems(&dir, &load(&dir, "s"), &placed);
+        assert!(problems.iter().any(|p| p.contains("megapixel-layers")), "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("particles alive")), "{problems:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WHERE TO STAND AN EFFECT: for each `POINTS=x,y,z;..` (y: a height
+    /// inside the room), the floor and the ceiling a ray down and up meets
+    /// through the physics scene, as `find_ceilings` casts. `SCENE` (test_room).
+    #[test]
+    #[ignore]
+    fn print_floor_and_ceiling() {
+        let game = crate::offline_frame::offline_game_dir();
+        let name = std::env::var("SCENE").unwrap_or_else(|_| "test_room".into());
+        let scene = Scene::load(&Manifest::scene_path(&game, &name)).expect("the scene");
+        let mut physics = space_soup_engine::rigid_physics::PhysicsWorld::new();
+        physics.rebuild(&scene, &game);
+        for p in std::env::var("POINTS").unwrap_or_default().split(';').filter(|s| !s.is_empty()) {
+            let v: Vec<f32> = p.split(',').map(|x| x.trim().parse().unwrap()).collect();
+            let at = Vec3::new(v[0], v[1], v[2]);
+            let down = physics.raycast(at, Vec3::NEG_Y, 40.0).map(|(hit, _)| hit.y);
+            let up = physics.raycast(at, Vec3::Y, 40.0).map(|(hit, _)| hit.y);
+            eprintln!("POINT {p}: floor {down:?} ceiling {up:?}");
+        }
     }
 
     #[test]

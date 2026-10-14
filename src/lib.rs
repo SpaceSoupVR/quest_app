@@ -53,6 +53,8 @@ mod scene_effects;
 mod scene_lights;
 mod scene_meshes;
 mod client_doors;
+mod grab_reach;
+mod lag_probe;
 mod terrain_render;
 mod water_render;
 mod weather_render;
@@ -458,6 +460,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let (effect_library, effect_errors) = space_soup::renderer::effects::stack::EffectLibrary::from_dir(&dir.join("effects"));
     effect_errors.iter().for_each(|e| log::error!("EFFECTS: {e}"));
     renderer.set_effect_library(effect_library);
+    // Objects whose effect names an asset (`effect.asset`): placed, streaming
+    // for as long as the level is loaded; and the scene's fill budget.
+    let placed_effects = scene_effects::placed(&dir, &static_scene.scene_name);
+    scene_effects::budget_problems(&dir, &level_effects, &placed_effects).iter().for_each(|p| log::error!("EFFECTS over the scene's budget: {p}"));
+    renderer.place_effects(&placed_effects);
     let mut muzzle = muzzle_test::MuzzleTest::default();
     // THE LEVEL'S WEATHER: rain and snow over its areas, and what they leave
     // on the ground, its ground found through the physics scene. Nothing is
@@ -688,6 +695,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut debug_reconnect_timer: u64 = 0;
     let mut last_time: Option<std::time::Instant> = None;
     let mut sim_time: f32 = 0.0;
+    // What each hand will take and the glow on it: see `grab_reach`.
+    let mut grab_targets = space_soup_engine::grab_target::GrabTargets::default();
+    let mut grab_glow = space_soup_engine::grab_target::GlowFade::default();
 
     let mut prev_r_trigger = false;
     let mut prev_l_trigger = false;
@@ -1112,6 +1122,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 level_effects = scene_effects::load(&dir, &w.scene_name);
                 scene_effects::find_ceilings(&mut level_effects, |p| static_scene.physics.raycast(p, Vec3::Y, 40.0).map(|(hit, _)| hit.y));
                 renderer.set_effects(level_effects.clone());
+                let placed_effects = scene_effects::placed(&dir, &w.scene_name);
+                scene_effects::budget_problems(&dir, &level_effects, &placed_effects).iter().for_each(|p| log::error!("EFFECTS over the scene's budget: {p}"));
+                renderer.place_effects(&placed_effects);
                 weather = weather_render::WeatherClient::load(&dir, &w.scene_name, &static_scene.physics);
                 renderer.set_weather(&weather.texels(), weather.chunk_firsts(loaded_terrain.as_ref().map(|(t, _)| t)));
                 {
@@ -1178,6 +1191,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 grabbed,
                 dt,
             );
+            // A bench view's doors, held or swinging (`BenchPose::doors`).
+            if let Some(angles) = bench_pose.as_ref().and_then(|(pose, since)| pose.door_angles_at(since.elapsed().as_secs_f32())) {
+                static_scene.doors.set_angles_deg(&angles);
+            }
             let poses: Vec<(String, Vec3, Quat)> = static_scene.doors.poses().map(|(id, p, r)| (id.to_string(), p, r)).collect();
             for (id, p, r) in &poses {
                 static_scene.physics.set_door_pose(id, *p, *r);
@@ -1224,6 +1241,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             for s in splash_watch.told(sim_time as f64, told.unwrap_or(&[]), &ground, &sunlit) {
                 renderer.add_splash(s);
             }
+            // Floating things bobbing make their own rings (`SplashWatch::bob`).
+            let floating = live_objects.by_id.iter().map(|(id, c)| (id.as_str(), c.position, c.half_size, c.rotation));
+            for s in splash_watch.bob(sim_time as f64, &surface, &sunlit, floating) {
+                renderer.add_splash(s);
+            }
         }
         // THE MUZZLE TEST (lever `muzzle_test`): the right hand's A fires the
         // selected effect from its aim, B steps to the next. See `muzzle_test`.
@@ -1240,6 +1262,43 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
         queue_new_meshes(meshes_src, &mesh_cache, &mut requested_mesh_ids, &mesh_req_tx);
 
+        // WHAT EACH HAND WILL TAKE, lit before the grip closes: the loose
+        // things and door handles within its reach and aim (`grab_reach`,
+        // `space_soup_engine::grab_target`), the glow on the choice's model
+        // (`ModelUniform::set_highlight`). Nothing is written while nothing
+        // is lit or fading.
+        {
+            use space_soup_engine::{Hand, JointId};
+            let probe = |h: Hand| {
+                let grip = rig.get(JointId::HandGrip(h))?.position;
+                let aim = space_soup_engine::grab_target::aim_of(rig.hand_aim(h).rotation);
+                Some(grab_reach::HandProbe { grip, aim: if aim == Vec3::ZERO { Vec3::NEG_Y } else { aim } })
+            };
+            let server_held = |h: Hand| {
+                world
+                    .as_ref()
+                    .and_then(|w| match h {
+                        Hand::Left => w.left_hand_held.as_ref(),
+                        Hand::Right => w.right_hand_held.as_ref(),
+                    })
+                    .map(|g| g.object_id.as_str())
+            };
+            let held = [Hand::Left, Hand::Right].map(|h| grabbed_ids[part_pull::hand_idx(h)].as_deref().or_else(|| server_held(h)));
+            let may_take = |id: &str| !static_scene.fixed.contains(id) && !static_scene.grip_points.contains_key(id);
+            let offers = grab_reach::offers_for(&live_objects.near, may_take, &static_scene.doors, [probe(Hand::Left), probe(Hand::Right)]);
+            let changed = grab_targets.update([offers[0].as_deref(), offers[1].as_deref()], held);
+            for (h, new) in changed.iter().enumerate() {
+                if let (true, Some(c)) = (*new, grab_targets.choice(h)) {
+                    info!("GRAB TARGET {}: '{}' ({:?}, cost {:.2})", ["L", "R"][h], c.id, c.kind, c.cost);
+                }
+            }
+            let wanted: Vec<&str> = grab_targets.hands.iter().flatten().map(|c| c.glow.as_str()).collect();
+            for (id, level) in grab_glow.step(dt, sim_time as f64, &wanted) {
+                if let Some((_, model)) = mesh_cache.get(&id) {
+                    model.set_highlight(renderer.queue(), level);
+                }
+            }
+        }
         let mut input = part_pull::handle_input(
             cs,
             &rig,
@@ -1260,6 +1319,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             &mut prev_btn_y,
             sim_time,
             &part_transforms,
+            &grab_targets,
         );
         if respawn_props_pressed {
             info!("respawn props: asked by the menu button");
@@ -1677,7 +1737,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .map(|s| flashlight_bounce::lit_surface(s, offset, yaw_inv))
             .collect();
         renderer.set_lit_surfaces(&held);
-        renderer.set_pool_light(&pool_light);
+        renderer.set_pool_light(if renderer.frame_levers().pool_metering { &pool_light } else { &[] });
 
         let sounds_src = world.as_ref().map(|w| w.sounds.as_slice()).unwrap_or(&[]);
         let occlusion: HashMap<String, f32> = sounds_src

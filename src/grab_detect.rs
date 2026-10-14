@@ -103,15 +103,7 @@ impl StaticScene {
         let mut fixed = std::collections::HashSet::new();
         let (grip_points, part_animations) = match Scene::load(&path) {
             Ok(scene) => {
-                fixed = scene
-                    .objects
-                    .iter()
-                    .filter(|o| {
-                        let loose = o.rigid_body.as_ref().is_some_and(|b| b.mode == space_soup_engine::BodyMode::Dynamic);
-                        !loose || o.door.is_some()
-                    })
-                    .map(|o| o.id.clone())
-                    .collect();
+                fixed = crate::grab_reach::fixed_objects(&scene);
                 physics.rebuild(&scene, game_dir);
                 doors = crate::client_doors::ClientDoors::from_scene(&scene);
                 sky = scene.sky.clone();
@@ -219,6 +211,8 @@ pub fn nearest_object_to(live: &LiveObjects, point: Vec3) -> Option<String> {
 /// sends, so a grip pressed near a wall grabbed the room (`StaticScene::fixed`
 /// is what it may not take), and it measured the hand against all of them;
 /// now it asks the grid for what is within reach (`LiveObjects::near`).
+// Superseded on the press by `grab_reach` (what is lit is what is taken).
+#[allow(dead_code)]
 pub fn nearest_grabbable_object_to(
     live: &LiveObjects,
     static_scene: &StaticScene,
