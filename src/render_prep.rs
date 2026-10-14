@@ -93,7 +93,7 @@ pub(crate) fn build_render_lists<'a>(
     }
     // THE DOORS where this headset draws them: the server's pose, turned by
     // any local hand pushing the leaf. See `client_doors`.
-    for (id, position, rotation) in static_scene.doors.poses() {
+    for (id, position, rotation) in static_scene.doors.poses().chain(static_scene.doors.rider_poses()) {
         if let Some((mesh, _)) = mesh_cache.get_mut(id) {
             mesh.position = yaw_inv * (position - offset);
             mesh.rotation = yaw_inv * rotation;

@@ -304,6 +304,9 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
     // what the beam lands on, cast against the brushes alone -- the frame
     // casts the physics scene too, which adds the ground and the models.
     let mut lit_surfaces: Vec<space_soup::renderer::lights::LitSurface> = Vec::new();
+    // What its pool puts in front of the eye, for the meter, as the frame
+    // meters it (`Landings::meter_samples`). `POOL_METER=0`: not metered.
+    let mut pool_light: Vec<(Vec3, f32, f32)> = Vec::new();
     if let Some((glass, aim)) = view.flashlight {
         let (lens, rotation) = crate::flashlight::lens_from_bench(glass, aim);
         lights.push(crate::flashlight::beam(lens, rotation * Vec3::NEG_Z, offset, yaw_inv));
@@ -319,6 +322,9 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         };
         let rays = crate::flashlight_bounce::beam_rays(crate::flashlight::CONE_DEG, crate::flashlight::HOTSPOT_DEG);
         let landed = crate::flashlight_bounce::landings(lens, rotation, &rays, land);
+        if std::env::var("POOL_METER").as_deref() != Ok("0") {
+            pool_light = landed.meter_samples(view.eye);
+        }
         let patches = landed.patches();
         // The surfaces its pool shows on in reflections, as the frame names
         // them (`flashlight_bounce::HeldSurfaces`, freshly found).
@@ -345,6 +351,16 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                 .iter()
                 .filter_map(|e| space_soup::renderer::effects::fire_light(e, time, offset, yaw_inv)),
         );
+    }
+    // SHOTS to look at (`BURST=`, see `muzzle_test::offline_bursts`), and
+    // their flash's light on the room: judged visible at `BURST_EXPOSURE`
+    // (this frame's own exposure is metered after its lights are listed;
+    // without one the light is raised).
+    let mut shots = crate::muzzle_test::offline_bursts(&game);
+    if let Some((lib, set)) = shots.as_mut() {
+        let judged = std::env::var("BURST_EXPOSURE").ok().and_then(|v| v.parse().ok()).unwrap_or(f32::MAX);
+        lights.extend(set.lights(lib, judged, offset, yaw_inv));
+        eprintln!("offline frame: {} shots, their lights {:?}", set.live.len(), set.stats);
     }
     let lights = space_soup::renderer::lights::rank_for_budget(&lights, space_soup::renderer::lights::MAX_LIGHTS);
     let lights_uniform = LightsUniform::new(&device);
@@ -687,6 +703,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         } else {
             Vec::new()
         };
+        let fires: Vec<_> = fires.into_iter().chain(pool_light.iter().copied()).collect();
         let mut m = eye.meter_with(view.eye, view.at - view.eye, &fires);
         // Under the water the eye adapts to the water's own light.
         if let Some((_, state, u)) = &in_water {
@@ -1130,7 +1147,7 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
         }
         let effects_time: f64 = std::env::var("EFFECTS_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(30.0);
         let splashes = splash_at(effects_time);
-        match (&probe_pass, emitters.is_empty() && splashes.is_empty()) {
+        match (&probe_pass, emitters.is_empty() && splashes.is_empty() && shots.is_none()) {
             (Some(_), false) => {
                 let layout = effects::bind_group_layout(&device);
                 let mut gpu = effects::EffectsGpu::new(&device, &queue, &layout);
@@ -1150,9 +1167,19 @@ pub fn render_brushes(scene_name: &str, view: View) -> Option<Shot> {
                     ambient: &ambient,
                     exposure,
                 };
-                let frame = effects::simulate_with(&emitters, &splashes, time, &at);
+                let frame = match shots.as_mut() {
+                    Some((lib, set)) => {
+                        let drawn = set.frame(lib, time, &[], view.eye);
+                        effects::simulate_all(&emitters, &|_| true, &splashes, Some(&effects::stack::BurstFrame { lib, set, drawn: &drawn }), time, &at)
+                    }
+                    None => effects::simulate_with(&emitters, &splashes, time, &at),
+                };
                 eprintln!("offline frame: effects at {time} s: {} over, {} screened", frame.over, frame.screened);
+                // `EFFECT_VARIANTS=0`: the two union shaders, as the lever
+                // `effect_variants` off draws them.
+                gpu.use_variants = std::env::var("EFFECT_VARIANTS").as_deref() != Ok("0");
                 gpu.upload(&device, &queue, &frame);
+                eprintln!("offline frame: effects drawn in {} draws ({:?})", gpu.run_stats.draws, gpu.run_stats);
                 let forward = (at_p - eye_p).normalize();
                 let right = forward.cross(up).normalize();
                 gpu.set_view(
@@ -1746,6 +1773,11 @@ type OfflineCaves = (
 struct OfflineDoors {
     pipeline: space_soup::renderer::mesh_pipeline::MeshPipeline,
     leaves: Vec<(space_soup::renderer::mesh::GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform)>,
+    /// What goes with the doors and is drawn like them but casts into no
+    /// tile: each door's lever on its leaf, the doorways' frames, and the
+    /// level's loose props (rocks, crates) where the scene puts them. The
+    /// harness draws no other model.
+    dressing: Vec<(space_soup::renderer::mesh::GltfMesh, space_soup::renderer::mesh_pipeline::ModelUniform)>,
     lightmap: space_soup::renderer::mesh::LoadedTexture,
     tiles: Vec<(usize, Mat4)>,
     /// The leaves as the renderer takes them, for their reflection proxies.
@@ -1807,6 +1839,29 @@ impl OfflineDoors {
             model.upload_lit_bulb(queue, mesh.model_matrix(), 0.0, 0.0, &room, None, 0.0);
             leaves.push((mesh, model));
         }
+        // THE DRESSING: levers where their leaves carry them, then frames
+        // (models under models/doors that are not doors) and loose props.
+        let riders: Vec<(String, Vec3, Quat)> = doors.rider_poses().map(|(id, p, r)| (id.to_string(), p, r)).collect();
+        let standing = scene.objects.iter().filter(|o| {
+            let loose = o.rigid_body.as_ref().is_some_and(|b| b.mode == space_soup_engine::BodyMode::Dynamic);
+            let frame = o.mesh.as_ref().is_some_and(|m| m.path.starts_with("models/doors/"));
+            o.door.is_none() && !o.hidden && (loose || frame) && !riders.iter().any(|(id, ..)| *id == o.id)
+        });
+        let mut dressing = Vec::new();
+        for (id, position, rotation) in riders.iter().cloned().chain(standing.map(|o| (o.id.clone(), o.cuboid.position, o.cuboid.rotation))) {
+            let Some(mref) = scene.find_object(&id).and_then(|o| o.mesh.clone()) else { continue };
+            let Ok(mut mesh) = space_soup::renderer::mesh::GltfMesh::load(device, queue, &pipeline.texture_layout, &game.join(&mref.path)) else {
+                eprintln!("offline frame: {id}'s model did not load");
+                continue;
+            };
+            mesh.position = yaw_inv * (position - offset);
+            mesh.rotation = yaw_inv * rotation * mref.rotation_offset;
+            mesh.scale = mref.scale;
+            let model = pipeline.create_model_uniform(device);
+            let room = space_soup::renderer::room_light::turned_to_player(&space_soup::renderer::room_light::room_light_at(descs, position), yaw);
+            model.upload_lit_bulb(queue, mesh.model_matrix(), 0.0, 0.0, &room, None, 0.0);
+            dressing.push((mesh, model));
+        }
         let casters: Vec<space_soup::renderer::shadow::DoorCaster> = doors
             .views()
             .iter()
@@ -1842,7 +1897,7 @@ impl OfflineDoors {
             "offline frame: door tiles for lamps {:?}",
             tiles.iter().map(|(i, _)| (*i, (Quat::from_rotation_y(yaw) * lights[*i].position + offset).to_array().map(|v| (v * 10.0).round() / 10.0))).collect::<Vec<_>>()
         );
-        Some(Self { pipeline, leaves, lightmap, tiles, views: doors.views() })
+        Some(Self { pipeline, leaves, dressing, lightmap, tiles, views: doors.views() })
     }
 
     fn tile_lamps(&self) -> Vec<usize> {
@@ -1888,7 +1943,7 @@ impl OfflineDoors {
     fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, uniforms: &'a wgpu::BindGroup) {
         pass.set_pipeline(&self.pipeline.pipeline);
         pass.set_bind_group(0, uniforms, &[]);
-        for (mesh, model) in &self.leaves {
+        for (mesh, model) in self.leaves.iter().chain(&self.dressing) {
             for prim in mesh.primitives.iter().filter(|p| !p.blended) {
                 pass.set_bind_group(1, &model.bind_group, &[]);
                 pass.set_bind_group(2, &prim.texture.bind_group, &[]);
@@ -2372,6 +2427,17 @@ fn offline_terrain(
             (reader, if poolless { twins.pass_poolless } else { twins.pass })
         }
         None => (reader, pass),
+    };
+    // `GROUND_DEBUG=<name>` (with `WEATHER=0`): the reader answering with one
+    // of the ground's diagnostic pictures over the whole ground
+    // (`terrain_pipeline::GROUND_DEBUG_VIEWS`: albedo, plane, stretch, ...).
+    let reader = match std::env::var("GROUND_DEBUG") {
+        Ok(view) => {
+            assert!(weather.is_none(), "GROUND_DEBUG draws the dry reader: set WEATHER=0");
+            TerrainPipeline::new_debug_reader(device, format, uniform_layout, samples, probe_layout, &view)
+                .unwrap_or_else(|| panic!("GROUND_DEBUG={view}: not one of the ground's diagnostic pictures"))
+        }
+        Err(_) => reader,
     };
     let dir = game.join("textures").join("terrain");
     let material = tp::TerrainMaterial::from_layers_with(
@@ -3368,7 +3434,11 @@ mod bench_views {
             // same picture, through every turn's worth of posing (the app's,
             // or the vertex shaders' for geometry kept in the world).
             let yaw_deg = std::env::var("YAW").ok().and_then(|n| n.parse().ok()).unwrap_or(base.yaw_deg);
-            let Some(shot) = render_brushes(&scene, View { adapt: true, flashlight, torch, terrain, cut, effects, water, weather, samples, yaw_deg, ..base }) else {
+            // `SCALE=k`: k times the pixels each way, the supersampled
+            // picture a fault of under-sampling is absent from.
+            let scale = std::env::var("SCALE").ok().and_then(|n| n.parse::<u32>().ok()).unwrap_or(1).max(1);
+            let (width, height) = (base.width * scale, base.height * scale);
+            let Some(shot) = render_brushes(&scene, View { adapt: true, flashlight, torch, terrain, cut, effects, water, weather, samples, yaw_deg, width, height, ..base }) else {
                 eprintln!("skipping: no GPU or no {scene} (a level with no brush lightmap is not drawn)");
                 return;
             };
@@ -3521,7 +3591,20 @@ mod bench_views {
         let water = std::env::var("WATER").as_deref() != Ok("0");
         let weather = std::env::var("WEATHER").as_deref() != Ok("0");
         let scene = offline_scene();
-        let Some(shot) = render_brushes(&scene, View { adapt: true, flashlight, terrain, cut, effects, water, weather, ..View::headset(eye, at) }) else {
+        // (`SCALE=k`, `MSAA=n`: as for the bench views.)
+        let base = View::headset(eye, at);
+        let scale = std::env::var("SCALE").ok().and_then(|n| n.parse::<u32>().ok()).unwrap_or(1).max(1);
+        let (width, height) = (base.width * scale, base.height * scale);
+        let samples = std::env::var("MSAA").ok().and_then(|n| n.parse().ok()).unwrap_or(base.samples);
+        // (`TERMINATOR_AA=0`: the lamps' hard terminator, as `measure_the_aliasing` takes it.)
+        let terminator_aa = std::env::var("TERMINATOR_AA").as_deref() != Ok("0");
+        // (`TORCH=1`: the torch in the reflections, as a bench view's `"torch": true`;
+        // `SOURCES=1`: the lighting-sources picture; `LINEAR=1`: radiance with no
+        // tone curve, times `EXPOSURE` if set, else the metered exposure.)
+        let torch = std::env::var("TORCH").as_deref() == Ok("1");
+        let sources = std::env::var("SOURCES").as_deref() == Ok("1");
+        let linear = std::env::var("LINEAR").as_deref() == Ok("1");
+        let Some(shot) = render_brushes(&scene, View { adapt: true, flashlight, torch, sources, linear, terrain, cut, effects, water, weather, width, height, samples, terminator_aa, ..base }) else {
             eprintln!("skipping: no GPU or no {scene}");
             return;
         };

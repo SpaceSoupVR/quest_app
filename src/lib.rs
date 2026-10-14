@@ -22,6 +22,7 @@ mod loaders;
 mod mesh_load;
 #[cfg(target_os = "android")]
 mod movement;
+mod muzzle_test;
 #[cfg(target_os = "android")]
 mod network;
 #[cfg(target_os = "android")]
@@ -451,6 +452,13 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut level_effects = scene_effects::load(&dir, &static_scene.scene_name);
     scene_effects::find_ceilings(&mut level_effects, |p| static_scene.physics.raycast(p, Vec3::Y, 40.0).map(|(hit, _)| hit.y));
     renderer.set_effects(level_effects.clone());
+    // THE EFFECTS AN EVENT CAN RAISE (`game/effects`: a shot's flash and
+    // smoke), compiled now so the first shot draws at once; and the test
+    // that fires them from the right hand. See `muzzle_test`.
+    let (effect_library, effect_errors) = space_soup::renderer::effects::stack::EffectLibrary::from_dir(&dir.join("effects"));
+    effect_errors.iter().for_each(|e| log::error!("EFFECTS: {e}"));
+    renderer.set_effect_library(effect_library);
+    let mut muzzle = muzzle_test::MuzzleTest::default();
     // THE LEVEL'S WEATHER: rain and snow over its areas, and what they leave
     // on the ground, its ground found through the physics scene. Nothing is
     // built for a level without. See `weather_render`.
@@ -1016,6 +1024,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 if want && !got { " -- REFUSED: this device has no stereo pipelines" } else { "" },
             );
         }
+        // BRING THE ROCKS BACK: the left controller's menu button, which the
+        // tester's build gives no other use, asks the server to put every
+        // loose prop back where the level placed it (`RESPAWN_PROPS_BUTTON`).
+        let respawn_props_pressed = !DEVELOPER_TOGGLES && cs.btn_menu && !prev_btn_menu;
         prev_btn_menu = cs.btn_menu;
 
         let rig = build_player_rig(&eye_views, &locomotion, cs, &hands, &synthetic_hand_config);
@@ -1144,13 +1156,28 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         // them where they are drawn, and the renderer shadows them and culls
         // through the doorways they leave open. See `client_doors`.
         {
-            let yaw = Quat::from_rotation_y(locomotion.player_yaw);
-            let offset = locomotion.player_offset;
             // Every part of each hand that can push: grip and palm, and a
             // tracked hand's finger tips, in the world.
-            let hands = client_doors::hand_spheres(|j| rig.get(j).map(|t| yaw * t.position + offset));
-            let head = yaw * rig.head().position + offset;
-            static_scene.doors.update(object_bounds_src.iter().map(|b| (b.id.as_str(), Quat::from_array(b.rotation))), &hands, Some(head), dt);
+            //
+            // THE RIG IS ALREADY IN THE WORLD: `build_player_rig` puts every
+            // joint through `Locomotion::apply_to_head` (offset + yaw). This
+            // used to turn and move them by the player's yaw and offset a
+            // second time, so the hands and body the doors felt were where
+            // the player is only at the level's origin facing -z.
+            let hands = client_doors::hand_spheres(|j| rig.get(j).map(|t| t.position));
+            let head = rig.head().position;
+            // A hand that grabbed a door's handle holds it: see `part_pull`.
+            let grips = [space_soup_engine::Hand::Left, space_soup_engine::Hand::Right]
+                .map(|h| rig.get(space_soup_engine::JointId::HandGrip(h)).map(|t| t.position));
+            let grabbed = [grabbed_ids[0].as_deref(), grabbed_ids[1].as_deref()];
+            static_scene.doors.update_held(
+                object_bounds_src.iter().map(|b| (b.id.as_str(), Quat::from_array(b.rotation))),
+                &hands,
+                Some(head),
+                grips,
+                grabbed,
+                dt,
+            );
             let poses: Vec<(String, Vec3, Quat)> = static_scene.doors.poses().map(|(id, p, r)| (id.to_string(), p, r)).collect();
             for (id, p, r) in &poses {
                 static_scene.physics.set_door_pose(id, *p, *r);
@@ -1160,7 +1187,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         // THE WEATHER, on the same clock: each area's numbers every frame,
         // its map a few times a second, and the player's own wetness.
         {
-            let head_world = Quat::from_rotation_y(locomotion.player_yaw) * rig.head().position + locomotion.player_offset;
+            // The rig is already in the world (`build_player_rig`).
+            let head_world = rig.head().position;
             let (areas, maps) = weather.step(sim_time as f64, dt, head_world);
             if !areas.is_empty() {
                 renderer.update_weather(sim_time as f64, &areas, &maps);
@@ -1174,10 +1202,14 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             let told = world.as_ref().and_then(|w| w.water_entries.as_deref());
             let yaw = Quat::from_rotation_y(locomotion.player_yaw);
             let offset = locomotion.player_offset;
-            let world = |p: Vec3| yaw * p + offset;
+            // The rig is already in the world (`build_player_rig`); this
+            // used to turn and move it a second time, which put the feet's
+            // and hands' splashes where the player was not.
+            let world = |p: Vec3| p;
             let head = rig.head();
             let floor = Vec3::new(world(head.position).x, offset.y, world(head.position).z);
-            let facing = yaw * (head.rotation * Vec3::NEG_Z);
+            let _ = yaw;
+            let facing = head.rotation * Vec3::NEG_Z;
             let hands = [space_soup_engine::Hand::Left, space_soup_engine::Hand::Right]
                 .map(|h| rig.get(space_soup_engine::JointId::HandGrip(h)).map(|t| world(t.position)));
             let physics = &static_scene.physics;
@@ -1193,9 +1225,22 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 renderer.add_splash(s);
             }
         }
+        // THE MUZZLE TEST (lever `muzzle_test`): the right hand's A fires the
+        // selected effect from its aim, B steps to the next. See `muzzle_test`.
+        if renderer.frame_levers().muzzle_test {
+            // The rig is already in the world (`build_player_rig` applies the
+            // locomotion), as bursts are.
+            let aim = rig.hand_aim(space_soup_engine::Hand::Right);
+            let shots = muzzle.step(cs.btn_a, cs.btn_b, dt, aim.position, aim.rotation, |name| renderer.effect_id(name));
+            shots.into_iter().for_each(|b| renderer.add_burst(b));
+            if frame_count % 180 == 0 && renderer.burst_stats().0.live > 0 {
+                let (stats, count) = renderer.burst_stats();
+                info!("{}", muzzle_test::stats_line(&stats, &count));
+            }
+        }
         queue_new_meshes(meshes_src, &mesh_cache, &mut requested_mesh_ids, &mesh_req_tx);
 
-        let input = part_pull::handle_input(
+        let mut input = part_pull::handle_input(
             cs,
             &rig,
             &world,
@@ -1216,6 +1261,14 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             sim_time,
             &part_transforms,
         );
+        if respawn_props_pressed {
+            info!("respawn props: asked by the menu button");
+            input.button_presses.push(space_soup_engine::ButtonPress::new(
+                space_soup_engine::events::RESPAWN_PROPS_BUTTON,
+                None,
+                space_soup_engine::Hand::Left,
+            ));
+        }
 
         // Held still while pinned: a stick knocked on the desk must not walk
         // the benchmark out of its viewpoint.
@@ -1459,6 +1512,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     // light pulses with the flames drawn (`fire_glow`).
                     .filter_map(|e| space_soup::renderer::effects::fire_light(e, time.as_nanos() as f64 * 1e-9, offset, yaw_inv)),
             );
+            // A shot's flash lights the room for its frame, where that shows.
+            lights.extend(renderer.burst_lights(offset, yaw_inv));
         }
         // The flashlight's beam rides last, after the pairing above (which
         // matches lights to `lights_src` by position), as one more live spot.
@@ -1534,6 +1589,9 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         };
         // Every beam's lit surfaces this instant. See `lit_surfaces`.
         let mut surfaces_now: Vec<flashlight_bounce::LitPlane> = Vec::new();
+        // And what their pools put in front of the eye, for its meter. See
+        // `flashlight_bounce::Landings::meter_samples`.
+        let mut pool_light: Vec<(Vec3, f32, f32)> = Vec::new();
         if let Some((lens, rotation, torch)) = flashlight_now {
             let beam = flashlight::beam(lens, rotation * Vec3::NEG_Z, offset, yaw_inv);
             // The rain and snow in its cone catch its light. See `weather`.
@@ -1541,6 +1599,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             lights.push(beam);
             let landed = flashlight_bounce::landings(lens, rotation, &bounce_rays, land);
             surfaces_now.extend(landed.surfaces());
+            pool_light.extend(landed.meter_samples(rig.head().position));
             if bouncing {
                 bounce_lights.extend(
                     bounce
@@ -1580,6 +1639,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             lights.push(flashlight::beam(f.lens.position, forward, offset, yaw_inv));
             let landed = flashlight_bounce::landings(f.lens.position, f.lens.rotation, &bounce_rays, land);
             surfaces_now.extend(landed.surfaces());
+            pool_light.extend(landed.meter_samples(rig.head().position));
             if bouncing {
                 bounce_lights.extend(
                     remote_bounces
@@ -1617,6 +1677,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .map(|s| flashlight_bounce::lit_surface(s, offset, yaw_inv))
             .collect();
         renderer.set_lit_surfaces(&held);
+        renderer.set_pool_light(&pool_light);
 
         let sounds_src = world.as_ref().map(|w| w.sounds.as_slice()).unwrap_or(&[]);
         let occlusion: HashMap<String, f32> = sounds_src
