@@ -730,6 +730,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     // THE FRAME-RATE READOUT: Y shows or hides it (`fps_hud`). It sits in
     // the head's own space, so it follows the view.
     let mut prev_y_readout = false;
+    // ... and the lever `fps_hud` does too, when it changes.
+    let mut prev_fps_lever = false;
     let view_space = headset
         .session
         .create_reference_space(openxr::ReferenceSpaceType::VIEW, openxr::Posef::IDENTITY)?;
@@ -1022,6 +1024,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             info!("FPS readout -> {} by Y", if on { "on" } else { "off" });
         }
         prev_y_readout = cs.btn_y;
+        if renderer.levers().fps_hud != prev_fps_lever {
+            prev_fps_lever = renderer.levers().fps_hud;
+            renderer.set_fps_hud(&headset.session, prev_fps_lever);
+            info!("FPS readout -> {} by the lever", if prev_fps_lever { "on" } else { "off" });
+        }
         // MULTIVIEW A/B: the menu button flips the stereo scene pass, which
         // draws both eyes in one go instead of once each. Its own control
         // rather than a state in the SSR cycle, because the comparison that
