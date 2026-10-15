@@ -727,6 +727,12 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     // For the brush debug-view cycle below.
     let mut prev_l_stick_click = false;
     let mut prev_btn_menu = false;
+    // THE FRAME-RATE READOUT: Y shows or hides it (`fps_hud`). It sits in
+    // the head's own space, so it follows the view.
+    let mut prev_y_readout = false;
+    let view_space = headset
+        .session
+        .create_reference_space(openxr::ReferenceSpaceType::VIEW, openxr::Posef::IDENTITY)?;
     // What the compositor was last asked for, logged when it changes.
     let mut last_layer_state: Option<(bool, bool)> = None;
 
@@ -1008,6 +1014,14 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             info!("debug view -> {:?} by left stick click", view);
         }
         prev_l_stick_click = cs.l_stick_click;
+        // Y also still reaches the scene as `btn_y` (part_pull); nothing in
+        // the shipped scenes binds it.
+        if cs.btn_y && !prev_y_readout {
+            let on = !renderer.fps_hud_on();
+            renderer.set_fps_hud(&headset.session, on);
+            info!("FPS readout -> {} by Y", if on { "on" } else { "off" });
+        }
+        prev_y_readout = cs.btn_y;
         // MULTIVIEW A/B: the menu button flips the stereo scene pass, which
         // draws both eyes in one go instead of once each. Its own control
         // rather than a state in the SSR cycle, because the comparison that
@@ -1865,6 +1879,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                 if layer_settings { format!("{sharpening:?}") } else { "off".to_string() },
             );
         }
+        // The readout counts this frame now: the views below borrow the
+        // renderer until the frame is handed over.
+        let period = frame_state.predicted_display_period.as_nanos();
+        renderer.fps_hud_frame(if period > 0 { 1e9 / period as f64 } else { 72.0 });
         let proj_views = renderer.render_frame_with_meshes(
             &headset.session,
             &headset.stage,
@@ -1935,9 +1953,14 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             // The eyes stay at their size. See `renderer::dynamic_resolution`.
             renderer.ask_recommended_resolution(proj_layer.as_raw(), time);
 
+            let fps_layer = renderer.fps_hud_layer(&view_space);
+            let mut layers: Vec<&openxr::CompositionLayerBase<openxr::Vulkan>> = vec![&*proj_layer];
+            if let Some(quad) = &fps_layer {
+                layers.push(&**quad);
+            }
             headset
                 .frame_stream
-                .end(time, openxr::EnvironmentBlendMode::OPAQUE, &[&proj_layer])?;
+                .end(time, openxr::EnvironmentBlendMode::OPAQUE, &layers)?;
         }
 
         frame_count += 1;
