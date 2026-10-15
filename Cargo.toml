@@ -3,7 +3,7 @@ name        = "quest_app"
 version     = "0.1.0"
 edition     = "2021"
 authors     = ["Your Name <you@example.com>"]
-description = "A Quest VR app"
+description = "DEPRECATED: the old Quest headset build. Not built or maintained; the crate refuses to compile."
 
 [lib]
 name       = "quest_app"
