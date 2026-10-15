@@ -2485,6 +2485,10 @@ fn offline_terrain(
     // `GROUND_LOD=lists`: the lists built and the lever OFF -- step 1, to
     // show the lists in the buffer change nothing drawn.
     let lod_env = std::env::var("GROUND_LOD").ok().filter(|v| v != "0");
+    // `GROUND_LOD_MRAD=2.4`: the error a coarser node may show, milliradians
+    // (`ground_lod::TOLERANCE`; a pixel, 1.2, unset).
+    let mrad = std::env::var("GROUND_LOD_MRAD").ok().and_then(|v| v.parse::<f32>().ok()).filter(|m| *m > 0.0).unwrap_or(1.2);
+    space_soup::renderer::ground_lod::TOLERANCE.store((mrad * 1e-3).to_bits(), std::sync::atomic::Ordering::Relaxed);
     space_soup::renderer::ground_lod::LISTS.store(lod_env.is_some(), std::sync::atomic::Ordering::Relaxed);
     // `GROUND_LOD=1` is the lever as it comes: no node coarser than its
     // error allows at any distance (`Levers::ground_lod_strict`, on).
@@ -2688,7 +2692,7 @@ fn offline_terrain(
         Err(_) => reader,
     };
     let dir = game.join("textures").join("terrain");
-    let material = tp::TerrainMaterial::from_layers_with(
+    let material = tp::TerrainMaterial::from_layers_with_shape(
         device,
         queue,
         &reader.material_layout,
@@ -2720,7 +2724,13 @@ fn offline_terrain(
             }
             settings
         },
+        // `GROUND_SHAPE=0`: the ground lit by its interpolated vertex normals
+        // and textured by its drawn triangles, as before 2026-10-14 -- the
+        // control for what the shape alone does to a picture.
+        geometry.shape.as_ref().filter(|_| std::env::var("GROUND_SHAPE").as_deref() != Ok("0")),
     );
+    // Coarser triangles are classed by the step-1 cells under them (`ground_shape`).
+    let lattice = geometry.lod.lattice;
     let (verts, idx) = match world_ground {
         true => geometry.assemble_world(offset, yaw_inv, yaw)?,
         false => geometry.assemble(offset, yaw_inv, yaw)?,
@@ -2790,7 +2800,7 @@ fn offline_terrain(
     let (class_offset, class_yaw) = if world_ground { (Vec3::ZERO, 0.0) } else { (offset, yaw) };
     let class_of = |corners: [[f32; 3]; 3]| if by_class { level_ground.class_of_posed(class_offset, class_yaw, corners) } else { 0 };
     let classed = |verts: &[space_soup::renderer::cuboid::SolidVertex], idx: &[u32]| {
-        space_soup::renderer::ground_twins::SlopeSplit::classed(verts, idx, &[], threshold, by_class as u64, &class_of)
+        space_soup::renderer::ground_twins::SlopeSplit::classed_on(verts, idx, &[], threshold, by_class as u64, &class_of, Some(lattice), None)
     };
     let class_draws = |split: &space_soup::renderer::ground_twins::SlopeSplit| {
         by_class.then(|| {
