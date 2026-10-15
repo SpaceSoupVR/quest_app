@@ -314,6 +314,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     // What the ground hides. See `space_soup::renderer::ground_horizon`.
     // The ground's chunks and the tree a frame asks which of them it draws.
     renderer.set_ground_lod(loaded_terrain.as_ref().map(|(t, _)| t.lod.clone()));
+    renderer.set_ground_shape(loaded_terrain.as_ref().and_then(|(t, _)| t.shape.clone()));
     renderer.set_ground_horizon(loaded_terrain.as_ref().and_then(|(t, _)| {
         Some((t.ground_occluder(static_scene.terrain.as_ref())?, t.chunk_world_bounds()))
     }));
@@ -1171,6 +1172,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     loaded_terrain.as_ref().and_then(|(t, _)| t.height_grid(static_scene.terrain.as_ref(), &dir)),
                 );
                 renderer.set_ground_lod(loaded_terrain.as_ref().map(|(t, _)| t.lod.clone()));
+                renderer.set_ground_shape(loaded_terrain.as_ref().and_then(|(t, _)| t.shape.clone()));
                 renderer.set_ground_horizon(loaded_terrain.as_ref().and_then(|(t, _)| {
                     Some((t.ground_occluder(static_scene.terrain.as_ref())?, t.chunk_world_bounds()))
                 }));

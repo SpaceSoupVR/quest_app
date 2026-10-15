@@ -245,6 +245,11 @@ pub struct TerrainGeometry {
     /// Every run of `indices` the slope split sorts, its box in the WORLD:
     /// the same list every frame ([`Self::caster_chunks`]).
     units: Vec<space_soup::renderer::shadow::CasterChunk>,
+    /// THE GROUND'S STEP-1 SHAPE, a texel a sample (`ground_shape`): what
+    /// its readers take the normal and the face from, so a coarser step is
+    /// lit as step 1 is. `None` for a ground that is not a lattice of samples
+    /// at step 1.
+    pub shape: Option<space_soup::renderer::ground_shape::GroundShape>,
 }
 
 impl TerrainGeometry {
@@ -457,7 +462,7 @@ impl TerrainGeometry {
     fn from_parts(vertices: Vec<SolidVertex>, mut lod: GroundLod) -> Self {
         let units = lod.all_units();
         let indices = std::mem::take(&mut lod.indices);
-        Self { vertices, indices, posed: Vec::new(), built_for: None, lod, units }
+        Self { vertices, indices, posed: Vec::new(), built_for: None, lod, units, shape: None }
     }
 }
 
@@ -599,6 +604,31 @@ pub fn load_with(def: &TerrainDef, game_dir: &std::path::Path, step: u32, struct
         None => GroundLod::build(&ground_lod::GridInput { cells: [0, 0], positions: &positions, triangles: &kept_indices, open: None, chunk_cells: 1, lists: false }),
     };
     let lod = if lod.units.is_empty() { GroundLod::single(&positions, &kept_indices) } else { lod };
+    // THE STEP-1 SHAPE the readers light every step by: the lattice's
+    // normals (as authored, before burial) and drawn heights, and each
+    // cell's diagonal as drawn. A cave's ground patch (the vertices after the
+    // lattice) is marked by its alpha, 0: its triangles keep their own.
+    let shape = source.as_heightfield().filter(|_| step.max(1) == 1).and_then(|field| {
+        let cells = field.meshed_cells();
+        let uv_cells = [extent.x, extent.z];
+        let cell_x = cells[0].max(1) as f32;
+        let cell_z = cells[1].max(1) as f32;
+        let first = positions.first()?;
+        let span_x = positions.get(cells[0] as usize)?.x - first.x;
+        let span_z = positions.get((cells[1] * (cells[0] + 1)) as usize)?.z - first.z;
+        let (cx, cz) = (span_x / cell_x, span_z / cell_z);
+        if cx <= 0.0 || cz <= 0.0 {
+            return None;
+        }
+        space_soup::renderer::ground_shape::GroundShape::build(cells, [uv_cells[0] / cx, uv_cells[1] / cz], &positions, &normals, &kept_indices)
+    });
+    let mut vertices = vertices;
+    if let Some(s) = &shape {
+        for v in vertices.iter_mut().skip((s.size[0] * s.size[1]) as usize) {
+            v.color[3] = 0.0;
+        }
+        log::info!("terrain_render: the ground's shape, {} x {} samples ({:.1} MB), lights every step as step 1", s.size[0], s.size[1], s.bytes().len() as f64 / 1e6);
+    }
     log::info!(
         "terrain_render: {} chunk(s) of {} cells a side ({} x {}) over {} triangles{}",
         lod.units.iter().filter(|u| u.first < lod.level0_len()).count(),
@@ -608,7 +638,9 @@ pub fn load_with(def: &TerrainDef, game_dir: &std::path::Path, step: u32, struct
         lod.level0_len() / 3,
         if lod.has_lists() { format!("; with the coarser lists {} indices in {} runs", lod.indices.len(), lod.units.len()) } else { String::new() },
     );
-    Some(TerrainGeometry::from_parts(vertices, lod))
+    let mut geometry = TerrainGeometry::from_parts(vertices, lod);
+    geometry.shape = shape;
+    Some(geometry)
 }
 
 /// Area-weighted vertex normals from the triangles.
@@ -775,6 +807,7 @@ mod player_frame_tests {
             built_for: None,
             lod: GroundLod::default(),
             units: Vec::new(),
+            shape: None,
         }
     }
 
@@ -897,6 +930,7 @@ mod player_frame_tests {
             built_for: None,
             lod: GroundLod::default(),
             units: Vec::new(),
+            shape: None,
         };
         assert!(g.assemble(Vec3::ZERO, Quat::IDENTITY, 0.0).is_none());
     }
