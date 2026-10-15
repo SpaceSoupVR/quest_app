@@ -1,3 +1,4 @@
+compile_error!("quest_app is DEPRECATED and no longer builds: the Space Soup stack moved on to ssstudio, space_soup, space_soup_engine and spacesoup_graphics.");
 use log::{error, info};
 
 pub mod avatar;
