@@ -310,6 +310,7 @@ impl Landings {
                     return None;
                 }
                 let normal = facing.try_normalize()?;
+                let (near, far) = lit_depths(on.iter().map(|&i| (self.hits[i].point - self.lens).dot(self.forward)));
                 Some(LitPlane {
                     normal,
                     offset: normal.dot(middle / weight),
@@ -318,6 +319,8 @@ impl Landings {
                     lens: self.lens,
                     forward: self.forward,
                     right: self.right,
+                    near,
+                    far,
                 })
             })
             .collect();
@@ -332,7 +335,10 @@ impl Landings {
 /// for the reflections to show the beam's pool on it ([`Landings::surfaces`])
 /// -- and the beam that found it, as its pool map sees the plane: from the
 /// glass (`lens`) along `forward`, `right` across. `weight`: the luminance it
-/// sends back, which ranks it.
+/// sends back, which ranks it. `near`..`far`: how far down `forward` its lit
+/// part lies -- its landings, padded ([`lit_depths`]) -- so the plane's run
+/// past its face claims no other surface's reflection
+/// (`space_soup::renderer::lights::LitSurface`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LitPlane {
     pub normal: Vec3,
@@ -342,6 +348,19 @@ pub(crate) struct LitPlane {
     pub lens: Vec3,
     pub forward: Vec3,
     pub right: Vec3,
+    pub near: f32,
+    pub far: f32,
+}
+
+/// How far down the beam a plane's lit part lies, from the depths of its
+/// landings: padded past them, since the rings stand inside the cone's edge
+/// and the pool fades on beyond -- a third nearer, half again further.
+pub(crate) fn lit_depths(depths: impl Iterator<Item = f32>) -> (f32, f32) {
+    let (lo, hi) = depths.fold((f32::INFINITY, 0.0f32), |(lo, hi), z| (lo.min(z), hi.max(z)));
+    if !lo.is_finite() {
+        return (0.0, 0.0);
+    }
+    ((lo * 0.66 - 0.05).max(0.0), hi * 1.5 + 0.1)
 }
 
 /// How far off its axis a surface's pool map reaches, as a tangent: the
@@ -403,6 +422,9 @@ pub(crate) fn lit_surface(s: &LitPlane, offset: Vec3, yaw_inv: Quat) -> space_so
         forward: yaw_inv * s.forward,
         right: yaw_inv * s.right,
         tan_half: pool_map_tan(),
+        // Down the beam from the glass: the same in either frame.
+        near: s.near,
+        far: s.far,
     }
 }
 
@@ -960,6 +982,8 @@ mod tests {
             lens: Vec3::new(0.0, 1.5, 0.0),
             forward: Vec3::NEG_Z,
             right: Vec3::X,
+            near: 1.0,
+            far: 3.0,
         };
         let floor = LitPlane { normal: Vec3::Y, offset: 0.0, weight: 0.5, ..wall };
         let mut held = HeldSurfaces::default();
@@ -987,6 +1011,8 @@ mod tests {
             lens: Vec3::new(0.5, 1.4, -1.0),
             forward: Vec3::X,
             right: Vec3::Z,
+            near: 1.5,
+            far: 4.0,
         };
         let (offset, yaw_inv) = (Vec3::new(1.0, 0.5, -4.0), Quat::from_rotation_y(0.7));
         let p = lit_surface(&s, offset, yaw_inv);
@@ -995,6 +1021,36 @@ mod tests {
         assert!((p.lens - yaw_inv * (s.lens - offset)).length() < 1e-6);
         assert!((p.forward - yaw_inv * s.forward).length() < 1e-6 && (p.right - yaw_inv * s.right).length() < 1e-6);
         assert_eq!((p.albedo, p.tan_half), (s.albedo, pool_map_tan()));
+        assert_eq!((p.near, p.far), (s.near, s.far), "depths down the beam turn with it");
+    }
+
+    /// A PILLAR'S SIDE AND THE FAR WALL, lit by one beam: each plane knows
+    /// how far down the beam its own lit part lies, so the side's plane --
+    /// which runs on to cross the wall -- stops well short of it.
+    #[test]
+    fn each_lit_plane_knows_how_far_down_the_beam_it_is_lit() {
+        let lens = Vec3::new(0.0, 1.2, 0.0);
+        // A side at x = 0.2 from 0.1 m to 0.9 m down the beam, then a wall at 9 m.
+        let land = |o: Vec3, d: Vec3| {
+            if d.z >= 0.0 {
+                return None;
+            }
+            if d.x > 0.0 {
+                let t = (0.2 - o.x) / d.x;
+                let p = o + d * t;
+                if p.z <= -0.1 && p.z >= -0.9 {
+                    return Some(Landing { point: p, normal: Vec3::NEG_X, albedo: Vec3::splat(0.5) });
+                }
+            }
+            let t = (o.z + 9.0) / -d.z;
+            Some(Landing { point: o + d * t, normal: Vec3::Z, albedo: Vec3::splat(0.5) })
+        };
+        let lit = landings(lens, Quat::IDENTITY, &rays(), land).surfaces();
+        let side = lit.iter().find(|s| s.normal.x < -0.9).expect("the side is lit");
+        let wall = lit.iter().find(|s| s.normal.z > 0.9).expect("the wall is lit");
+        assert!(side.near < 0.6 && side.far > 0.9 && side.far < 2.0, "the side: {} to {}", side.near, side.far);
+        assert!(wall.near < 8.5 && wall.near > 4.0 && wall.far > 9.5, "the wall: {} to {}", wall.near, wall.far);
+        assert_eq!(lit_depths(std::iter::empty()), (0.0, 0.0), "nothing landed, nothing bounded");
     }
 
     /// A ray past an edge takes no light of its own, nor pulls the rest's off
